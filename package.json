@@ -1,0 +1,41 @@
+{
+  "name": "@code-ministry/agentenv",
+  "version": "0.0.1",
+  "description": "Virtual environments for AI agents - switch between specialised context, skill & plugin bundles",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "agentenv": "dist/bin.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.typecheck.json",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "ci": "npm run lint && npm run typecheck && npm run test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/code-ministry-ltd/agentenv.git"
+  },
+  "homepage": "https://github.com/code-ministry-ltd/agentenv#readme",
+  "bugs": {
+    "url": "https://github.com/code-ministry-ltd/agentenv/issues"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.1.2",
+    "eslint": "^10.8.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.65.0",
+    "vitest": "^4.1.10"
+  }
+}
