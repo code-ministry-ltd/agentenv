@@ -4,6 +4,8 @@ import { dirname, join, resolve } from 'node:path';
 import { writeFileAtomic } from '../fs-atomic.js';
 import { withLock } from '../lock.js';
 import type { Paths } from '../paths.js';
+import { isApproved, recordApproval } from './approvals.js';
+import { validateEnvName } from '../store.js';
 
 /**
  * The session registry — machine-local, per-shell bindings that drive session
@@ -262,6 +264,45 @@ export async function findAgentenvFile(
   }
 }
 
+/**
+ * Parse a `.agentenv` file into its env stack (D16): the content is just the env
+ * name(s), one per line. Blank lines and `#` comments are ignored (a forgiving
+ * parse). Only syntactically valid names survive — this is a path-safety gate as
+ * much as a filter, since these names feed `environmentExists` / `envDir(name)`
+ * downstream (mirrors the `rm` command validating before any path construction).
+ * Order-preserving and de-duplicated. Never throws.
+ */
+export function parseAgentenvEnvs(text: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (line === '' || line.startsWith('#')) continue;
+    if (validateEnvName(line) !== null) continue; // drop malformed names, don't bind them
+    if (seen.has(line)) continue;
+    seen.add(line);
+    out.push(line);
+  }
+  return out;
+}
+
+/** A request to grant a one-time approval to an unapproved `.agentenv` (D16). */
+export interface AgentenvApprovalRequest {
+  /** The discovered `.agentenv` file. */
+  file: string;
+  /** The canonical project folder that declares it (the approval key). */
+  projectDir: string;
+  /** The env stack the file names. */
+  envs: string[];
+}
+
+/**
+ * Interactive one-time approval seam. Returning `true` trusts the folder (the
+ * caller records it); anything else leaves it inert. Absent → non-interactive:
+ * the `.agentenv` is skipped with a notice and NEVER auto-approved (D16).
+ */
+export type ApproveAgentenv = (req: AgentenvApprovalRequest) => Promise<boolean>;
+
 /** Where a resolved binding came from (D16 precedence). */
 export type BindingSource = 'explicit' | 'agentenv-file' | 'none';
 
@@ -276,34 +317,77 @@ export interface ResolvedBinding {
 
 /**
  * Resolve the binding for a launch, applying the D16 precedence: an explicit
- * `use` binding in this shell/project wins; otherwise an approved `.agentenv`
- * for the project (Task 3.2 — discovered here, application deferred); otherwise
- * none. A blank/absent session id can never have an explicit binding.
+ * `use` binding in this shell/project wins; otherwise an **approved** `.agentenv`
+ * for the project applies at session scope; otherwise none. A blank/absent
+ * session id can never have an explicit binding.
+ *
+ * `.agentenv` pickup (D16): a discovered file does nothing until a one-time
+ * per-project approval (the `.mcp.json` trust model). Already-approved → bind its
+ * env stack (`source: 'agentenv-file'`) with no prompt. Unapproved → the `approve`
+ * seam decides (interactive); a `true` records the approval and binds, anything
+ * else (including no seam = non-interactive) leaves it inert with a notice, never
+ * auto-approving. Missing/invalid env names are the caller's concern (the shim
+ * validates existence and warns) — approval trusts the FILE, not the env set.
+ *
+ * Fail-open: any error resolving `.agentenv` yields an inert result with a note,
+ * never a throw — the launch must never be bricked by this feature.
  */
 export async function resolveSessionBinding(args: {
   paths: Paths;
   session: string | undefined;
   projectRoot: string;
   env: NodeJS.ProcessEnv;
+  /** One-time approval seam for an unapproved `.agentenv` (absent = non-interactive). */
+  approve?: ApproveAgentenv;
+  /** Injectable clock for the approval timestamp (tests). */
+  now?: () => number;
 }): Promise<ResolvedBinding> {
-  const { paths, session, projectRoot, env } = args;
+  const { paths, session, projectRoot, env, approve, now } = args;
 
   if (session && session.trim() !== '') {
     const registry = await readSessionRegistry(paths);
     const binding = findBinding(registry, session, projectRoot);
-    if (binding) return { source: 'explicit', binding };
+    if (binding) return { source: 'explicit', binding }; // explicit `use` wins (D16)
   }
 
-  // HOOK POINT (Task 3.2): a discovered `.agentenv` is NOT applied without a
-  // per-project approval. Surface it as a note so 3.2 can wire pickup/approval
-  // and auto-adoption (D10) on top without changing this precedence.
-  const agentenvFile = await findAgentenvFile(projectRoot, env);
-  if (agentenvFile) {
-    return {
-      source: 'none',
-      note: `found ${agentenvFile} — .agentenv pickup requires a one-time approval (Task 3.2); launching unbound`,
+  try {
+    const agentenvFile = await findAgentenvFile(projectRoot, env);
+    if (!agentenvFile) return { source: 'none' };
+
+    const envs = parseAgentenvEnvs(await readFile(agentenvFile, 'utf8'));
+    if (envs.length === 0) {
+      return { source: 'none', note: `${agentenvFile} names no environment(s) — launching unbound` };
+    }
+
+    const projectDir = resolve(dirname(agentenvFile));
+    let approved = await isApproved(paths, projectDir);
+    if (!approved && approve) {
+      approved = await approve({ file: agentenvFile, projectDir, envs });
+      if (approved) await recordApproval(paths, projectDir, now);
+    }
+    if (!approved) {
+      return {
+        source: 'none',
+        note:
+          `found ${agentenvFile} (default: ${envs.join(', ')}) — a .agentenv needs a one-time ` +
+          'approval before it applies; not approved (non-interactive or declined), launching unbound',
+      };
+    }
+
+    const binding: SessionBinding = {
+      session: session ?? '',
+      projectRoot,
+      envs,
+      global: false,
+      createdAt: (now ?? Date.now)(),
     };
+    return {
+      source: 'agentenv-file',
+      binding,
+      note: `applying .agentenv default [${envs.join(', ')}] from ${agentenvFile}`,
+    };
+  } catch (err) {
+    // Fail-open: a `.agentenv` problem must never brick the launch (D15/D16).
+    return { source: 'none', note: `.agentenv resolution failed (${(err as Error).message}) — launching unbound` };
   }
-
-  return { source: 'none' };
 }
