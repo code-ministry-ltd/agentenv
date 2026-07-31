@@ -9,6 +9,12 @@ export interface RunResult {
   code: number;
 }
 
+/** One skill offered by the `add skills` checklist: a name and its description. */
+export interface SkillChoice {
+  name: string;
+  description: string;
+}
+
 /**
  * Injectable seams for a single invocation. Everything a command needs from
  * the outside world arrives here so command logic stays pure and unit-testable
@@ -24,6 +30,12 @@ export interface RunOptions {
    * absent, commands fall back to a safe non-interactive default (decline).
    */
   confirm?: (question: string) => Promise<boolean>;
+  /**
+   * Choose which discovered skills `add skills` installs (design D17). Injected
+   * in tests so the checklist runs with no TTY; returns the selected skill names.
+   * When absent, commands fall back to the default TTY selector (or `--all`).
+   */
+  selectSkills?: (choices: readonly SkillChoice[]) => Promise<readonly string[]>;
   /**
    * Launch an external editor, resolving to its exit code. Injected in tests
    * so `edit` never spawns a real editor.
