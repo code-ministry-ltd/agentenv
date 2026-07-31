@@ -62,6 +62,12 @@ export interface ComposeRequest {
   /** Where the harness reads config absent an override — the composition source. */
   realConfigRoot: string;
   /**
+   * The launch's project root (the harness cwd), threaded into config-keys
+   * compilation so a project-path-keyed injection (Codex trust) is representable
+   * (H3). `null`/absent when there is no project context.
+   */
+  projectRoot?: string | null;
+  /**
    * Dedup hook (D15): return `true` for a real-root path already owned by
    * agentenv via `--global`, so the view represents it once (through the surface)
    * rather than doubling it as a bucket-1 symlink. Default: nothing is globally
@@ -333,7 +339,10 @@ async function composeConfigKeys(
   for (const env of envs) {
     let injections: ConfigKeysInjection[];
     try {
-      injections = await adapter.compileConfigKeys(surface, paths.envDir(env));
+      injections = await adapter.compileConfigKeys(surface, {
+        envContentDir: paths.envDir(env),
+        projectRoot: req.projectRoot ?? null,
+      });
     } catch (err) {
       onWarn(`agentenv: env '${env}' ${surface.id} compile failed: ${(err as Error).message}`);
       continue;

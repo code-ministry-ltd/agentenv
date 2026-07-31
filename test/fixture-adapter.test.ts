@@ -60,7 +60,10 @@ describe('session fixture harness', () => {
     );
     const a = makeFixtureAdapter();
     const mcp = a.surfaces.find((s) => s.id === 'mcp')!;
-    const injections = await a.compileConfigKeys(mcp as never, envDir);
+    const injections = await a.compileConfigKeys(mcp as never, {
+      envContentDir: envDir,
+      projectRoot: null,
+    });
     expect(injections).toEqual([
       {
         style: 'keyed',

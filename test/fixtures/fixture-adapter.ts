@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import type {
   Adapter,
+  ConfigKeysContext,
   ConfigKeysInjection,
   ConfigKeysSurface,
   EntryBucket,
@@ -123,10 +124,10 @@ export function makeFixtureAdapter(opts: FixtureAdapterOptions = {}): Adapter {
 
     async compileConfigKeys(
       surface: ConfigKeysSurface,
-      envContentDir: string,
+      ctx: ConfigKeysContext,
     ): Promise<ConfigKeysInjection[]> {
       if (surface.id !== 'mcp') return [];
-      const serversFile = join(envContentDir, 'mcp', 'servers.yaml');
+      const serversFile = join(ctx.envContentDir, 'mcp', 'servers.yaml');
       if (!existsSync(serversFile)) return [];
       const parsed = parseYaml(readFileSync(serversFile, 'utf8')) as
         | Record<string, unknown>

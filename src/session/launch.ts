@@ -119,6 +119,9 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
       envs: req.envs!,
       session: req.session,
       realConfigRoot,
+      // The launch cwd is the project root an adapter keys project-scoped config
+      // by (Codex trust); thread it through to config-keys compilation (H3).
+      projectRoot: cwd,
       isGloballyOwned: (p) => ownedRealPaths.has(p),
       now: req.now,
       onWarn: (m) => notices.push(m),

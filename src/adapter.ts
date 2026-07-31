@@ -160,6 +160,23 @@ export type ConfigKeysInjection =
 /** The set of environment variables that point a harness at a private root. */
 export type OverrideEnv = Record<string, string>;
 
+/**
+ * What {@link Adapter.compileConfigKeys} may read when compiling store content
+ * into config-keys injections. Carries the env's content dir AND the launch's
+ * project root, so an adapter whose config is keyed by the project path (Codex's
+ * `[projects."<projectRoot>"] trust_level="trusted"`, which only merges project
+ * config when present) can emit a project-path-keyed injection (H3).
+ */
+export interface ConfigKeysContext {
+  /** `environments/<env>/` — the adapter reads the relevant subdir under it. */
+  envContentDir: string;
+  /**
+   * The launch's project root (the harness's cwd), or `null` when there is no
+   * project context (e.g. a probe). An adapter keys project-scoped config by it.
+   */
+  projectRoot: string | null;
+}
+
 /** Outcome of an adapter's launch self-check (D15 fail-closed probe). */
 export interface SelfCheckResult {
   /** Whether the child provably observes the intended root. */
@@ -277,12 +294,13 @@ export interface Adapter {
    * for an instructions-array surface (OpenCode) it yields the store path to
    * append. Returns `[]` when the env contributes nothing to the surface.
    *
-   * `envContentDir` is `environments/<env>/`; the adapter reads the relevant
-   * subdir under it.
+   * The {@link ConfigKeysContext} carries `environments/<env>/` plus the launch's
+   * project root, so a project-path-keyed injection (Codex trust) is representable
+   * without re-freezing this contract later (H3).
    */
   compileConfigKeys(
     surface: ConfigKeysSurface,
-    envContentDir: string,
+    ctx: ConfigKeysContext,
   ): Promise<ConfigKeysInjection[]>;
 
   // — launch self-check (D15 fail-closed) —
