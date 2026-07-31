@@ -1,6 +1,11 @@
+import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { access } from 'node:fs/promises';
-import { basename, dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { parseFrontmatter } from './content-items.js';
 
 /**
  * A resolved git skill source (design D17). `repo` is the canonical origin
@@ -200,4 +205,216 @@ export async function resolveSkillSource(arg: string): Promise<ParseSkillSourceR
       `'${arg}' is not a recognised skill source ` +
       '(expected owner/repo[/path][@ref], a git URL, or an existing local skill directory)',
   };
+}
+
+/** A generous ceiling so a wedged clone can never hang an invocation forever. */
+const GIT_TIMEOUT_MS = 120_000;
+
+interface GitResult {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+/** Run `git <args>` (optionally in `cwd`), capturing output. Never throws on a
+ * non-zero exit — the caller inspects `code`. A spawn error (git missing) or a
+ * timeout resolves with `code: null` and an explanatory `stderr`. */
+function runGit(args: readonly string[], cwd?: string): Promise<GitResult> {
+  return new Promise((resolvePromise) => {
+    const child = spawn('git', [...args], {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
+    child.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
+    const timer = setTimeout(() => {
+      stderr += '\ngit timed out';
+      child.kill('SIGKILL');
+    }, GIT_TIMEOUT_MS);
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      resolvePromise({ code: null, stdout, stderr: `${stderr}${err.message}` });
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolvePromise({ code, stdout, stderr });
+    });
+  });
+}
+
+/** First non-empty line of git's stderr, for a compact error message. */
+function firstLine(text: string): string {
+  return text.split('\n').map((l) => l.trim()).find((l) => l !== '') ?? '';
+}
+
+/** A fetched clone (design D17): a temp checkout the caller must clean up. */
+export interface FetchedSource {
+  /** The temp clone directory (caller removes it when done). */
+  cloneDir: string;
+  /** The subpath inside the clone to scan for skills. */
+  scanDir: string;
+  /** Resolved HEAD commit sha. */
+  commit: string;
+  /** The ref that was checked out: the requested ref, or the default branch name. */
+  ref: string;
+}
+
+export type FetchSkillSourceResult = FetchedSource | { error: string };
+
+/**
+ * Clone a resolved skill source into a temp dir with `git clone --depth 1`
+ * (design D17): plain git, so the user's existing git auth covers private repos.
+ * Honours `@ref` (a branch/tag via `--branch`, falling back to fetch+checkout for
+ * an arbitrary sha). On any git failure the temp dir is removed and a clear error
+ * is returned, so nothing outside the temp dir is ever touched — this is the one
+ * command that may fail offline (spec criterion 11).
+ */
+export async function fetchSkillSource(source: ParsedSkillSource): Promise<FetchSkillSourceResult> {
+  const cloneDir = await mkdtemp(join(tmpdir(), 'agentenv-skill-clone-'));
+  const fail = async (message: string): Promise<{ error: string }> => {
+    await rm(cloneDir, { recursive: true, force: true });
+    return { error: message };
+  };
+
+  const clone = source.ref
+    ? await runGit(['clone', '--depth', '1', '--branch', source.ref, source.cloneUrl, cloneDir])
+    : await runGit(['clone', '--depth', '1', source.cloneUrl, cloneDir]);
+
+  if (clone.code !== 0) {
+    // `--branch` fails for a bare commit sha; retry with a shallow fetch+checkout.
+    if (source.ref) {
+      const plain = await runGit(['clone', '--depth', '1', source.cloneUrl, cloneDir]);
+      if (plain.code !== 0) {
+        return fail(cloneError(source, plain.stderr || clone.stderr));
+      }
+      const fetched = await runGit(['fetch', '--depth', '1', 'origin', source.ref], cloneDir);
+      const checkout = fetched.code === 0 ? await runGit(['checkout', source.ref], cloneDir) : fetched;
+      if (checkout.code !== 0) {
+        return fail(
+          `could not resolve ref '${source.ref}' in ${source.repo}` +
+            `${firstLine(checkout.stderr) ? ` (${firstLine(checkout.stderr)})` : ''}`,
+        );
+      }
+    } else {
+      return fail(cloneError(source, clone.stderr));
+    }
+  }
+
+  const rev = await runGit(['rev-parse', 'HEAD'], cloneDir);
+  if (rev.code !== 0) return fail(`could not read the cloned commit for ${source.repo}`);
+  const commit = rev.stdout.trim();
+
+  let ref = source.ref;
+  if (ref === undefined) {
+    const branch = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], cloneDir);
+    ref = branch.code === 0 && branch.stdout.trim() !== '' ? branch.stdout.trim() : 'HEAD';
+  }
+
+  // Resolve the subpath and re-check it never escaped the clone.
+  const scanDir = resolve(cloneDir, source.subpath);
+  const rel = relative(cloneDir, scanDir);
+  if (rel.startsWith('..') || rel.startsWith(`${sep}..`)) {
+    return fail(`invalid source path '${source.subpath}'`);
+  }
+  if (!(await exists(scanDir))) {
+    return fail(
+      `path '${source.subpath || '.'}' does not exist in ${source.repo}` +
+        `${source.ref ? ` at ${source.ref}` : ''}`,
+    );
+  }
+
+  return { cloneDir, scanDir, commit, ref };
+}
+
+function cloneError(source: ParsedSkillSource, stderr: string): string {
+  const detail = firstLine(stderr);
+  return (
+    `could not clone ${source.repo} (${source.cloneUrl})` +
+    `${detail ? `: ${detail}` : ''} — the source is unreachable; nothing was changed`
+  );
+}
+
+/** A skill directory discovered by scanning a fetched source. */
+export interface SkillCandidate {
+  /** Absolute path of the skill directory. */
+  dir: string;
+  /** The directory's basename (the skill's folder name). */
+  name: string;
+  /** The SKILL.md frontmatter `description`, or '' when absent/unreadable. */
+  description: string;
+}
+
+/**
+ * Recursively find every directory under `root` (inclusive) that directly
+ * contains a `SKILL.md`, reading each one's frontmatter description. Returned
+ * sorted by name for stable, testable output. `.git` is never descended into.
+ */
+export async function scanSkillDirs(root: string): Promise<SkillCandidate[]> {
+  const found: SkillCandidate[] = [];
+  const visit = async (dir: string): Promise<void> => {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    if (entries.some((e) => e.isFile() && e.name === 'SKILL.md')) {
+      found.push({ dir, name: basename(dir), description: await readDescription(dir) });
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory() && entry.name !== '.git') {
+        await visit(join(dir, entry.name));
+      }
+    }
+  };
+  await visit(root);
+  found.sort((a, b) => a.name.localeCompare(b.name));
+  return found;
+}
+
+async function readDescription(dir: string): Promise<string> {
+  let text: string;
+  try {
+    text = await readFile(join(dir, 'SKILL.md'), 'utf8');
+  } catch {
+    return '';
+  }
+  const frontmatter = parseFrontmatter(text);
+  const description = frontmatter?.description;
+  return typeof description === 'string' ? description : '';
+}
+
+/**
+ * A stable content hash of a directory tree (design D17 provenance): sha256 over
+ * every file's relative path and bytes, in sorted order, so identical content
+ * yields an identical hash on any machine and drift is detectable. `.git` is
+ * excluded. Returns a hex digest.
+ */
+export async function hashDir(dir: string): Promise<string> {
+  const files: string[] = [];
+  const walk = async (current: string): Promise<void> => {
+    const entries = await readdir(current, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name === '.git') continue;
+      const full = join(current, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+      } else if (entry.isFile()) {
+        files.push(full);
+      }
+    }
+  };
+  await walk(dir);
+  files.sort((a, b) => relative(dir, a).localeCompare(relative(dir, b)));
+  const hash = createHash('sha256');
+  for (const file of files) {
+    hash.update(relative(dir, file).split(sep).join('/'));
+    hash.update('\0');
+    hash.update(await readFile(file));
+    hash.update('\0');
+  }
+  return hash.digest('hex');
 }

@@ -68,6 +68,8 @@ export interface FixtureRepo {
   commit(message: string): string;
   /** Current HEAD sha. */
   head(): string;
+  /** Run an arbitrary git command in the repo (for tags, branches, …). */
+  git(...args: string[]): string;
   cleanup(): void;
 }
 
@@ -126,6 +128,7 @@ export function makeFixtureRepo(): FixtureRepo {
       return git('rev-parse', 'HEAD');
     },
     head: () => git('rev-parse', 'HEAD'),
+    git,
     cleanup: () => rmSync(dir, { recursive: true, force: true }),
   };
 }
