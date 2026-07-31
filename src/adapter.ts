@@ -125,6 +125,32 @@ export interface ConfigKeysSurface extends SurfaceBase {
    * the array's path for array-element mode (e.g. `['instructions']`).
    */
   keyPath: readonly (string | number)[];
+  /**
+   * OPTIONAL rung selector for `${VAR}` placeholders in this surface's values (D6,
+   * added Task 2.4 — freeze-relevant). The frozen contract flags placeholder-origin
+   * fields (`ConfigKeysInjection.secretFields`) but did NOT express whether the
+   * harness interpolates `${VAR}` itself. This closes that gap:
+   *
+   * - **absent / `false` → passthrough (rung 1, the safe default)**: the compiled
+   *   `${VAR}` is written to the REAL config verbatim and the harness interpolates
+   *   it (Claude `${VAR}`, OpenCode `{env:VAR}`, Cursor `${env:VAR}`). No secret
+   *   value ever leaves `secrets.env`/the shell. Defaulting here is deliberate: an
+   *   adapter that forgets the flag leaks NOTHING — at worst a harness that cannot
+   *   interpolate sees a literal `${VAR}` (visibly broken), never a leaked secret.
+   * - **`true` → literal substitution (rung 3)**: the harness cannot interpolate
+   *   `${VAR}` in this config file, so at materialisation the engine/composer resolve
+   *   each `secretFields` placeholder from `secrets.env`/the shell and write the
+   *   LITERAL into the real config. The manifest still records the placeholder, so
+   *   drift write-back restores `${VAR}` and never carries the literal to the store.
+   *
+   * Native indirection (rung 2, e.g. Codex `env_vars`) needs no flag: the adapter
+   * compiles the placeholder away in {@link Adapter.compileConfigKeys}, so no `${VAR}`
+   * — and no `secretFields` entry — reaches materialisation. The rung is therefore
+   * per-surface here, since any placeholder still present shares the surface's rung.
+   * An unresolved `${VAR}` on a `true` surface fails closed PER SERVER (warn + skip),
+   * never writing an empty or placeholder-looking literal.
+   */
+  substitutePlaceholders?: boolean;
 }
 
 /** A managed surface a harness exposes, discriminated by {@link SurfaceMechanism}. */

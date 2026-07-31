@@ -30,6 +30,7 @@ import {
 import { beginTransaction, recoverState } from './journal.js';
 import { withLock } from './lock.js';
 import type { Paths } from './paths.js';
+import { loadResolver, substituteSecretFields, type SecretResolver } from './secrets.js';
 import { findOwner, readState, writeState, type ManifestItem, type StateManifest } from './state.js';
 
 /**
@@ -64,9 +65,11 @@ export interface GlobalSkip {
   surfaceId: string;
   /**
    * `unsupported` (adapter says so), `shadowed` (a later env or a user item won),
-   * `user-collision` (a non-owned real item/key won), or `compile-error`.
+   * `user-collision` (a non-owned real item/key won), `compile-error`, or
+   * `secret-unresolved` (a substitute-rung `${VAR}` resolved to nothing → the server
+   * is skipped, fail-closed per server, D6).
    */
-  reason: 'unsupported' | 'shadowed' | 'user-collision' | 'compile-error';
+  reason: 'unsupported' | 'shadowed' | 'user-collision' | 'compile-error' | 'secret-unresolved';
   detail: string;
 }
 
@@ -334,6 +337,31 @@ async function materialiseFileBlock(
 }
 
 /**
+ * Apply the `${VAR}` rung (D6) to one keyed injection before it is written to the
+ * REAL config. A *substitute* surface ({@link ConfigKeysSurface.substitutePlaceholders})
+ * resolves each flagged placeholder to its literal from `secrets.env`/the shell;
+ * a *passthrough* surface (the default) is a no-op — the placeholder is kept so the
+ * harness interpolates it. Either way the caller passes the ORIGINAL `secretFields`
+ * to the manifest, so drift write-back always restores `${VAR}`. Unresolved names
+ * are returned so the caller can fail closed for that server only.
+ */
+function resolveInjectionSecrets(
+  surface: ConfigKeysSurface,
+  injection: import('./adapter.js').ConfigKeysInjection,
+  resolver: SecretResolver,
+): { value: import('./config-keys.js').JsonValue; unresolved: string[] } {
+  if (
+    injection.style !== 'keyed' ||
+    !surface.substitutePlaceholders ||
+    !injection.secretFields ||
+    Object.keys(injection.secretFields).length === 0
+  ) {
+    return { value: injection.value, unresolved: [] };
+  }
+  return substituteSecretFields(injection.value, injection.secretFields, (n) => resolver.resolve(n));
+}
+
+/**
  * Inject every env's compiled config keys under ONE transaction. Keyed injections
  * respect later-wins (reversed stack, first claim wins) and idempotency (a key we
  * already own is skipped, not re-injected — `injectKeyed` would otherwise refuse
@@ -400,6 +428,12 @@ async function materialiseConfigKeys(
 
   if (planned.length === 0) return 0;
 
+  // Secrets resolver for the substitute rung (D6): secrets.env first, then the
+  // shell env. Loaded once per invocation — a substitute-surface `${VAR}` is
+  // resolved to a LITERAL in the real config here, while the manifest keeps the
+  // placeholder (below) so drift write-back never carries the literal to the store.
+  const resolver = await loadResolver(paths, env);
+
   return withLock(paths, async () => {
     const tx = await beginTransaction(paths);
     const manifest = await readState(paths); // ownership snapshot for idempotency
@@ -409,13 +443,29 @@ async function materialiseConfigKeys(
         if (p.injection.style === 'keyed') {
           const owner = ownedConfigKey(manifest, p.file, p.injection.keyPath);
           if (owner !== null) continue; // already ours (or a stack env's) — idempotent no-op
+          // Substitute rung: resolve `${VAR}` in the flagged fields to literals for
+          // the real config; unresolved → fail closed for THIS server only (D6).
+          const resolved = resolveInjectionSecrets(p.surface, p.injection, resolver);
+          if (resolved.unresolved.length > 0) {
+            const detail = `key '${p.injection.keyPath.join('.')}' from env '${p.env}' skipped — unresolved secret(s): ${resolved.unresolved.join(', ')} (set them in ~/.agentenv/secrets.env or the shell)`;
+            onWarn(`agentenv: ${detail}`);
+            skips.push({
+              adapterId: p.adapterId,
+              surfaceId: p.surface.id,
+              reason: 'secret-unresolved',
+              detail,
+            });
+            continue;
+          }
           try {
             await injectKeyed(paths, tx, {
               file: p.file,
               format: p.surface.format,
               keyPath: p.injection.keyPath,
-              value: p.injection.value,
+              value: resolved.value,
               ownerEnv: p.env,
+              // Always the ORIGINAL placeholder text — the manifest records the
+              // placeholder regardless of rung, so write-back restores `${VAR}` (D6).
               ...(p.injection.secretFields ? { secretFields: p.injection.secretFields } : {}),
             });
             applied += 1;
