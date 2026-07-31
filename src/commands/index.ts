@@ -2,6 +2,7 @@ import type { Command } from '../command.js';
 import { createCommand } from './create.js';
 import { dropCommand } from './drop.js';
 import { editCommand } from './edit.js';
+import { initCommand } from './init.js';
 import { listCommand } from './list.js';
 import { rmCommand } from './rm.js';
 import { runCommand } from './run.js';
@@ -16,6 +17,7 @@ import { useCommand } from './use.js';
  * entries. Each slice appends its command; order here is the display order.
  */
 export const commands: readonly Command[] = [
+  initCommand,
   createCommand,
   listCommand,
   showCommand,
