@@ -252,7 +252,7 @@ export const claudeAdapter: Adapter = {
       | Record<string, unknown>
       | null
       | undefined;
-    if (!parsed || typeof parsed !== 'object') return [];
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
     // One keyed injection per server, owned independently under mcpServers (D3/D6).
     return Object.entries(parsed).map(([name, def]) => {
       const value = shapeClaudeServer(def);
@@ -278,6 +278,9 @@ export const claudeAdapter: Adapter = {
     // written in Claude's normalised shape; because shapeClaudeServer is idempotent
     // on that shape, a subsequent compile reproduces it exactly — round-trip stable.
     if (surface.id !== 'mcp' || drift.style !== 'keyed') return [];
+    // A server injection is always keyPath ['mcpServers', <name>] (length 2); a
+    // length-1 keyPath would fold a bogus `mcpServers` "server" into the store.
+    if (drift.keyPath.length < 2) return [];
     const name = drift.keyPath[drift.keyPath.length - 1];
     if (typeof name !== 'string') return [];
     const serversFile = join(ctx.envContentDir, 'mcp', 'servers.yaml');
