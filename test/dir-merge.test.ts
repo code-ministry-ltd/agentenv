@@ -9,7 +9,13 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { materialise, dematerialise, type MaterialiseResult } from '../src/dir-merge.js';
+import { rmSync } from 'node:fs';
+import {
+  materialise,
+  dematerialise,
+  syncBack,
+  type MaterialiseResult,
+} from '../src/dir-merge.js';
 import { resolvePaths } from '../src/paths.js';
 import { findOwner, readState } from '../src/state.js';
 import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot } from './helpers.js';
@@ -230,6 +236,97 @@ describe('dir-merge surface', () => {
       expect(lstatSync(at).isSymbolicLink()).toBe(true);
       expect(readlinkSync(at)).toBe(userTarget);
       expect(readFileSync(join(at, 'SKILL.md'), 'utf8')).toBe('linked user skill\n');
+    });
+  });
+
+  describe('copy-with-write-back fallback (mode: copy, D1)', () => {
+    it('copies the store item in as a real item, not a symlink', async () => {
+      const p = paths();
+      const targetDir = join(temp.home, 'opencode', 'skills');
+      const source = makeStoreItem('sharpen', '# env sharpen\n');
+      const at = join(targetDir, 'sharpen');
+
+      const item = materialised(
+        await materialise(p, {
+          ownerEnv: 'writing',
+          sourcePath: source,
+          targetDir,
+          itemName: 'sharpen',
+          mode: 'copy',
+        }),
+      );
+
+      // A real copy, not a link — the fallback for surfaces without symlinks.
+      expect(lstatSync(at).isSymbolicLink()).toBe(false);
+      expect(lstatSync(at).isDirectory()).toBe(true);
+      expect(readFileSync(join(at, 'SKILL.md'), 'utf8')).toBe('# env sharpen\n');
+      expect(item).toMatchObject({ action: 'copy', target: source });
+    });
+
+    it('round-trips a directory item: materialise(copy) → edit → syncBack → store updated → drop', async () => {
+      const p = paths();
+      const targetDir = join(temp.home, 'opencode', 'skills');
+      const source = makeStoreItem('sharpen', '# env sharpen\n');
+      writeFileSync(join(source, 'keep.txt'), 'unchanged\n');
+      writeFileSync(join(source, 'gone.txt'), 'will be deleted in the copy\n');
+      const at = join(targetDir, 'sharpen');
+
+      const item = materialised(
+        await materialise(p, {
+          ownerEnv: 'writing',
+          sourcePath: source,
+          targetDir,
+          itemName: 'sharpen',
+          mode: 'copy',
+        }),
+      );
+
+      // Edit the working copy: change a file, add a file, delete a file.
+      writeFileSync(join(at, 'SKILL.md'), '# edited in the copy\n');
+      writeFileSync(join(at, 'new.txt'), 'added in the copy\n');
+      rmSync(join(at, 'gone.txt'));
+
+      await syncBack(p, item);
+
+      // The store now mirrors the working copy...
+      expect(readFileSync(join(source, 'SKILL.md'), 'utf8')).toBe('# edited in the copy\n');
+      expect(readFileSync(join(source, 'new.txt'), 'utf8')).toBe('added in the copy\n');
+      expect(existsSync(join(source, 'gone.txt'))).toBe(false);
+      // ...and an untouched file is left exactly as it was.
+      expect(readFileSync(join(source, 'keep.txt'), 'utf8')).toBe('unchanged\n');
+
+      // Drop removes the working copy but never the store.
+      await dematerialise(p, item);
+      expect(existsSync(at)).toBe(false);
+      expect(readFileSync(join(source, 'SKILL.md'), 'utf8')).toBe('# edited in the copy\n');
+    });
+
+    it('round-trips a single-FILE item (an agent/command .md): edit → syncBack', async () => {
+      const p = paths();
+      const targetDir = join(temp.home, 'opencode', 'agents');
+      const source = join(temp.home, 'store-src', 'reviewer.md');
+      mkdirSync(join(temp.home, 'store-src'), { recursive: true });
+      writeFileSync(source, 'original agent\n');
+      const at = join(targetDir, 'reviewer.md');
+
+      const item = materialised(
+        await materialise(p, {
+          ownerEnv: 'work',
+          sourcePath: source,
+          targetDir,
+          itemName: 'reviewer.md',
+          mode: 'copy',
+        }),
+      );
+      expect(readFileSync(at, 'utf8')).toBe('original agent\n');
+
+      writeFileSync(at, 'edited agent\n');
+      await syncBack(p, item);
+      expect(readFileSync(source, 'utf8')).toBe('edited agent\n');
+
+      await dematerialise(p, item);
+      expect(existsSync(at)).toBe(false);
+      expect(readFileSync(source, 'utf8')).toBe('edited agent\n'); // store survives
     });
   });
 });

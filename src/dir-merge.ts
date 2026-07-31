@@ -1,4 +1,14 @@
-import { lstat, mkdir, rm, symlink } from 'node:fs/promises';
+import {
+  copyFile,
+  lstat,
+  mkdir,
+  readdir,
+  readFile,
+  readlink,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { join } from 'node:path';
 import { backup, restore, type BackupRef } from './backups.js';
 import { beginTransaction } from './journal.js';
@@ -87,13 +97,113 @@ async function lexists(p: string): Promise<boolean> {
   }
 }
 
+/** Recursively copy a directory, preserving nested files and symlinks. */
+async function copyDir(src: string, dest: string): Promise<void> {
+  await mkdir(dest, { recursive: true });
+  for (const entry of await readdir(src, { withFileTypes: true })) {
+    const from = join(src, entry.name);
+    const to = join(dest, entry.name);
+    if (entry.isSymbolicLink()) {
+      await symlink(await readlink(from), to);
+    } else if (entry.isDirectory()) {
+      await copyDir(from, to);
+    } else if (entry.isFile()) {
+      await copyFile(from, to);
+    }
+    // else: a special file we cannot meaningfully copy — skip it.
+  }
+}
+
+/** Copy a store item (a file, directory, or symlink) to `dest`. */
+async function copyPath(src: string, dest: string): Promise<void> {
+  const st = await lstat(src);
+  if (st.isSymbolicLink()) {
+    await symlink(await readlink(src), dest);
+  } else if (st.isDirectory()) {
+    await copyDir(src, dest);
+  } else {
+    await copyFile(src, dest);
+  }
+}
+
 /** Place the store item at `targetPath` using `mode`. */
 async function placeItem(mode: DirMergeMode, sourcePath: string, targetPath: string): Promise<void> {
   if (mode === 'symlink') {
     await symlink(sourcePath, targetPath);
     return;
   }
-  throw new Error(`agentenv: dir-merge mode '${mode}' not implemented`);
+  await copyPath(sourcePath, targetPath);
+}
+
+/** Whether two regular files hold identical bytes. */
+async function sameFile(a: string, b: string): Promise<boolean> {
+  const [da, db] = await Promise.all([readFile(a), readFile(b)]);
+  return da.equals(db);
+}
+
+/**
+ * Make `dest` mirror the directory `src`, writing only what differs: changed or
+ * new files are copied, files absent from `src` are removed (the working copy
+ * is authoritative). Nested dirs recurse; nested symlinks are recreated.
+ */
+async function mirrorDir(src: string, dest: string): Promise<void> {
+  await mkdir(dest, { recursive: true });
+  const srcEntries = await readdir(src, { withFileTypes: true });
+  const srcNames = new Set(srcEntries.map((e) => e.name));
+
+  // Drop anything in the store no longer present in the working copy.
+  for (const entry of await readdir(dest, { withFileTypes: true })) {
+    if (!srcNames.has(entry.name)) {
+      await rm(join(dest, entry.name), { recursive: true, force: true });
+    }
+  }
+
+  for (const entry of srcEntries) {
+    const from = join(src, entry.name);
+    const to = join(dest, entry.name);
+    if (entry.isSymbolicLink()) {
+      await rm(to, { recursive: true, force: true });
+      await symlink(await readlink(from), to);
+    } else if (entry.isDirectory()) {
+      await mirrorPath(from, to);
+    } else if (entry.isFile()) {
+      await mirrorPath(from, to);
+    }
+  }
+}
+
+/**
+ * Make `dest` a byte-identical mirror of `src`, replacing it wholesale if their
+ * kinds differ. Only differing regular files are rewritten, so an unchanged
+ * store stays untouched (no spurious drift).
+ */
+async function mirrorPath(src: string, dest: string): Promise<void> {
+  const st = await lstat(src);
+  if (st.isDirectory()) {
+    const destSt = await lstat(dest).catch(() => null);
+    if (!destSt || !destSt.isDirectory()) {
+      await rm(dest, { recursive: true, force: true });
+      await copyDir(src, dest);
+      return;
+    }
+    await mirrorDir(src, dest);
+    return;
+  }
+  if (st.isSymbolicLink()) {
+    await rm(dest, { recursive: true, force: true });
+    await symlink(await readlink(src), dest);
+    return;
+  }
+  // regular file
+  const destSt = await lstat(dest).catch(() => null);
+  if (!destSt || !destSt.isFile()) {
+    await rm(dest, { recursive: true, force: true });
+    await copyFile(src, dest);
+    return;
+  }
+  if (!(await sameFile(src, dest))) {
+    await writeFile(dest, await readFile(src));
+  }
 }
 
 /**
@@ -189,4 +299,17 @@ export async function dematerialise(paths: Paths, item: DirMergeItem): Promise<v
       throw err;
     }
   });
+}
+
+/**
+ * Copy-mode write-back: diff a copied item (`item.path`) against its store
+ * source (`item.target`) and write every change back to the store, so an agent
+ * editing the working copy has its edits persisted (D1). Changed and new files
+ * are written; files deleted from the copy are removed from the store. A no-op
+ * for a symlink item (edits already write through). Touches no state, so it
+ * needs no lock.
+ */
+export async function syncBack(paths: Paths, item: DirMergeItem): Promise<void> {
+  if (item.action !== 'copy') return;
+  await mirrorPath(item.path, item.target);
 }
