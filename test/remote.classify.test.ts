@@ -91,6 +91,12 @@ function unrelatedBare(): { dir: string; url: string } {
   return { dir: bare, url: pathToFileURL(bare).href };
 }
 
+/** A path where a bare repo WOULD live but does NOT (an unreachable file:// URL). */
+function missingBare(): { dir: string; url: string } {
+  const dir = join(scratch('bare-missing'), 'store.git');
+  return { dir, url: pathToFileURL(dir).href };
+}
+
 /** Commit subjects of a repo's HEAD history (bare or working). */
 function subjects(dir: string): string[] {
   return execFileSync('git', ['log', '--format=%s'], { cwd: dir, encoding: 'utf8' })
@@ -374,6 +380,67 @@ describe('remote 2.3: UNRELATED candidate → refuse / cancel / archive-and-adop
     expect(originUrl(paths.store)).toBe(oldRemote.url); // OLD url intact
     expect(subjects(paths.store)).toEqual(localBefore); // local intact
     expect(existsSync(join(paths.store, 'UNRELATED.md'))).toBe(false); // remote NOT adopted
+  });
+});
+
+describe('remote 2.3: UNREACHABLE candidate + the fault-injection matrix', () => {
+  it('an unreachable candidate on REPLACEMENT changes nothing (old remote survives)', async () => {
+    const th = gitHome();
+    const paths = resolvePaths(th.env);
+    const oldRemote = emptyBare();
+    await run(['init'], { env: th.env });
+    await run(['remote', oldRemote.url], { env: th.env });
+    const localBefore = subjects(paths.store);
+
+    const gone = missingBare(); // a file:// URL with no repo behind it
+    const res = await run(['remote', gone.url], { env: th.env });
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toMatch(/unreachable/i);
+    expect(originUrl(paths.store)).toBe(oldRemote.url); // OLD url intact
+    expect(subjects(paths.store)).toEqual(localBefore); // local intact
+  });
+
+  it('a probe (ls-remote) failure leaves the OLD remote configured and local intact', async () => {
+    const th = gitHome();
+    const paths = resolvePaths(th.env);
+    const oldRemote = emptyBare();
+    await run(['init'], { env: th.env });
+    await run(['remote', oldRemote.url], { env: th.env });
+    const localBefore = subjects(paths.store);
+
+    const candidate = emptyBare();
+    const failProbe: GitRunner = (args, opts) =>
+      args[0] === 'ls-remote' && args.includes(candidate.url)
+        ? Promise.resolve({ code: 1, stdout: '', stderr: 'simulated ls-remote failure', timedOut: false })
+        : defaultGitRunner(args, opts);
+
+    const res = await run(['remote', candidate.url], { env: th.env, gitRun: failProbe });
+    expect(res.code).not.toBe(0);
+    expect(originUrl(paths.store)).toBe(oldRemote.url); // unchanged
+    expect(subjects(paths.store)).toEqual(localBefore); // intact
+  });
+
+  it('a push failure while integrating a related remote rolls local back (transactional)', async () => {
+    const th = gitHome();
+    const paths = resolvePaths(th.env);
+    const oldRemote = emptyBare();
+    await run(['init'], { env: th.env });
+    await run(['remote', oldRemote.url], { env: th.env });
+    const related = relatedBare(paths.store);
+    await run(['create', 'writing'], { env: th.env }); // local-only commit
+    const localBefore = subjects(paths.store);
+
+    const failPush: GitRunner = (args, opts) =>
+      args[0] === 'push' && args.includes(related.url)
+        ? Promise.resolve({ code: 1, stdout: '', stderr: 'simulated push failure', timedOut: false })
+        : defaultGitRunner(args, opts);
+
+    const res = await run(['remote', related.url], { env: th.env, gitRun: failPush });
+    expect(res.code).not.toBe(0);
+    expect(originUrl(paths.store)).toBe(oldRemote.url); // OLD url intact
+    // The integrate was rolled back exactly: the remote's commit is NOT present locally.
+    expect(subjects(paths.store)).toEqual(localBefore);
+    expect(subjects(paths.store)).not.toContain('remote-divergent');
   });
 });
 
