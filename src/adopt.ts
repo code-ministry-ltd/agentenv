@@ -1,6 +1,7 @@
 import { copyFile, lstat, mkdir, readdir, readFile, readlink, rm, symlink } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { backup } from './backups.js';
+import { validateItemName, validateSkillDir } from './content-items.js';
 import type { DirMergeItem } from './dir-merge.js';
 import { scanTextForSecrets } from './git.js';
 import { beginTransaction, recoverState } from './journal.js';
@@ -104,7 +105,13 @@ export interface AdoptedRecord {
 }
 
 /** Why the sweep left a new item alone. */
-export type AdoptSkipReason = 'foreign-symlink' | 'secret-declined' | 'project' | 'no-env' | 'owned';
+export type AdoptSkipReason =
+  | 'foreign-symlink'
+  | 'secret-declined'
+  | 'project'
+  | 'no-env'
+  | 'owned'
+  | 'invalid';
 
 /** One item the sweep did not adopt, with the guardrail that stopped it. */
 export interface AdoptSkip {
@@ -195,6 +202,9 @@ export async function adoptSweep(req: AdoptSweepRequest): Promise<AdoptSweepResu
   const surfaces = req.surfaces ?? readInventory(await readState(paths));
   if (surfaces.length === 0) return result;
 
+  // Recovery-first: a crash mid-adoption is rolled back by the write-ahead journal
+  // before any new transaction opens (Finding 4: any residual crash orphan beyond
+  // this self-healing rollback is `agentenv doctor` territory — Task 3.3).
   if (!dryRun) await withLock(paths, () => recoverState(paths));
 
   for (const surface of surfaces) {
@@ -223,6 +233,15 @@ export async function adoptSweep(req: AdoptSweepRequest): Promise<AdoptSweepResu
         result.skipped.push({ name, surfacePath, reason: 'project' });
         continue;
       }
+      // Junk gate, name half (Finding 2): a `.`-prefixed entry (`.DS_Store`, a
+      // stray `.git/`, any dotfile) is never an adoptable item — skipped by NAME
+      // only, before any content read, so a nested `.git` cannot cause gitlink
+      // confusion and macOS finder droppings are never moved into the store.
+      if (name.startsWith('.')) {
+        result.skipped.push({ name, surfacePath, reason: 'invalid' });
+        note(`agentenv: skipping '${name}' — dotfiles/dot-dirs are never adopted.`);
+        continue;
+      }
       // Guardrail 1 (foreign-manager symlink): a symlink into a non-agentenv root
       // belongs to another manager → never touched (checked BEFORE reading content).
       if (await isForeignSymlink(surfacePath, paths.store)) {
@@ -230,6 +249,17 @@ export async function adoptSweep(req: AdoptSweepRequest): Promise<AdoptSweepResu
         note(
           `agentenv: leaving '${name}' alone — it is a symlink into another manager's root ` +
             `(${await readlink(surfacePath)}); adopting it would corrupt that manager.`,
+        );
+        continue;
+      }
+      // Junk gate, shape/name half (Finding 2): validate the candidate against its
+      // storeKind's real item shape (a valid skill dir; a `.md` file with a legal
+      // name for agents/commands). A malformed / mis-named item is skipped, never
+      // adopted. Runs AFTER guardrail 1 so a foreign link's content is never read.
+      if (!(await isAdoptableShape(surface.storeKind, surfacePath))) {
+        result.skipped.push({ name, surfacePath, reason: 'invalid' });
+        note(
+          `agentenv: skipping '${name}' — it is not a well-formed ${singular(surface.storeKind)} (name/shape check).`,
         );
         continue;
       }
@@ -430,6 +460,36 @@ export function isAdopted(item: ManifestItem): item is AdoptedDirMergeItem {
 // ---------------------------------------------------------------------------
 // Guardrail detection
 // ---------------------------------------------------------------------------
+
+/**
+ * Junk gate (Finding 2): whether a NEW candidate at `surfacePath` is a well-formed,
+ * adoptable item of `storeKind`. Conservative — reuses the same validators a
+ * scaffolded item is held to (`src/content-items.ts`):
+ * - `skills`   → a real directory that passes {@link validateSkillDir} (a `SKILL.md`
+ *                whose frontmatter name is a valid skill name and equals the folder);
+ * - `agents` / `commands` → a real `.md` FILE whose basename (sans `.md`) passes
+ *                {@link validateItemName}.
+ * A symlink, a loose non-`.md` file, or a mis-shaped/mis-named skill dir is NOT
+ * adoptable. Called only AFTER the foreign-symlink guardrail, so it never reads a
+ * foreign manager's link (and a lone symlink here — not ours, not foreign — is
+ * conservatively treated as non-adoptable).
+ */
+async function isAdoptableShape(
+  storeKind: 'skills' | 'agents' | 'commands',
+  surfacePath: string,
+): Promise<boolean> {
+  const st = await lstat(surfacePath);
+  if (st.isSymbolicLink()) return false;
+  if (storeKind === 'skills') {
+    if (!st.isDirectory()) return false;
+    return !('error' in (await validateSkillDir(surfacePath)));
+  }
+  // agents / commands: a real `.md` file with a legal item name.
+  if (!st.isFile()) return false;
+  const base = baseName(surfacePath);
+  if (!/\.md$/i.test(base)) return false;
+  return validateItemName(singular(storeKind), base.replace(/\.md$/i, '')) === null;
+}
 
 /**
  * Guardrail 1: whether `itemPath` is a symlink whose target is OUTSIDE the store

@@ -1,4 +1,4 @@
-import { mkdirSync, readlinkSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readlinkSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { lstat, readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -176,6 +176,51 @@ describe('adopt: guardrail 4 — no active env leaves items global', () => {
     expect(result.adopted).toHaveLength(0);
     expect(result.skipped.some((s) => s.name === 'orphan' && s.reason === 'no-env')).toBe(true);
     expect((await lstat(join(surfaceDir, 'orphan'))).isDirectory()).toBe(true);
+  });
+});
+
+describe('adopt: Finding 2 — junk / dotfiles / malformed items are never auto-adopted', () => {
+  /** A directory `folder` whose SKILL.md frontmatter name is `frontName` (mis-named when they differ). */
+  function makeMisnamedSkill(surfaceDir: string, folder: string, frontName: string): void {
+    const dir = join(surfaceDir, folder);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'SKILL.md'), `---\nname: ${frontName}\ndescription: mis-named\n---\n\n# ${frontName}\n`, 'utf8');
+  }
+
+  it('adopts only the well-formed skill; skips dotfiles, loose files, and mis-shaped dirs as invalid', async () => {
+    const { paths, surfaceDir } = await setup();
+
+    // Junk that MUST NEVER be adopted:
+    writeFileSync(join(surfaceDir, '.DS_Store'), 'macOS finder junk\n', 'utf8'); // dotfile
+    mkdirSync(join(surfaceDir, '.git'), { recursive: true }); // dot-dir (gitlink risk)
+    writeFileSync(join(surfaceDir, '.git', 'HEAD'), 'ref: refs/heads/main\n', 'utf8');
+    writeFileSync(join(surfaceDir, 'notes.txt'), 'a loose non-item file\n', 'utf8'); // loose file
+    makeMisnamedSkill(surfaceDir, 'wrongname', 'othername'); // folder != frontmatter name
+
+    // A well-formed skill that MUST be adopted:
+    makeSkill(surfaceDir, 'sharpen', '# sharpen body\n');
+
+    const result = await adoptSweep({ paths });
+
+    // Only the well-formed skill is adopted.
+    expect(result.adopted.map((a) => a.name)).toEqual(['sharpen']);
+
+    // Every junk item is reported skipped `invalid`, is NOT in the store, and is NOT owned.
+    const state = await readState(paths);
+    for (const junk of ['.DS_Store', '.git', 'notes.txt', 'wrongname']) {
+      expect(result.skipped.some((s) => s.name === junk && s.reason === 'invalid')).toBe(true);
+      expect(existsSync(join(paths.envDir('work'), 'skills', junk))).toBe(false);
+      expect(state.items.some((i) => i.path === join(surfaceDir, junk))).toBe(false);
+    }
+    // Junk left untouched on the surface (not moved out / not symlinked away).
+    expect((await lstat(join(surfaceDir, 'notes.txt'))).isFile()).toBe(true);
+    expect((await lstat(join(surfaceDir, 'wrongname'))).isDirectory()).toBe(true);
+    expect((await lstat(join(surfaceDir, '.git'))).isDirectory()).toBe(true);
+    expect((await lstat(join(surfaceDir, '.DS_Store'))).isFile()).toBe(true);
+
+    // The good skill IS in the store and symlinked back.
+    expect(existsSync(join(paths.envDir('work'), 'skills', 'sharpen', 'SKILL.md'))).toBe(true);
+    expect((await lstat(join(surfaceDir, 'sharpen'))).isSymbolicLink()).toBe(true);
   });
 });
 
