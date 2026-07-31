@@ -1,6 +1,7 @@
 import { adapters as realAdapters } from '../adapters/index.js';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
+import { driftSweep } from '../drift.js';
 import { materialiseGlobal, selectAdapters } from '../engine.js';
 import { setBinding } from '../session/registry.js';
 import { resolveProjectRoot } from '../session/registry.js';
@@ -104,6 +105,9 @@ async function useGlobal(
   if (kept.length === 0) {
     return { stdout: '', stderr: `${notices.join('\n')}\nuse --global: no valid environments to activate\n`, code: 1 };
   }
+
+  // Per-invocation drift sweep (D9): capture mid-session edits before mutating.
+  await driftSweep({ paths, adapters, env, onWarn: (m) => notices.push(m) });
 
   const result = await materialiseGlobal({
     paths,

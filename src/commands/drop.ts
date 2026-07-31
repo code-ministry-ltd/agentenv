@@ -1,6 +1,7 @@
 import { adapters as realAdapters } from '../adapters/index.js';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
+import { driftSweep } from '../drift.js';
 import { dematerialiseGlobal, selectAdapters } from '../engine.js';
 import {
   findBinding,
@@ -88,6 +89,10 @@ async function dropGlobal(
   const restrictToRoots = harnesses ? adapters.map((a) => a.realConfigRoot(env)) : undefined;
 
   const notices: string[] = [];
+  // Drift sweep BEFORE removal (D9): reconcile config-key hashes so removal is not
+  // blocked by drift, and preserve mid-session edits to the store first.
+  await driftSweep({ paths, adapters, env, onWarn: (m) => notices.push(m) });
+
   const result = await dematerialiseGlobal({
     paths,
     adapters,
