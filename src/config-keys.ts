@@ -274,8 +274,13 @@ function jsonBaseText(text: string): string {
  * Inject an object key at `keyPath`, format- and comment-preserving. JSON/JSONC
  * uses jsonc-parser surgical `modify` with no reformatting, so a full
  * inject→remove cycle is byte-identical to the original. Records ownership via the
- * transaction (backup-first, write-ahead journal). Idempotent: re-injecting the
- * same key overwrites its value and refreshes the hash.
+ * transaction (backup-first, write-ahead journal).
+ *
+ * Refuses (a {@link ConfigKeysError}) when a NON-owned value already sits at
+ * `keyPath` — it will not silently overwrite a user's JSON key (which a later
+ * removal would then delete) nor emit a doubled `[table]` in TOML (fix B2). See
+ * {@link assertNoCollision} for the scope boundary between this refusal and the
+ * engine's skip/force/re-activation policy (task 1.7).
  *
  * Returns the ownership record the caller should surface in status; the engine's
  * `tx.commit()` upserts it into the manifest.
@@ -286,6 +291,7 @@ export async function injectKeyed(
   req: InjectKeyedRequest,
 ): Promise<ConfigKeysItem> {
   const text = await readText(req.file);
+  assertNoCollision(text, req);
   // Record which ancestor levels we CREATE, so removal can prune exactly them and
   // no more (fix B1). TOML uses whole marked [table] blocks — nothing to prune.
   const createdParents =
@@ -310,6 +316,38 @@ function countCreatedParents(root: unknown, keyPath: KeyPath): number {
     if (!getAtPath(root, keyPath.slice(0, depth)).found) created++;
   }
   return created;
+}
+
+/**
+ * Refuse a keyed inject that would land on a value/table the environment does not
+ * own (fix B2).
+ *
+ * SCOPE BOUNDARY: this module owns key paths but cannot see the manifest, so
+ * "owned" is judged from the file alone. For TOML, our marked block is stripped
+ * first, so re-injecting/overwriting *our own* key is fine; a value that still
+ * resolves at `keyPath` afterwards is the user's unmarked table → refuse (rather
+ * than emit a second `[table]`, which is invalid TOML). For JSON/JSONC there are
+ * no markers, so ANY pre-existing value at `keyPath` is treated as a collision and
+ * refused (rather than silently overwrite a key a later removal would then delete).
+ * Deciding to skip, force, or re-activate an owned key over a collision is the
+ * engine's policy (task 1.7); this module's contract is only to REFUSE rather than
+ * corrupt, and to surface the collision as a {@link ConfigKeysError}.
+ */
+function assertNoCollision(text: string, req: InjectKeyedRequest): void {
+  const preexisting =
+    req.format === 'toml'
+      ? getAtPath(
+          parseTomlConfig(tomlStripMarkedBlock(text, keyedDiscriminator(req.keyPath)).text, req.file),
+          req.keyPath,
+        ).found
+      : getAtPath(parseJsonConfig(jsonBaseText(text), req.file), req.keyPath).found;
+  if (preexisting) {
+    throw new ConfigKeysError(
+      `${req.file}: refusing to inject over an existing non-owned value at ` +
+        `${displayPath(req.keyPath)} — resolve the collision first (skip/force is the engine's call)`,
+      req.file,
+    );
+  }
 }
 
 /**

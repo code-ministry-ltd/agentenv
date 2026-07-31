@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { parse as parseToml, stringify as stringifyToml } from 'smol-toml';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  ConfigKeysError,
   injectArrayElement,
   injectKeyed,
   removeKey,
@@ -501,6 +502,58 @@ transport = "stdio"
       const second = await inTx(p, (tx) => removeKey(p, tx, item));
       expect(second).toMatchObject({ removed: false, reason: 'absent' });
       expect(second.note).toMatch(/absent/);
+    });
+  });
+
+  // B2 (REQUIRED): injecting a keyed value over a pre-existing NON-owned value/table
+  // must REFUSE — never silently overwrite a user's JSON key (a later removal would
+  // then delete it) nor emit a doubled [table] in TOML (invalid). Skip/force policy
+  // is the engine's (1.7) call; this module's job is to refuse rather than corrupt.
+  describe('config-keys keyed inject collision refusal', () => {
+    it('refuses a JSON inject over a pre-existing non-owned key (no silent overwrite)', async () => {
+      const p = paths();
+      const f = file('claude.json');
+      const original = '{\n  "mcpServers": {\n    "linear": { "transport": "stdio" }\n  }\n}\n';
+      writeFileSync(f, original);
+
+      await expect(
+        inTx(p, (tx) =>
+          injectKeyed(p, tx, {
+            file: f,
+            format: 'json',
+            keyPath: ['mcpServers', 'linear'],
+            value: { transport: 'http' },
+            ownerEnv: 'writing',
+          }),
+        ),
+      ).rejects.toBeInstanceOf(ConfigKeysError);
+
+      // The user's key is untouched and nothing was committed to the manifest.
+      expect(readFileSync(f, 'utf8')).toBe(original);
+      expect(findOwners(await readState(p), f)).toHaveLength(0);
+    });
+
+    it('refuses a TOML inject over a pre-existing non-owned table (no invalid TOML)', async () => {
+      const p = paths();
+      const f = file('config.toml');
+      const original = '[mcp_servers.linear]\ntransport = "stdio"\n';
+      writeFileSync(f, original);
+
+      await expect(
+        inTx(p, (tx) =>
+          injectKeyed(p, tx, {
+            file: f,
+            format: 'toml',
+            keyPath: ['mcp_servers', 'linear'],
+            value: { transport: 'http', url: 'https://mcp.linear.app/mcp' },
+            ownerEnv: 'writing',
+          }),
+        ),
+      ).rejects.toBeInstanceOf(ConfigKeysError);
+
+      // The user's file is left byte-for-byte intact (no doubled table written).
+      expect(readFileSync(f, 'utf8')).toBe(original);
+      expect(findOwners(await readState(p), f)).toHaveLength(0);
     });
   });
 });
