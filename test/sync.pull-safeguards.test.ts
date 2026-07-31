@@ -39,12 +39,17 @@ const GIT_ENV: NodeJS.ProcessEnv = {
   GIT_COMMITTER_EMAIL: 'other@machine.invalid',
 };
 
+/** Run git quietly (git chatters progress to stderr; keep the test output clean). */
+function quietGit(args: string[], cwd?: string): void {
+  execFileSync('git', args, { ...(cwd ? { cwd } : {}), env: GIT_ENV, stdio: 'ignore' });
+}
+
 /** Create + init a bare remote; return its file:// URL. */
 function makeBareRemote(): string {
   const dir = mkdtempSync(join(tmpdir(), 'agentenv-remote-'));
   dirs.push(dir);
   const bare = join(dir, 'store.git');
-  execFileSync('git', ['init', '--bare', '-b', 'main', bare], { encoding: 'utf8' });
+  quietGit(['init', '--bare', '-b', 'main', bare]);
   return pathToFileURL(bare).href;
 }
 
@@ -53,11 +58,11 @@ function otherMachinePushes(remoteUrl: string, mutate: (storeRoot: string) => vo
   const wd = mkdtempSync(join(tmpdir(), 'agentenv-other-'));
   dirs.push(wd);
   const clone = join(wd, 'clone');
-  execFileSync('git', ['clone', remoteUrl, clone], { env: GIT_ENV, encoding: 'utf8' });
+  quietGit(['clone', remoteUrl, clone]);
   mutate(clone);
-  execFileSync('git', ['add', '-A'], { cwd: clone, env: GIT_ENV });
-  execFileSync('git', ['commit', '-m', message, '--no-verify'], { cwd: clone, env: GIT_ENV });
-  execFileSync('git', ['push', 'origin', 'main'], { cwd: clone, env: GIT_ENV });
+  quietGit(['add', '-A'], clone);
+  quietGit(['commit', '-m', message, '--no-verify'], clone);
+  quietGit(['push', 'origin', 'main'], clone);
 }
 
 /** A hermetic fixture "real home" for the fixture harness, plus resolved paths. */
