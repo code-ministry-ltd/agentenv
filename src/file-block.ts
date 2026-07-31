@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, rm } from 'node:fs/promises';
 import type { BackupRef } from './backups.js';
 import { backup } from './backups.js';
 import { writeFileAtomic } from './fs-atomic.js';
@@ -95,6 +95,14 @@ declare module './state.js' {
 
 /** Convenience alias for the registered file-block variant. */
 export type FileBlockItem = import('./state.js').ManifestItemVariants['file-block'];
+
+/** Inputs to {@link dematerialise} and {@link syncBack}. */
+export interface FileBlockTargetOptions {
+  /** Absolute path to the target user instruction file. */
+  target: string;
+  /** The owning environment whose region is operated on. */
+  env: string;
+}
 
 /** Inputs to {@link materialise}. */
 export interface MaterialiseOptions {
@@ -194,8 +202,12 @@ function regionSpan(content: string, env: string): { start: number; end: number 
 /**
  * Strip `env`'s managed region from `content`, returning the surrounding user
  * content byte-for-byte. The exact inverse of {@link appendRegion}: the region
- * was joined with a single leading `\n` separator (when user content precedes
- * it) and a single trailing `\n`, so both are removed here and nothing else.
+ * is always joined with exactly one leading `\n` separator and exactly one
+ * trailing `\n`, so one of each is removed here and nothing else. Removing a
+ * *fixed* one leading newline (never a heuristic count) is what lets a user
+ * safely prepend their own content — e.g. `MY NOTES\n` above the region — and
+ * keep it: their newline survives because only agentenv's single separator is
+ * reclaimed.
  */
 export function stripRegion(content: string, env: string): { user: string; region: string | null } {
   const span = regionSpan(content, env);
@@ -205,22 +217,23 @@ export function stripRegion(content: string, env: string): { user: string; regio
   const region = content.slice(span.start, span.end);
   const after = content.slice(span.end);
 
-  // Reverse appendRegion: content = user + SEP + region + "\n",
-  // where SEP = "" when user is empty, else "\n". So remove one separator "\n"
-  // from the tail of `before` and one trailing "\n" from `after`.
+  // Reverse appendRegion: content = user + "\n" + region + "\n". Remove the one
+  // separator "\n" from the tail of `before` and the one trailing "\n" from
+  // `after`; everything else is the user's, byte-for-byte.
   const userHead = before.endsWith('\n') ? before.slice(0, -1) : before;
   const userTail = after.startsWith('\n') ? after.slice(1) : after;
   return { user: userHead + userTail, region };
 }
 
 /**
- * Append a rendered region `region` to user content, byte-reversibly by
- * {@link stripRegion}: exactly one `\n` separates existing content from the
- * region (giving a blank line when the content already ends in a newline), and
- * exactly one `\n` terminates the file.
+ * Append a rendered region to user content, byte-reversibly by
+ * {@link stripRegion}: exactly one `\n` always separates the (possibly empty)
+ * user content from the region — giving a blank line whenever the content
+ * already ends in a newline — and exactly one `\n` terminates the file. The
+ * separator is inserted unconditionally (even for empty content) so its removal
+ * is unambiguous regardless of any user edits made around the region later.
  */
 export function appendRegion(user: string, region: string): string {
-  if (user === '') return `${region}\n`;
   return `${user}\n${region}\n`;
 }
 
@@ -330,5 +343,69 @@ export async function materialise(paths: Paths, opts: MaterialiseOptions): Promi
       throw err;
     }
     return item;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// dematerialise
+// ---------------------------------------------------------------------------
+
+/**
+ * Remove an env's managed region from a target instruction file. Only
+ * agentenv's markers and their content are removed; the surrounding user
+ * content is restored byte-for-byte (spec round-trip guarantee). If agentenv
+ * created the file (its preserved backup is `absent`) and nothing else remains,
+ * the file is deleted rather than left empty; a pre-existing empty file is
+ * restored to empty, not deleted.
+ *
+ * Idempotent — a second drop with no region and no ownership record is a safe
+ * no-op. Transactional and under {@link withLock}, like {@link materialise}:
+ * the current file is backed up so a crash mid-drop rolls back.
+ */
+export async function dematerialise(paths: Paths, opts: FileBlockTargetOptions): Promise<void> {
+  const { target, env } = opts;
+  return withLock(paths, async () => {
+    const manifest = await readState(paths);
+    const record = findRecord(manifest, target, env);
+    const before = await readFileOrEmpty(target);
+    const span = regionSpan(before, env);
+    // Nothing owned here and no region to strip: a safe no-op (idempotent drop).
+    if (!record && !span) return;
+
+    const after = stripRegion(before, env).user;
+    // Delete only a file agentenv itself created that is now empty; never a file
+    // that pre-existed (even empty) or that still holds user content.
+    const deleteFile = after === '' && record?.backupRef?.kind === 'absent';
+
+    const currentBackup = await backup(paths, target);
+    const removalItem: ManifestItem =
+      record ??
+      ({
+        surface: 'file-block',
+        action: 'file-block',
+        path: target,
+        key: env,
+        ownerEnv: env,
+        mode: 'inline',
+        subBlocks: [],
+      } as FileBlockItem);
+
+    const tx = await beginTransaction(paths);
+    try {
+      await tx.apply(
+        { op: 'remove', item: removalItem, undo: { path: target, backupRef: currentBackup } },
+        async () => {
+          if (deleteFile) {
+            await rm(target, { force: true });
+          } else {
+            await writeFileAtomic(target, after);
+          }
+        },
+      );
+      await tx.commit();
+    } catch (err) {
+      await tx.rollback();
+      throw err;
+    }
   });
 }
