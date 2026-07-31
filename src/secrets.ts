@@ -1,5 +1,5 @@
 import { chmod, readFile } from 'node:fs/promises';
-import type { JsonValue } from './config-keys.js';
+import { splitDotted, type JsonValue } from './config-keys.js';
 import { writeFileAtomic } from './fs-atomic.js';
 import type { Paths } from './paths.js';
 
@@ -173,9 +173,11 @@ export interface SubstituteFieldsResult {
  * './config-keys.js').syncBack}) restores those same subfields to their placeholders,
  * so nothing substituted here can ever be carried into the store as a literal.
  *
- * The subpath split is naive on `.` — symmetric with the `${prefix}.${k}` keys the
- * adapters produce (`collectPlaceholders`). A subpath that no longer resolves to a
- * string is skipped (best-effort), never an error.
+ * The subpath split is escape-aware ({@link import('./config-keys.js').splitDotted})
+ * — symmetric with BOTH the escaped keys the adapters produce (`collectPlaceholders`)
+ * and the restore side (`restoreSecrets`), so a key name containing a literal `.`
+ * navigates identically on every path. A subpath that no longer resolves to a string
+ * is skipped (best-effort), never an error.
  */
 export function substituteSecretFields(
   value: JsonValue,
@@ -185,7 +187,7 @@ export function substituteSecretFields(
   const clone = structuredClone(value);
   const unresolved: string[] = [];
   for (const dotted of Object.keys(secretFields)) {
-    const segments = dotted.split('.');
+    const segments = splitDotted(dotted);
     const current = getStringAt(clone, segments);
     if (current === undefined) continue; // subfield gone/non-string — best-effort
     const res = substituteString(current, resolve);

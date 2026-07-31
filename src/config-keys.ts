@@ -671,7 +671,7 @@ function restoreSecrets(value: JsonValue, secretFields?: Record<string, string>)
  * so a real key name containing a dot can be addressed as `\.` without being split
  * into two segments (fix C2).
  */
-function splitDotted(dotted: string): string[] {
+export function splitDotted(dotted: string): string[] {
   const segments: string[] = [];
   let current = '';
   let escaped = false;

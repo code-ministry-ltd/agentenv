@@ -118,7 +118,11 @@ function collectPlaceholders(value: unknown, prefix: string, out: Record<string,
   }
   if (value && typeof value === 'object') {
     for (const [k, v] of Object.entries(value)) {
-      collectPlaceholders(v, prefix === '' ? k : `${prefix}.${k}`, out);
+      // Escape a literal `.`/`\` in the key so the dotted path round-trips through
+      // the escape-aware split on BOTH consumers (substitute + restore) — mirrors
+      // the real adapter (secret-safety fix).
+      const seg = k.replace(/\\/g, '\\\\').replace(/\./g, '\\.');
+      collectPlaceholders(v, prefix === '' ? seg : `${prefix}.${seg}`, out);
     }
   }
 }

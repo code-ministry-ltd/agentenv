@@ -153,6 +153,32 @@ describe('secrets: substituteSecretFields', () => {
     );
     expect(unresolved).toEqual(['MISSING']);
   });
+
+  it('navigates a key name containing a literal dot (escape-aware split)', () => {
+    // The flagged subpath is `env.weird\.key` — the key is `weird.key`, ONE segment.
+    // A naive `.` split would descend env→weird→key and miss it (leak on restore);
+    // the escape-aware split resolves the real key. Escaping is symmetric with the
+    // adapters' `collectPlaceholders` and the restore-side `restoreSecrets`.
+    const value: JsonValue = { env: { 'weird.key': '${TOKEN}' } };
+    const { value: outValue, unresolved } = substituteSecretFields(
+      value,
+      { 'env.weird\\.key': '${TOKEN}' },
+      resolve,
+    );
+    expect(unresolved).toEqual([]);
+    expect(outValue).toEqual({ env: { 'weird.key': 'tkn' } });
+  });
+
+  it('substitutes an ARRAY-nested placeholder by index (args.<i>)', () => {
+    const value: JsonValue = { command: 'npx', args: ['--api-key', '${TOKEN}'] };
+    const { value: outValue, unresolved } = substituteSecretFields(
+      value,
+      { 'args.1': '${TOKEN}' },
+      resolve,
+    );
+    expect(unresolved).toEqual([]);
+    expect(outValue).toEqual({ command: 'npx', args: ['--api-key', 'tkn'] });
+  });
 });
 
 describe('secrets: masking + write', () => {
