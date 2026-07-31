@@ -198,6 +198,47 @@ describe('adapter.opencode — compileConfigKeys: MCP (canonical → OpenCode mc
     if (inj.style !== 'keyed') throw new Error('unreachable');
     expect(inj.value).toEqual({ type: 'local', command: ['/bin/echo', 'hi'], enabled: true });
   });
+
+  it('honours a hand-authored `type: sse` rather than re-inferring from the url (F5/2)', async () => {
+    const dir = envWithServers('linear:\n  type: sse\n  url: https://mcp.linear.app/sse\n');
+    const out = await opencodeAdapter.compileConfigKeys(MCP_SURFACE, {
+      envContentDir: dir,
+      projectRoot: null,
+    });
+    const inj = out[0]!;
+    if (inj.style !== 'keyed') throw new Error('unreachable');
+    expect(inj.value).toEqual({
+      type: 'remote',
+      url: 'https://mcp.linear.app/sse',
+      enabled: true,
+    });
+  });
+
+  it('never re-enables a deliberately disabled server (F5/2)', async () => {
+    // Canonical form…
+    const canonical = envWithServers(
+      'echo:\n  transport: stdio\n  command: /bin/echo\n  enabled: false\n',
+    );
+    const fromCanonical = await opencodeAdapter.compileConfigKeys(MCP_SURFACE, {
+      envContentDir: canonical,
+      projectRoot: null,
+    });
+    const a = fromCanonical[0]!;
+    if (a.style !== 'keyed') throw new Error('unreachable');
+    expect(a.value).toEqual({ type: 'local', command: ['/bin/echo'], enabled: false });
+
+    // …and the hand-authored OpenCode form.
+    const authored = envWithServers(
+      'echo:\n  type: local\n  command: ["/bin/echo"]\n  enabled: false\n',
+    );
+    const fromAuthored = await opencodeAdapter.compileConfigKeys(MCP_SURFACE, {
+      envContentDir: authored,
+      projectRoot: null,
+    });
+    const b = fromAuthored[0]!;
+    if (b.style !== 'keyed') throw new Error('unreachable');
+    expect(b.value).toEqual({ type: 'local', command: ['/bin/echo'], enabled: false });
+  });
 });
 
 describe('adapter.opencode — compileConfigKeys: instructions (array-element, absolute store paths)', () => {
@@ -302,6 +343,32 @@ describe('adapter.opencode — syncBackConfigKeys (criterion 4)', () => {
     if (inj.style !== 'keyed') throw new Error('unreachable');
     expect(inj.value).toEqual(drifted);
     expect(inj.secretFields).toEqual({ 'headers.Authorization': 'Bearer {env:LINEAR_TOKEN}' });
+  });
+
+  it("does not mangle Cursor's ${env:VAR} into $${VAR} on write-back (F5/9)", async () => {
+    // A `servers.yaml` written by a pre-F1 Cursor drift sweep still holds Cursor's
+    // `${env:VAR}`. OpenCode's compile leaves it alone (its own syntax is `{env:VAR}`),
+    // so it reaches the write-back — where a `{env:…}` regex without a `$` guard also
+    // matched the INNER braces and produced `$${VAR}`, which no harness interpolates.
+    const dir = envWithServers('gh:\n  transport: stdio\n  command: gh-mcp\n');
+    const mutations = await opencodeAdapter.syncBackConfigKeys!(
+      MCP_SURFACE,
+      {
+        style: 'keyed',
+        keyPath: ['mcp', 'gh'],
+        canonicalValue: {
+          type: 'local',
+          command: ['gh-mcp'],
+          enabled: true,
+          env: { CURSOR_STYLE: '${env:GH_TOKEN}', OPENCODE_STYLE: '{env:GH_TOKEN}' },
+        },
+      },
+      { envContentDir: dir, projectRoot: null },
+    );
+    const written = parseYaml(mutations[0]!.content) as Record<string, JsonValue>;
+    const env = (written.gh as Record<string, JsonValue>).env as Record<string, JsonValue>;
+    expect(env.CURSOR_STYLE).toBe('${env:GH_TOKEN}'); // left alone, NOT '$${GH_TOKEN}'
+    expect(env.OPENCODE_STYLE).toBe('${GH_TOKEN}'); // OpenCode's own form still converts
   });
 
   it('ignores a non-mcp / non-keyed drift (instructions array-element carries no drift)', async () => {

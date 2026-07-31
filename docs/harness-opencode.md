@@ -133,10 +133,17 @@ Canonical `mcp/servers.yaml` (D6) → OpenCode `opencode.json` `mcp.<name>`:
 
 | canonical | OpenCode |
 |---|---|
-| `transport: stdio` + `command`/`args`/`env` | `{ type:"local", command:[command, ...args], enabled:true, env? }` |
-| `transport: http`\|`sse` + `url`/`headers` | `{ type:"remote", url, enabled:true, headers? }` |
+| `transport: stdio` + `command`/`args`/`env` | `{ type:"local", command:[command, ...args], enabled, env? }` |
+| `transport: http`\|`sse` + `url`/`headers` | `{ type:"remote", url, enabled, headers? }` |
 | `auth: { bearer_env: VAR }` | header `Authorization: "Bearer {env:VAR}"` |
+| `enabled: false` | `enabled: false` (defaults to `true` when canonical says nothing) |
 | `${VAR}` (any string) | `{env:VAR}` (OpenCode's native syntax) |
+
+A canonical `enabled: false` is **carried through**: a deliberately disabled server must
+never be silently switched back on. A HAND-AUTHORED harness-shaped entry (no
+`transport`, an OpenCode/Claude-style `type`) keeps its `type` as the transport hint
+rather than being re-inferred from the bare `url` — otherwise `{ type: sse, url }` would
+compile to an HTTP server and the SSE endpoint would break.
 
 Canonical `${VAR}` placeholders are **compiled to OpenCode's `{env:VAR}` form and
 KEPT** (rung-1 passthrough — OpenCode interpolates `{env:VAR}` natively,
@@ -144,15 +151,34 @@ KEPT** (rung-1 passthrough — OpenCode interpolates `{env:VAR}` natively,
 `secretFields` so drift write-back restores the placeholder, never a baked literal
 (D6).
 
-`servers.yaml` is **always D6-canonical** (F1): `syncBackConfigKeys` reverse-maps a
-drifted server via `unshapeOpenCodeServer` (the inverse of the forward transform —
-`{env:VAR}`→`${VAR}`, the single `command` array split back into `command`+`args`,
-`type:'local'|'remote'`+`enabled` dropped, `Authorization: Bearer {env:VAR}`→
-`auth.bearer_env`) and writes the **canonical** shape, NEVER OpenCode's `{env:}`/
-array shape. This keeps the shared store readable by every OTHER adapter and is
-round-trip stable — `compile(syncBack(v)) === v`. `http` vs `sse` is not
-distinguishable in OpenCode's single `remote` type; an `sse` canonical entry
-round-trips as `remote`→`http` (documented, rare).
+`servers.yaml` is **always D6-canonical** (F1): `syncBackConfigKeys` folds a drifted
+server back via `unshapeOpenCodeServer` (`{env:VAR}`→`${VAR}`, the single `command`
+array split back into `command`+`args`, `type:'local'|'remote'`→`transport`,
+`Authorization: Bearer {env:VAR}`→`auth.bearer_env`) and writes the **canonical** shape,
+NEVER OpenCode's `{env:}`/array shape. This keeps the shared store readable by every
+OTHER adapter and is round-trip stable — `compile(syncBack(v)) === v`.
+
+**OVERLAY-AND-PRESERVE, not reconstruction.** The un-shape is applied as an overlay onto
+the PRIOR canonical def read from `servers.yaml`, never as a fresh reconstruction,
+because the forward shape is **not injective**:
+
+- `type:"remote"` maps from BOTH `transport: http` and `transport: sse`;
+- `command:[cmd, ...args]` maps from BOTH `{command:"a", args:["b"]}` and
+  `{command:["a","b"]}`.
+
+With a prior canonical def in hand, both ambiguities resolve exactly: the prior
+`transport` is kept verbatim while the entry stays in the same family, and the prior
+`command`/`args` split is kept whenever the flattened array is unchanged. Everything the
+OpenCode shape cannot express (`timeout`, any field a future release adds) survives from
+the prior def, and everything the user adds in `opencode.json` is carried over verbatim
+— there is no whitelist.
+
+**Where NO prior canonical entry exists** (a server the user added straight into
+`opencode.json`), the `http`/`sse` ambiguity is **irreducible** — OpenCode's config
+simply does not record the difference — and the write-back infers `http`. Codex has the
+same irreducible gap (a bare `url` table). Claude and Cursor do not: they keep a native
+`type`, so they recover `sse` exactly. This is a property of OpenCode's schema, not a
+bug we can fix.
 
 **Round-trip note (`use --global` → `drop`).** Keyed config-keys (this MCP surface)
 and file-block surfaces restore byte-identically. The **array-element** surface —

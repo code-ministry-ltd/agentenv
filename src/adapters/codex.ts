@@ -19,6 +19,12 @@ import type {
 } from '../adapter.js';
 import type { JsonValue } from '../config-keys.js';
 import { resolveBinaryOnPath } from '../session/resolve.js';
+import {
+  foldDriftIntoCanonical,
+  omitKeys,
+  passthroughUnshape,
+  type UnshapedServer,
+} from './mcp-canonical.js';
 
 /**
  * The Codex CLI adapter — the Phase-4 implementation of the frozen {@link Adapter}
@@ -227,31 +233,58 @@ function shapeCodexServer(def: unknown): JsonValue {
   return def as JsonValue;
 }
 
+/** Codex-only keys the un-shape TRANSLATES away (they have canonical counterparts). */
+const CODEX_NATIVE_KEYS = [
+  'env_vars',
+  'bearer_token_env_var',
+  'http_headers',
+  'env_http_headers',
+] as const;
+
 /**
- * The inverse of {@link shapeCodexServer}: one drifted Codex `[mcp_servers.<name>]`
- * table back to the canonical `servers.yaml` D6 shape (`transport` + `auth`/`env`
- * with `${VAR}` restored). Keeping `servers.yaml` in the pure canonical form — the
- * shape `add mcp` authors and Claude's compile also reads — is the Phase-4
- * decision that servers.yaml is D6-canonical across adapters.
+ * The canonical keys {@link shapeCodexServer} is authoritative for. Unlike the other
+ * adapters, `auth` is unconditional: Codex's `bearer_token_env_var` is an EXACT
+ * bidirectional mapping with no header shadowing it, so its absence really does mean
+ * the bearer was removed.
  */
-function unshapeCodexServer(def: unknown): JsonValue {
-  if (!isObject(def)) return def as JsonValue;
+const CODEX_SUPERSEDES = ['command', 'args', 'env', 'url', 'headers', 'auth'] as const;
+
+/**
+ * The inverse of {@link shapeCodexServer}, as an OVERLAY over the prior canonical def
+ * (see `mcp-canonical.ts`): the native indirections (`env_vars`, `bearer_token_env_var`,
+ * `env_http_headers`) translated back to canonical `env`/`auth`/`headers` with `${VAR}`
+ * restored, and every OTHER field of the drifted table carried over verbatim, so a field
+ * the user added in `config.toml` reaches the store rather than being dropped by a
+ * whitelist (F5/3). Codex's table cannot distinguish `http` from `sse` (both are just a
+ * `url`), so the prior canonical `transport` is kept verbatim by the overlay (F5/4); a
+ * bespoke `transport` the shaper passed through is never re-inferred (F5/1).
+ */
+function unshapeCodexServer(def: Record<string, JsonValue>): UnshapedServer {
+  // A `transport` in `config.toml` can only have come from the shaper's bespoke
+  // passthrough, so the entry is already canonical — never re-infer over it (F5/1).
+  if (typeof def.transport === 'string') return passthroughUnshape(def);
 
   if (def.command !== undefined) {
-    const out: Record<string, JsonValue> = { transport: 'stdio', command: def.command };
-    if (def.args !== undefined) out.args = def.args;
+    const fields: Record<string, JsonValue> = {
+      transport: 'stdio',
+      ...omitKeys(def, [...CODEX_NATIVE_KEYS, 'env']),
+    };
     const env: Record<string, JsonValue> = isObject(def.env) ? { ...def.env } : {};
     if (Array.isArray(def.env_vars)) {
       for (const v of def.env_vars) if (typeof v === 'string') env[v] = `\${${v}}`;
     }
-    if (Object.keys(env).length > 0) out.env = env;
-    return out;
+    if (Object.keys(env).length > 0) fields.env = env;
+    else if (def.env !== undefined && !isObject(def.env)) fields.env = def.env;
+    return { fields, supersedes: CODEX_SUPERSEDES, family: 'stdio' };
   }
 
   if (def.url !== undefined) {
-    const out: Record<string, JsonValue> = { transport: 'http', url: def.url };
+    const fields: Record<string, JsonValue> = {
+      transport: 'http',
+      ...omitKeys(def, [...CODEX_NATIVE_KEYS, 'headers']),
+    };
     if (typeof def.bearer_token_env_var === 'string') {
-      out.auth = { bearer_env: def.bearer_token_env_var };
+      fields.auth = { bearer_env: def.bearer_token_env_var };
     }
     const headers: Record<string, JsonValue> = isObject(def.http_headers)
       ? { ...def.http_headers }
@@ -261,13 +294,13 @@ function unshapeCodexServer(def: unknown): JsonValue {
         if (typeof varName === 'string') headers[name] = `\${${varName}}`;
       }
     }
-    if (Object.keys(headers).length > 0) out.headers = headers;
-    return out;
+    if (Object.keys(headers).length > 0) fields.headers = headers;
+    return { fields, supersedes: CODEX_SUPERSEDES, family: 'remote' };
   }
 
-  // Unknown/bespoke Codex entry: pass through so a user's hand-authored table is
-  // never corrupted on write-back.
-  return def as JsonValue;
+  // Unknown/bespoke Codex entry: carry the whole table over so a user's hand-authored
+  // one is never corrupted on write-back.
+  return passthroughUnshape(def);
 }
 
 /** Run `codex --version`, resolving `true` only on a clean exit 0. Never throws. */
@@ -383,7 +416,8 @@ export const codexAdapter: Adapter = {
     // Inverse of compileConfigKeys (spec criterion 4): fold one drifted Codex
     // `[mcp_servers.<name>]` table back into servers.yaml, siblings untouched, in
     // the pure canonical D6 shape (`transport`/`auth`/`env` with `${VAR}` restored),
-    // so a later compile reproduces the drift exactly — round-trip stable.
+    // OVERLAID on the PRIOR canonical def so nothing Codex cannot express is lost
+    // (F5/1,3,4) and a later compile reproduces the drift exactly — round-trip stable.
     if (surface.id !== 'mcp' || drift.style !== 'keyed') return [];
     // The trust entry (`['projects', <root>]`) is launch-derived, not stored — its
     // drift is discarded, never written to servers.yaml.
@@ -395,7 +429,11 @@ export const codexAdapter: Adapter = {
     const existing = existsSync(serversFile)
       ? ((parseYaml(await readFile(serversFile, 'utf8')) as Record<string, unknown> | null) ?? {})
       : {};
-    existing[name] = unshapeCodexServer(drift.canonicalValue);
+    existing[name] = foldDriftIntoCanonical(
+      existing[name],
+      drift.canonicalValue,
+      unshapeCodexServer,
+    );
     return [{ storeRelativePath: join('mcp', 'servers.yaml'), content: stringifyYaml(existing) }];
   },
 

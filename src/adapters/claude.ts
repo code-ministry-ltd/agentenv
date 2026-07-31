@@ -18,6 +18,12 @@ import type {
 } from '../adapter.js';
 import type { JsonValue } from '../config-keys.js';
 import { resolveBinaryOnPath } from '../session/resolve.js';
+import {
+  foldDriftIntoCanonical,
+  omitKeys,
+  passthroughUnshape,
+  type UnshapedServer,
+} from './mcp-canonical.js';
 
 /**
  * The Claude Code adapter — the first real implementation of the frozen
@@ -144,8 +150,12 @@ function collectPlaceholders(value: unknown, prefix: string, out: Record<string,
  * Shape one canonical `mcp/servers.yaml` server (D6) into Claude's `.claude.json`
  * `mcpServers.<name>` object. `servers.yaml` is ALWAYS D6-canonical (F1: every
  * adapter's {@link syncBackConfigKeys} writes canonical, never its harness shape), so
- * the input always carries `transport` (or is inferred from `command`/`url`) — there
- * is no `type`-shaped short-circuit to pass a foreign harness shape through.
+ * the input normally carries `transport`.
+ *
+ * A HAND-AUTHORED harness-shaped entry (no `transport`, a Claude `type`) is still
+ * honoured: `type` is the transport hint, so `{ type: sse, url }` compiles to an SSE
+ * server rather than being re-inferred to `http` from the bare `url` (F5/2A — calling
+ * an SSE endpoint as HTTP breaks it).
  *
  * Mappings from the canonical model:
  *   stdio → `{ type:'stdio', command, args?, env? }`
@@ -163,7 +173,9 @@ function shapeClaudeServer(def: unknown): JsonValue {
       : def.command !== undefined
         ? 'stdio'
         : def.url !== undefined
-          ? 'http'
+          ? typeof def.type === 'string'
+            ? def.type
+            : 'http'
           : undefined;
 
   if (transport === 'stdio') {
@@ -190,25 +202,39 @@ function shapeClaudeServer(def: unknown): JsonValue {
   return def;
 }
 
-/** A header value shaped EXACTLY `Bearer ${VAR}` → the var name, else null. */
+/**
+ * A header value shaped `Bearer ${VAR}` → the var name, else null. Tolerant of
+ * surrounding/inner whitespace (`Bearer  ${ X }`), which a user's hand-edit easily
+ * introduces and which must not silently cost them their `auth.bearer_env`.
+ */
 function bearerEnvFromHeader(value: unknown): string | null {
   if (typeof value !== 'string') return null;
-  const m = /^Bearer \$\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}$/.exec(value);
+  const m = /^\s*Bearer\s+\$\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\s*$/.exec(value);
   return m ? m[1]! : null;
 }
 
 /**
- * The inverse of {@link shapeClaudeServer}: fold one drifted Claude `mcpServers.<name>`
- * value back to the canonical `servers.yaml` D6 shape — `transport` + `command`/`url`,
- * `env` with `${VAR}` kept, and `auth.bearer_env` reconstructed from an
- * `Authorization: Bearer ${VAR}` header. Keeping servers.yaml D6-canonical (never
- * Claude's `type`/`headers` shape) is the Phase-4 decision (F1) so EVERY adapter's
- * compile reads canonical, not Claude's harness shape. A bespoke/unknown entry passes
- * through untouched (never corrupt a hand-authored server). Mirrors Codex's
- * `unshapeCodexServer`.
+ * The canonical keys {@link shapeClaudeServer} is authoritative for — the ones it reads
+ * and re-emits, so their absence from a drifted entry is a real user deletion. Every
+ * OTHER canonical field (`enabled`, `timeout`, anything a future release adds) is
+ * preserved from the prior canonical def by the overlay. `auth` is added conditionally
+ * (see below); `transport` is handled by the overlay's family rule.
  */
-function unshapeClaudeServer(def: unknown): JsonValue {
-  if (!isObject(def)) return def as JsonValue;
+const CLAUDE_SUPERSEDES = ['type', 'command', 'args', 'env', 'url', 'headers'] as const;
+
+/**
+ * The inverse of {@link shapeClaudeServer}, as an OVERLAY over the prior canonical def
+ * (see `mcp-canonical.ts`): translate Claude's `type`/`headers` shape back to canonical
+ * `transport`/`auth` and carry EVERY other field of the drifted entry over verbatim, so
+ * a field the user added in `.claude.json` reaches the store instead of being dropped by
+ * a whitelist (F5/3). What Claude cannot express is preserved from the prior def, and a
+ * bespoke `transport` the shaper passed through is never re-inferred (F5/1).
+ */
+function unshapeClaudeServer(def: Record<string, JsonValue>): UnshapedServer {
+  // A `transport` in `.claude.json` can only have come from the shaper's bespoke
+  // passthrough, so the entry is already canonical — never re-infer over it (F5/1).
+  if (typeof def.transport === 'string') return passthroughUnshape(def);
+
   const type =
     typeof def.type === 'string'
       ? def.type
@@ -219,26 +245,43 @@ function unshapeClaudeServer(def: unknown): JsonValue {
           : undefined;
 
   if (type === 'stdio') {
-    const out: Record<string, JsonValue> = { transport: 'stdio' };
-    if (def.command !== undefined) out.command = def.command;
-    if (def.args !== undefined) out.args = def.args;
-    if (def.env !== undefined) out.env = def.env;
-    return out;
+    return {
+      fields: { transport: 'stdio', ...omitKeys(def, ['type']) },
+      // Family changed away from remote → the remote-only canonical keys go with it.
+      supersedes: [...CLAUDE_SUPERSEDES, 'auth'],
+      family: 'stdio',
+    };
   }
   if (type === 'http' || type === 'sse') {
-    const out: Record<string, JsonValue> = { transport: type };
-    if (def.url !== undefined) out.url = def.url;
-    const headers: Record<string, JsonValue> = isObject(def.headers) ? { ...def.headers } : {};
-    const bearer = bearerEnvFromHeader(headers.Authorization);
-    if (bearer !== null) {
-      out.auth = { bearer_env: bearer };
-      delete headers.Authorization;
+    const fields: Record<string, JsonValue> = {
+      transport: type,
+      ...omitKeys(def, ['type', 'headers']),
+    };
+    let hadAuthorization = false;
+    if (isObject(def.headers)) {
+      const headers = { ...def.headers };
+      hadAuthorization = headers.Authorization !== undefined;
+      const bearer = bearerEnvFromHeader(headers.Authorization);
+      if (bearer !== null) {
+        fields.auth = { bearer_env: bearer };
+        delete headers.Authorization;
+      }
+      if (Object.keys(headers).length > 0) fields.headers = headers;
+    } else if (def.headers !== undefined) {
+      fields.headers = def.headers; // not an object — carry verbatim, never guess
     }
-    if (Object.keys(headers).length > 0) out.headers = headers;
-    return out;
+    return {
+      fields,
+      // `auth` has no Claude counterpart, so it is superseded ONLY when the drifted
+      // entry carries no `Authorization` header at all (the bearer really was removed).
+      // A hand-authored header that SHADOWS `auth.bearer_env` must not delete it — Codex
+      // maps that same `auth` to `bearer_token_env_var` and would lose its config (F5/11).
+      supersedes: hadAuthorization ? CLAUDE_SUPERSEDES : [...CLAUDE_SUPERSEDES, 'auth'],
+      family: 'remote',
+    };
   }
-  // Unknown/bespoke Claude entry: pass through so a hand-authored server survives.
-  return def;
+  // Neither a Claude discriminator nor an inferable one: carry the whole entry over.
+  return passthroughUnshape(def);
 }
 
 /** Run `claude --version`, resolving `true` only on a clean exit 0. Never throws. */
@@ -338,9 +381,9 @@ export const claudeAdapter: Adapter = {
     // (keyPath ['mcpServers', <name>]) back into servers.yaml, siblings untouched, in
     // the PURE canonical D6 shape (`transport`/`command`/`url`/`auth`, `${VAR}` kept) —
     // NOT Claude's `type`/`headers` shape. `canonicalValue` already has secret ${VAR}
-    // placeholders restored (D6); `unshapeClaudeServer` maps its harness shape back to
-    // canonical so servers.yaml stays D6-canonical for EVERY adapter (F1) and a later
-    // compile reproduces the drift exactly — round-trip stable.
+    // placeholders restored (D6); `unshapeClaudeServer` + the OVERLAY map its harness
+    // shape back onto the PRIOR canonical def, so servers.yaml stays D6-canonical for
+    // EVERY adapter (F1) and nothing Claude cannot express is lost (F5/1,3,4,11).
     if (surface.id !== 'mcp' || drift.style !== 'keyed') return [];
     // A server injection is always keyPath ['mcpServers', <name>] (length 2); a
     // length-1 keyPath would fold a bogus `mcpServers` "server" into the store.
@@ -351,7 +394,11 @@ export const claudeAdapter: Adapter = {
     const existing = existsSync(serversFile)
       ? ((parseYaml(await readFile(serversFile, 'utf8')) as Record<string, unknown> | null) ?? {})
       : {};
-    existing[name] = unshapeClaudeServer(drift.canonicalValue);
+    existing[name] = foldDriftIntoCanonical(
+      existing[name],
+      drift.canonicalValue,
+      unshapeClaudeServer,
+    );
     return [{ storeRelativePath: join('mcp', 'servers.yaml'), content: stringifyYaml(existing) }];
   },
 

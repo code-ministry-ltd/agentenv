@@ -169,6 +169,40 @@ describe('adapter.claude — compileConfigKeys (MCP → Claude mcpServers, D6)',
     if (inj.style !== 'keyed') throw new Error('unreachable');
     expect(inj.value).toEqual({ type: 'stdio', command: '/bin/echo', args: ['hi'] });
   });
+
+  it('honours a hand-authored `type: sse` — an SSE endpoint must not compile to http (F5/2)', async () => {
+    // A user may author the harness shape directly in servers.yaml. Re-inferring the
+    // transport from the bare `url` would silently call an SSE endpoint as HTTP.
+    const dir = envWithServers('linear:\n  type: sse\n  url: https://mcp.linear.app/sse\n');
+    const out = await claudeAdapter.compileConfigKeys(MCP_SURFACE, {
+      envContentDir: dir,
+      projectRoot: null,
+    });
+    const inj = out[0]!;
+    if (inj.style !== 'keyed') throw new Error('unreachable');
+    expect(inj.value).toEqual({ type: 'sse', url: 'https://mcp.linear.app/sse' });
+  });
+
+  it('keeps a canonical `enabled: false` in the store across a drift write-back (F5/3)', async () => {
+    // Claude's shape cannot express `enabled`, so the drifted entry says nothing about
+    // it — the overlay must preserve it rather than reconstruct the def without it.
+    const dir = envWithServers('echo:\n  transport: stdio\n  command: /bin/echo\n  enabled: false\n');
+    const mutations = await claudeAdapter.syncBackConfigKeys!(
+      MCP_SURFACE,
+      {
+        style: 'keyed',
+        keyPath: ['mcpServers', 'echo'],
+        canonicalValue: { type: 'stdio', command: '/bin/echo-v2' },
+      },
+      { envContentDir: dir, projectRoot: null },
+    );
+    const written = parseYaml(mutations[0]!.content) as Record<string, JsonValue>;
+    expect(written.echo).toEqual({
+      transport: 'stdio',
+      command: '/bin/echo-v2',
+      enabled: false,
+    });
+  });
 });
 
 describe('adapter.claude — syncBackConfigKeys (criterion 4)', () => {
