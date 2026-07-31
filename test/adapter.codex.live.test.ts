@@ -36,7 +36,16 @@ import { resolveBinaryOnPath } from '../src/session/resolve.js';
 import { composeView } from '../src/session/composer.js';
 
 const PROBE_TIMEOUT_MS = 30_000;
-const hasCodex = spawnSync('codex', ['--version'], { timeout: 20_000 }).status === 0;
+// Probe the binary under a THROWAWAY CODEX_HOME: `codex` writes a scratch
+// `tmp/arg0/*` helper lock under its config root on any invocation, so a bare
+// `codex --version` would touch the REAL ~/.codex tree. Isolating it keeps this
+// test's footprint entirely off the real dir (the safety rule).
+const probeHome = mkdtempSync(join(tmpdir(), 'agentenv-codex-probe-'));
+const hasCodex =
+  spawnSync('codex', ['--version'], {
+    timeout: 20_000,
+    env: { ...process.env, CODEX_HOME: probeHome },
+  }).status === 0;
 const realCodexHome = join(homedir(), '.codex');
 
 const tmpRoots: string[] = [];
@@ -46,7 +55,7 @@ function freshRoot(): string {
   return dir;
 }
 afterAll(() => {
-  for (const d of tmpRoots) rmSync(d, { recursive: true, force: true });
+  for (const d of [...tmpRoots, probeHome]) rmSync(d, { recursive: true, force: true });
 });
 
 /** sha of the real config's stable managed files (NOT `tmp/`, which the binary churns). */
