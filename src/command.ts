@@ -1,4 +1,5 @@
 import type { Adapter } from './adapter.js';
+import type { GitRunner } from './git.js';
 import type { Paths } from './paths.js';
 import type { CaptureFn, ExecHarness } from './session/exec.js';
 
@@ -53,6 +54,12 @@ export interface RunOptions {
   capture?: CaptureFn;
   /** Injectable clock (view build timestamps). */
   now?: () => number;
+  /**
+   * Injectable `git` runner for the store sync lifecycle (Task 2.1). Defaults to
+   * the real spawn-based runner; tests inject it to count pushes / simulate a
+   * failing or unreachable remote deterministically, with no network.
+   */
+  gitRun?: GitRunner;
 }
 
 /** Everything a command handler receives for one invocation. */

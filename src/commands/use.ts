@@ -7,6 +7,7 @@ import { setBinding } from '../session/registry.js';
 import { resolveProjectRoot } from '../session/registry.js';
 import { parseHarnesses, validateEnvs } from './activation.js';
 import { renderGlobalSkips } from './global-report.js';
+import { closeStoreSync, openStoreSync } from './store-sync.js';
 
 /**
  * `agentenv use <env>… [--harness <h>…] [--global]` — activate an env stack.
@@ -109,6 +110,24 @@ async function useGlobal(
   // Per-invocation drift sweep (D9): capture mid-session edits before mutating.
   await driftSweep({ paths, adapters, env, onWarn: (m) => notices.push(m) });
 
+  // Git sync START (D9): commit the swept drift, pull, then run the post-pull
+  // safeguards (schema-validate + secret-scan + manifest-reconcile) BEFORE anything
+  // materialises. A malformed / secret-bearing pulled tree is quarantined — NOT
+  // materialised — and the invocation ends without touching real surfaces.
+  const syncCtx = { paths, env, options };
+  const before = await openStoreSync(syncCtx, notices, { alreadySwept: true });
+  if (before.quarantined) {
+    await closeStoreSync(syncCtx, notices);
+    const stderr = notices.length > 0 ? `${notices.join('\n')}\n` : undefined;
+    return {
+      stdout:
+        `Did NOT materialise [${kept.join(', ')}] — pulled store changes were quarantined ` +
+        '(malformed or secret-bearing). See the warning above; nothing on real paths was touched.\n',
+      ...(stderr ? { stderr } : {}),
+      code: 0,
+    };
+  }
+
   const result = await materialiseGlobal({
     paths,
     adapters,
@@ -118,6 +137,7 @@ async function useGlobal(
   });
 
   notices.push(...renderGlobalSkips(result.skips));
+  await closeStoreSync(syncCtx, notices); // Git sync END (D9): one fail-soft push.
   const stderr = notices.length > 0 ? `${notices.join('\n')}\n` : undefined;
   return {
     stdout:
