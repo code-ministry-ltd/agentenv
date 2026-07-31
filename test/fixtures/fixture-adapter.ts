@@ -51,36 +51,47 @@ export interface FixtureAdapterOptions {
    * the real fake harness and compares the observed root.
    */
   forceSelfCheck?: SelfCheckResult;
+  /**
+   * Mark the MCP config-keys surface as the *substitute* rung (D6, rung 3): a
+   * harness that cannot interpolate `${VAR}` itself, so materialisation substitutes
+   * literals from secrets.env/the shell into the real config while the manifest keeps
+   * the placeholder. Default `false` — passthrough (rung 1), mimicking Claude.
+   */
+  substituteMcp?: boolean;
 }
 
-const SURFACES: readonly SurfaceDeclaration[] = [
-  {
-    id: 'skills',
-    storeKind: 'skills',
-    supported: true,
-    mechanism: 'dir-merge',
-    rootRelativePath: 'skills',
-    mode: 'symlink',
-  },
-  {
-    id: 'instructions',
-    storeKind: 'instructions',
-    supported: true,
-    mechanism: 'file-block',
-    rootRelativePath: 'INSTRUCTIONS.md',
-    layering: 'inline',
-  },
-  {
-    id: 'mcp',
-    storeKind: 'mcp',
-    supported: true,
-    mechanism: 'config-keys',
-    rootRelativePath: 'config.json',
-    format: 'json',
-    style: 'keyed',
-    keyPath: ['mcpServers'],
-  },
-];
+function makeSurfaces(substituteMcp: boolean): readonly SurfaceDeclaration[] {
+  return [
+    {
+      id: 'skills',
+      storeKind: 'skills',
+      supported: true,
+      mechanism: 'dir-merge',
+      rootRelativePath: 'skills',
+      mode: 'symlink',
+    },
+    {
+      id: 'instructions',
+      storeKind: 'instructions',
+      supported: true,
+      mechanism: 'file-block',
+      rootRelativePath: 'INSTRUCTIONS.md',
+      layering: 'inline',
+    },
+    {
+      id: 'mcp',
+      storeKind: 'mcp',
+      supported: true,
+      mechanism: 'config-keys',
+      rootRelativePath: 'config.json',
+      format: 'json',
+      style: 'keyed',
+      keyPath: ['mcpServers'],
+      // rung selector (D6): true → substitute literals at materialisation.
+      ...(substituteMcp ? { substitutePlaceholders: true } : {}),
+    },
+  ];
+}
 
 /** The real-config-root entries the fixture treats as bucket-2 (managed). */
 const MANAGED_ENTRIES = new Set(['skills', 'INSTRUCTIONS.md', 'config.json']);
@@ -96,9 +107,22 @@ function collectPlaceholders(value: unknown, prefix: string, out: Record<string,
     if (prefix !== '' && /\$\{[^}]+\}/.test(value)) out[prefix] = value;
     return;
   }
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
+  // Descend ARRAYS too (canonical MCP `args: [...]` holds `${VAR}` as an element):
+  // emit a numeric index segment so an array-nested placeholder is flagged and can
+  // be restored on write-back, not left as a baked literal (secret-safety fix).
+  if (Array.isArray(value)) {
+    value.forEach((v, i) => {
+      collectPlaceholders(v, prefix === '' ? String(i) : `${prefix}.${i}`, out);
+    });
+    return;
+  }
+  if (value && typeof value === 'object') {
     for (const [k, v] of Object.entries(value)) {
-      collectPlaceholders(v, prefix === '' ? k : `${prefix}.${k}`, out);
+      // Escape a literal `.`/`\` in the key so the dotted path round-trips through
+      // the escape-aware split on BOTH consumers (substitute + restore) — mirrors
+      // the real adapter (secret-safety fix).
+      const seg = k.replace(/\\/g, '\\\\').replace(/\./g, '\\.');
+      collectPlaceholders(v, prefix === '' ? seg : `${prefix}.${seg}`, out);
     }
   }
 }
@@ -112,6 +136,7 @@ function collectPlaceholders(value: unknown, prefix: string, out: Record<string,
 export function makeFixtureAdapter(opts: FixtureAdapterOptions = {}): Adapter {
   const id = opts.id ?? 'fixture';
   const sessionSupported = opts.sessionSupported ?? true;
+  const surfaces = makeSurfaces(opts.substituteMcp ?? false);
 
   const overrideEnv = (root: string): Record<string, string> => ({ [FIXTURE_CONFIG_ENV]: root });
 
@@ -136,7 +161,7 @@ export function makeFixtureAdapter(opts: FixtureAdapterOptions = {}): Adapter {
       return join(homedir(), '.fixture-harness');
     },
 
-    surfaces: SURFACES,
+    surfaces,
 
     classifyEntry(name): EntryBucket {
       return MANAGED_ENTRIES.has(name) ? 'managed' : 'state';

@@ -116,4 +116,29 @@ describe('sync: secret scan (D6/D9)', () => {
     expect(scanTextForSecrets('commit: ' + 'a1b2c3d4'.repeat(5))).toEqual([]);
     expect(scanTextForSecrets('hash: ' + 'deadbeef'.repeat(8))).toEqual([]);
   });
+
+  // Belt-and-braces (D9): an OPAQUE array-nested secret lands in a KEYLESS list item
+  // (canonical MCP `args`), which fires neither rule above — catch it by entropy.
+  const OPAQUE = 'Kp7mNq2wXt9vRb4zLc6yHa1dFe3gJh5nMs8pQr0T';
+
+  it('flags a bare high-entropy value in a keyless list item (YAML and JSON)', () => {
+    expect(scanTextForSecrets('    - ' + OPAQUE).length).toBe(1);
+    expect(scanTextForSecrets('    - "' + OPAQUE + '"').length).toBe(1);
+    expect(scanTextForSecrets('    "' + OPAQUE + '",').length).toBe(1);
+  });
+
+  it('does NOT flag ordinary list items (skill names, short args, packages, hashes)', () => {
+    expect(scanTextForSecrets('  - security-review')).toEqual([]);
+    expect(scanTextForSecrets('    - "--api-key"')).toEqual([]);
+    expect(scanTextForSecrets('    - "-y"')).toEqual([]);
+    expect(scanTextForSecrets('    - "@upstash/context7-mcp"')).toEqual([]);
+    // A ${VAR} placeholder list item is never a secret.
+    expect(scanTextForSecrets('    - "${CTX_API_KEY}"')).toEqual([]);
+    // Lowercase-hex provenance-shaped value (no mixed case) is not a token.
+    expect(scanTextForSecrets('  - ' + 'a1b2c3d4'.repeat(5))).toEqual([]);
+  });
+
+  it('respects agentenv:allow-secret above a bare high-entropy list item', () => {
+    expect(scanTextForSecrets('    # agentenv:allow-secret\n    - ' + OPAQUE)).toEqual([]);
+  });
 });
