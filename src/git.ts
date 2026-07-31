@@ -636,6 +636,74 @@ export async function probeRemoteUrl(
 }
 
 // ---------------------------------------------------------------------------
+// New-machine bootstrap: clone a populated remote into the store (design D14)
+// ---------------------------------------------------------------------------
+
+/** A generous clone budget — a full store clone can move more than a 3s probe. */
+const CLONE_TIMEOUT_MS = 30_000;
+
+/** The outcome of a {@link cloneStore} bootstrap. */
+export interface CloneResult {
+  /**
+   * `ok` — the populated remote was cloned into the store (`origin` set to `url`);
+   * `empty` — the remote has no history to clone (caller inits empty + connects);
+   * `unreachable` — a transport failure or timeout (caller inits empty + connects).
+   */
+  status: 'ok' | 'empty' | 'unreachable';
+  detail?: string;
+}
+
+/**
+ * Clone a POPULATED remote into the store directory — the clean-machine restore
+ * bootstrap (design D14, spec criterion 5). A fresh machine with no local store
+ * must CLONE an existing remote, not init-empty-then-classify: a fresh empty local
+ * plus a populated remote would classify as UNRELATED and refuse to integrate.
+ *
+ * The store directory MUST NOT yet exist as a git repo (`git clone` refuses a
+ * non-empty target). Probes first, so an empty or unreachable remote returns a
+ * status the caller can fall back on (init an empty store, connect the remote) with
+ * a clear message rather than a confusing clone error. On success `origin` points at
+ * `url` and the full store history is present. Offline-safe and credential-safe: the
+ * probe/clone never prompt for credentials and any error detail is URL-redacted.
+ */
+export async function cloneStore(
+  paths: Paths,
+  env: NodeJS.ProcessEnv,
+  url: string,
+  opts: { run?: GitRunner; timeoutMs?: number } = {},
+): Promise<CloneResult> {
+  const ctx = gitContext(paths, env, opts.run);
+  // The base must exist so `git ls-remote`/`git clone` have an existing cwd — the
+  // store dir does NOT exist yet on a fresh machine, so we can't run git from it.
+  await mkdir(paths.base, { recursive: true });
+
+  // Probe first (from `base`, not the not-yet-existent store): an empty/unreachable
+  // remote has nothing (useful) to clone.
+  const probe = await ctx.run(['ls-remote', url], {
+    cwd: paths.base,
+    env: ctx.env,
+    timeoutMs: opts.timeoutMs ?? PULL_TIMEOUT_MS,
+  });
+  if (probe.code !== 0 || probe.timedOut) {
+    return { status: 'unreachable', detail: probe.timedOut ? 'network timeout' : redactRemoteUrl(firstLine(probe.stderr)) };
+  }
+  if (probe.stdout.trim() === '') return { status: 'empty' };
+
+  const res = await ctx.run(['clone', url, paths.store], {
+    cwd: paths.base,
+    env: ctx.env,
+    timeoutMs: opts.timeoutMs ?? CLONE_TIMEOUT_MS,
+  });
+  if (res.code !== 0 || res.timedOut) {
+    return {
+      status: 'unreachable',
+      detail: res.timedOut ? 'network timeout' : redactRemoteUrl(firstLine(res.stderr)),
+    };
+  }
+  return { status: 'ok' };
+}
+
+// ---------------------------------------------------------------------------
 // Safe remote replacement classification (design D14, Task 2.3)
 // ---------------------------------------------------------------------------
 
