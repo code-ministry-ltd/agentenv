@@ -18,7 +18,7 @@ describe('getVersion', () => {
     expect(getVersion()).toBe(readPackageVersion());
   });
 
-  it('returns the scaffold version 0.0.1', () => {
-    expect(getVersion()).toBe('0.0.1');
+  it('returns a valid semver string', () => {
+    expect(getVersion()).toMatch(/^\d+\.\d+\.\d+(?:[-+].*)?$/);
   });
 });
