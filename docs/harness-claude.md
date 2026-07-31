@@ -81,11 +81,13 @@ Canonical `mcp/servers.yaml` (D6) → Claude `.claude.json` `mcpServers.<name>`:
 natively) and every `${VAR}`-bearing field is recorded in `secretFields` so
 write-back restores the placeholder, never a baked literal (D6).
 
-The forward transform is **idempotent** on an already-Claude-shaped entry (`type`
-present, no `transport`). `syncBackConfigKeys` writes the drifted server back into
-`servers.yaml` **verbatim** (in Claude's normalised shape, placeholders restored),
-which is round-trip stable — `compile(syncBack(v)) === v` — proving spec criterion 4
-without a lossy reverse transform. See the freeze note below.
+`servers.yaml` is **always D6-canonical** (F1): `syncBackConfigKeys` reverse-maps a
+drifted server via `unshapeClaudeServer` (the inverse of the forward transform —
+`type`→`transport`, `Authorization: Bearer ${VAR}`→`auth.bearer_env`, placeholders
+restored) and writes the **canonical** shape, NEVER Claude's `type`/`headers` shape.
+This keeps the shared store readable by every OTHER adapter's `compileConfigKeys` and
+is round-trip stable — `compile(syncBack(v)) === v` — proving spec criterion 4. See
+the freeze note below.
 
 ## Interface-freeze finding (reported to the owner)
 
@@ -93,14 +95,14 @@ The frozen `Adapter` interface expressed Claude with **no missing field** — ev
 surface, the override, the two-bucket split, MCP compile + reverse-sync, and the
 self-check all landed on existing shapes. Two points of friction worth recording:
 
-- **`syncBack` shape divergence is a shared-store concern, not a Claude bug.**
-  Writing the drifted server back in Claude's normalised shape means the canonical
-  `mcp/servers.yaml` entry can *adopt* Claude's `type`/`headers` form. That is fine
-  for Claude (forward is idempotent) but implies every OTHER adapter's
-  `compileConfigKeys` must also accept the normalised shape idempotently (Codex/
-  OpenCode, Task 4.x). The alternative — a strict reverse transform back to
-  `transport`/`auth.bearer_env` — is lossy (which header was "the bearer"?), so the
-  robust choice is a superset canonical model that every forward transform tolerates.
+- **`syncBack` writes the D6-canonical shape (F1 decision).** Earlier this adapter
+  wrote the drifted server back in Claude's normalised (`type`/`headers`) shape, which
+  *poisoned* the shared `mcp/servers.yaml` for every OTHER harness (they read one
+  canonical store). The fix: `unshapeClaudeServer` reverse-maps back to
+  `transport`/`auth.bearer_env` (mirroring Codex's `unshapeCodexServer`), so
+  `servers.yaml` stays canonical and each adapter's `compileConfigKeys` only ever reads
+  canonical. The reverse transform is unambiguous here because the forward transform is
+  the only writer of the `Authorization: Bearer ${VAR}` header we recognise.
 
 - **Instructions-as-dir-merge routes store files by their RAW store name.** The
   composer/engine place `environments/<env>/instructions/*` into `rules/` by

@@ -100,3 +100,13 @@ worked around inside the adapter), recorded for the owner:
   for settings.json. Pi itself writes multi-line arrays (observed from `pi config`),
   so the normalisation is user-visible — worth a `config-keys.ts` follow-up to pass
   `formattingOptions` derived from the file if strict byte-identity is wanted.
+
+## Round-trip note (`use --global` → `drop`)
+
+`use --global` followed by `drop` is **byte-identical** for keyed JSON/TOML surfaces
+and file-block surfaces. For **array-element** surfaces — Pi's `settings.json` arrays
+(`packages`/skills/prompts) and OpenCode's `instructions` array — it is
+**data-identical, not byte-identical**: a multi-line array literal reflows to inline
+(e.g. `packages: [\n  "x"\n]` → `packages: ["x"]`). This is **design-sanctioned**
+(parsed-equal, no residue, ownership fully removed), not a bug — see the array-element
+detail above.

@@ -100,14 +100,16 @@ Canonical `mcp/servers.yaml` (D6) → Cursor `mcp.json` `mcpServers.<name>`:
 natively, so the surface is **passthrough** (`substitutePlaceholders: false`) — the compiled
 `${env:VAR}` is written verbatim and Cursor resolves it; no secret value ever leaves the env.
 `secretFields` records the **Cursor-syntax** placeholder (e.g. `Bearer ${env:LINEAR_TOKEN}`),
-so a drift write-back restores `${env:VAR}` into **both** the store and the real `mcp.json`,
-keeping the real file interpolatable even after a user edit (never a baked literal).
+so a drift write-back keeps the secret as an INDIRECTION — never a baked literal — in both
+the store (as canonical `auth.bearer_env`, below) and the real `mcp.json` (as `${env:VAR}`,
+which Cursor interpolates), keeping the real file interpolatable even after a user edit.
 
-The forward transform is **idempotent** on an already-Cursor-shaped entry (no `transport`;
-`type` present for http/sse, or a bare `command` for stdio; `${env:VAR}` not re-rewritten
-because of its colon). `syncBackConfigKeys` writes the drifted server back **verbatim** in
-Cursor's normalised shape, which is round-trip stable — `compile(syncBack(v)) === v` —
-proving spec criterion 4 without a lossy reverse transform (same strategy as Claude).
+`servers.yaml` is **always D6-canonical** (F1): `syncBackConfigKeys` reverse-maps a drifted
+server via `unshapeCursorServer` (the inverse of the forward transform — `${env:VAR}`→
+`${VAR}`, a bare `command`→stdio, `Authorization: Bearer ${VAR}`→`auth.bearer_env`) and
+writes the **canonical** shape, NEVER Cursor's `${env:}` shape. This keeps the shared store
+readable by every OTHER adapter and is round-trip stable — `compile(syncBack(v)) === v`
+(same strategy as Claude/Codex).
 
 ## Interface-freeze findings (reported to the owner — LOUD)
 

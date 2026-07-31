@@ -144,14 +144,23 @@ KEPT** (rung-1 passthrough — OpenCode interpolates `{env:VAR}` natively,
 `secretFields` so drift write-back restores the placeholder, never a baked literal
 (D6).
 
-The forward transform is **idempotent** on an already-OpenCode-shaped entry
-(`type` present, no `transport`; `{env:VAR}` already in place). `syncBackConfigKeys`
-writes the drifted server back into `servers.yaml` **verbatim** (OpenCode's
-normalised shape, placeholders restored), which is round-trip stable —
-`compile(syncBack(v)) === v` — matching the Claude D6 decision (a superset
-canonical model every forward transform tolerates, rather than a lossy reverse
-transform). `http` vs `sse` is not distinguishable in OpenCode's single `remote`
-type; an `sse` canonical entry round-trips as `remote`→`http` (documented, rare).
+`servers.yaml` is **always D6-canonical** (F1): `syncBackConfigKeys` reverse-maps a
+drifted server via `unshapeOpenCodeServer` (the inverse of the forward transform —
+`{env:VAR}`→`${VAR}`, the single `command` array split back into `command`+`args`,
+`type:'local'|'remote'`+`enabled` dropped, `Authorization: Bearer {env:VAR}`→
+`auth.bearer_env`) and writes the **canonical** shape, NEVER OpenCode's `{env:}`/
+array shape. This keeps the shared store readable by every OTHER adapter and is
+round-trip stable — `compile(syncBack(v)) === v`. `http` vs `sse` is not
+distinguishable in OpenCode's single `remote` type; an `sse` canonical entry
+round-trips as `remote`→`http` (documented, rare).
+
+**Round-trip note (`use --global` → `drop`).** Keyed config-keys (this MCP surface)
+and file-block surfaces restore byte-identically. The **array-element** surface —
+OpenCode's `instructions` array — is **data-identical, not byte-identical**: the
+shared `config-keys.ts` rewrites the touched array literal compactly, so a user's
+multi-line `instructions: [\n  "…"\n]` returns single-line `instructions: ["…"]`
+after an inject→remove cycle. This reflow is design-sanctioned (parsed-equal, no
+residue, ownership fully removed), not a bug.
 
 ## selfCheck
 
