@@ -34,9 +34,10 @@ export interface LockOptions {
   /** Poll interval (ms) while waiting for a held lock. Default 25. */
   pollMs?: number;
   /**
-   * A lock at least this old (ms) is treated as stale and reclaimed, even if
-   * its owner still looks alive — the backstop for a process that acquired the
-   * lock and then wedged. Default 60000.
+   * Age (ms) after which a **different-host** holder — whose pid we cannot probe
+   * locally — is treated as reclaimable. It is NOT applied to a same-host holder
+   * whose pid is still alive: those are never reclaimed by age (see
+   * {@link withLock}). Default 60000.
    */
   staleMs?: number;
   /** Clock, injected for deterministic tests. Default {@link Date.now}. */
@@ -90,20 +91,55 @@ function describeHolder(holder: LockHolder): string {
   return `pid ${holder.pid} on ${holder.host} since ${new Date(holder.timestamp).toISOString()}`;
 }
 
+/** Outcome of a reclaim attempt. */
+type ReclaimResult =
+  | 'reclaimed' // we evicted the stale lock; the caller may now acquire
+  | 'lost' // another racer moved it first — re-poll
+  | 'superseded'; // a fresh, different holder had replaced it — restored, re-poll
+
 /**
- * Race-free reclaim: rename the stale lock aside (only one racer wins the
- * rename), then delete it. Losing the rename (ENOENT) means another process
- * already reclaimed it — harmless, we just retry the acquire loop.
+ * Race-free, identity-verified reclaim (TOCTOU-safe).
+ *
+ * `rename(lockPath → aside)` is atomic: if two waiters race, only one wins the
+ * rename; the loser gets ENOENT ('lost') and re-polls. After winning, we re-read
+ * the bytes we moved aside and evict ONLY if the on-disk `token` still matches
+ * the holder we judged reclaimable (`expectedToken`, or `null` when we judged it
+ * reclaimable because it was malformed). If it does not match, a *fresh* holder
+ * replaced the lock between our decision and our rename — we `rename(aside →
+ * lockPath)` to restore it and re-poll WITHOUT acquiring ('superseded').
  */
-async function reclaim(lockPath: string): Promise<void> {
+async function reclaim(lockPath: string, expectedToken: string | null): Promise<ReclaimResult> {
   const aside = `${lockPath}.stale-${process.pid}-${randomBytes(4).toString('hex')}`;
   try {
     await rename(lockPath, aside);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 'lost';
     throw err;
   }
-  await rm(aside, { force: true });
+
+  // We now exclusively hold `aside`. Verify the identity we judged reclaimable
+  // is still the one on disk before destroying it.
+  const moved = await readHolder(aside);
+  const identityOk =
+    expectedToken === null
+      ? moved === 'malformed' // reclaimable because unreadable — still is
+      : moved !== 'gone' && moved !== 'malformed' && moved.token === expectedToken;
+
+  if (identityOk) {
+    await rm(aside, { force: true });
+    return 'reclaimed';
+  }
+
+  // A fresh holder took the lock between our decision and our rename. Put its
+  // record back so we don't destroy a live lock, then re-poll.
+  try {
+    await rename(aside, lockPath);
+  } catch {
+    // The slot is already occupied again (or aside vanished); discard our copy
+    // rather than leak it. Whoever holds lockPath now is the authority.
+    await rm(aside, { force: true });
+  }
+  return 'superseded';
 }
 
 /** Attempt an atomic O_EXCL create carrying our holder record. */
@@ -135,12 +171,23 @@ async function tryAcquire(lockPath: string, self: LockHolder): Promise<boolean> 
  *   proceeds the instant the lock frees; if it is still held after `timeoutMs`
  *   it throws {@link LockError} (deterministic, not an indefinite hang).
  * - **Always releases** — the lock is removed in a `finally`, so a throw from
- *   `fn` frees it (the throw propagates). Release only removes the lock if we
- *   still own it (token match), so a lock reclaimed from us mid-run is not
- *   clobbered.
- * - **Stale reclaim** — a lock whose owner pid is dead, whose age exceeds
- *   `staleMs`, or whose file is malformed is reclaimed (race-free rename-aside)
- *   with a warning via `onWarn`, then acquisition proceeds.
+ *   `fn` frees it (the throw propagates). Release only removes the lock if the
+ *   on-disk `token` still matches ours, so a lock reclaimed from us mid-run is
+ *   never clobbered (we would delete the *new* holder's lock otherwise).
+ * - **Stale reclaim (liveness-first, never age-first for a live local holder)** —
+ *   a holder is reclaimed only when it is *provably* gone: its file is malformed/
+ *   unreadable, or it is a **same-host** pid that is dead. A same-host, still-alive
+ *   pid is NEVER reclaimed however old it is — waiters block until it releases or
+ *   they hit `timeoutMs` ({@link LockError}). `staleMs` is a fallback used ONLY
+ *   for a **different-host** holder, whose pid we cannot probe locally; a
+ *   cross-host holder older than `staleMs` is reclaimed. Reclaim is atomic and
+ *   identity-verified (rename-aside + token check) so two racers cannot both
+ *   evict, and a holder that changed under us is restored rather than destroyed.
+ *
+ *   Residual risk: a genuinely-alive holder on a *different* host, held past
+ *   `staleMs`, can still be reclaimed — we have no cross-host liveness probe.
+ *   This is the deliberate, documented trade-off; same-host (the common case) is
+ *   fully safe.
  *
  * Not reentrant: calling `withLock` again from within `fn` in the same process
  * contends with itself and will time out.
@@ -176,16 +223,38 @@ export async function withLock<T>(
     const holder = await readHolder(lockPath);
     if (holder === 'gone') continue; // freed between our attempt and our read
 
-    const stale =
-      holder === 'malformed' ||
-      !isProcessAlive(holder.pid) ||
-      now() - holder.timestamp >= staleMs;
+    // An unreadable/malformed lock has no live owner to protect: reclaim it
+    // (identity = "still malformed" is verified inside reclaim).
+    if (holder === 'malformed') {
+      const outcome = await reclaim(lockPath, null);
+      if (outcome === 'reclaimed') {
+        onWarn(`agentenv: reclaiming stale lock at ${lockPath} (malformed lock file)`);
+      }
+      continue;
+    }
 
-    if (stale) {
-      const which =
-        holder === 'malformed' ? 'malformed lock file' : `abandoned by ${describeHolder(holder)}`;
-      onWarn(`agentenv: reclaiming stale lock at ${lockPath} (${which})`);
-      await reclaim(lockPath);
+    // Decide reclaimability. A live, same-host pid is authoritative: never
+    // reclaimed, regardless of age. Only provably-gone holders are reclaimed.
+    let reclaimable: boolean;
+    let which: string;
+    if (holder.host === self.host) {
+      // Same host: we can probe the pid. Reclaim ONLY if it is dead — a slow but
+      // alive holder (e.g. a long `git clone`) keeps the lock however old it is.
+      reclaimable = !isProcessAlive(holder.pid);
+      which = `dead process ${describeHolder(holder)}`;
+    } else {
+      // Different host: no local liveness probe, so fall back to age. See the
+      // documented cross-host residual risk on withLock.
+      reclaimable = now() - holder.timestamp >= staleMs;
+      which = `aged-out cross-host holder ${describeHolder(holder)}`;
+    }
+
+    if (reclaimable) {
+      const outcome = await reclaim(lockPath, holder.token);
+      if (outcome === 'reclaimed') {
+        onWarn(`agentenv: reclaiming stale lock at ${lockPath} (${which})`);
+      }
+      // reclaimed → loop and acquire; lost/superseded → loop and re-evaluate.
       continue;
     }
 

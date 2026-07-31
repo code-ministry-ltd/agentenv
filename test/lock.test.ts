@@ -113,27 +113,131 @@ describe('withLock', () => {
     expect(existsSync(p.lock)).toBe(false);
   });
 
-  it('reclaims a lock older than staleMs even if its owner still looks alive', async () => {
+  it('reclaims a cross-host lock aged past staleMs (liveness unprovable off-host)', async () => {
     const p = paths();
+    // A holder on ANOTHER machine, aged past staleMs. We cannot probe a remote
+    // pid locally, so the age threshold is the only available reclaim signal.
     writeFileSync(
       p.lock,
       JSON.stringify({
-        pid: process.pid,
+        pid: 4321,
         timestamp: Date.now() - 100_000,
-        host: hostname(),
-        token: 'old',
+        host: `${hostname()}-elsewhere`,
+        token: 'remote-old',
       }),
     );
     const warnings: string[] = [];
 
     const result = await withLock(p, async () => 'ran', {
       staleMs: 1000, // lock is ~100s old
-      isProcessAlive: () => true,
+      isProcessAlive: () => true, // even "alive" is untrustworthy for a remote pid
       onWarn: (m) => warnings.push(m),
     });
 
     expect(result).toBe('ran');
     expect(warnings.some((w) => /reclaiming stale lock/.test(w))).toBe(true);
+  });
+
+  it('does NOT reclaim a LIVE same-host holder held past staleMs — waiter times out', async () => {
+    const p = paths();
+    // Same host, still-alive pid, but held far longer than staleMs (e.g. a slow
+    // `git clone` in `add skills`). Age alone must NOT evict a live holder.
+    writeFileSync(
+      p.lock,
+      JSON.stringify({
+        pid: process.pid,
+        timestamp: Date.now() - 100_000,
+        host: hostname(),
+        token: 'live-but-old',
+      }),
+    );
+
+    let ran = false;
+    await expect(
+      withLock(
+        p,
+        async () => {
+          ran = true;
+          return 'nope';
+        },
+        { timeoutMs: 60, pollMs: 10, staleMs: 1000, isProcessAlive: () => true },
+      ),
+    ).rejects.toBeInstanceOf(LockError);
+
+    expect(ran).toBe(false); // never entered the critical section
+    // The original holder's lock is untouched (token unchanged).
+    expect(JSON.parse(readFileSync(p.lock, 'utf8')).token).toBe('live-but-old');
+  });
+
+  it('never double-enters: a waiter must not reclaim a LIVE same-host holder by age', async () => {
+    const p = paths();
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    const events: string[] = [];
+
+    const run = (tag: string, staleMs: number) =>
+      withLock(
+        p,
+        async () => {
+          concurrent += 1;
+          maxConcurrent = Math.max(maxConcurrent, concurrent);
+          events.push(`${tag}:start`);
+          await delay(40);
+          events.push(`${tag}:end`);
+          concurrent -= 1;
+        },
+        { pollMs: 5, staleMs, timeoutMs: 5000, isProcessAlive: () => true },
+      );
+
+    // A takes the lock first and stays inside its section. B runs with an
+    // aggressive staleMs: on the buggy code it reclaims A's still-held lock by
+    // age and slips into the critical section alongside A (double-entry).
+    const a = run('A', 60_000);
+    await delay(8); // let A acquire and enter its section
+    const b = run('B', 1);
+    await Promise.all([a, b]);
+
+    expect(maxConcurrent).toBe(1); // the sections never overlapped
+    expect(events).toHaveLength(4);
+    // Whichever ran first completed fully before the other started.
+    expect(events[0]!.split(':')[0]).toBe(events[1]!.split(':')[0]);
+    expect(events[1]).toMatch(/:end$/);
+    expect(events[3]).toMatch(/:end$/);
+  });
+
+  it('serialises two acquirers reclaiming a dead-pid stale lock — one section at a time', async () => {
+    const p = paths();
+    // A stale lock left by a crashed process (pid dead on THIS host).
+    writeFileSync(
+      p.lock,
+      JSON.stringify({ pid: 999_999, timestamp: Date.now() - 1, host: hostname(), token: 'dead' }),
+    );
+
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    const events: string[] = [];
+    // Alive only for our own pid; the planted 999999 reads as dead.
+    const isProcessAlive = (pid: number) => pid === process.pid;
+    const critical = (tag: string) =>
+      withLock(
+        p,
+        async () => {
+          concurrent += 1;
+          maxConcurrent = Math.max(maxConcurrent, concurrent);
+          events.push(`${tag}:start`);
+          await delay(20);
+          events.push(`${tag}:end`);
+          concurrent -= 1;
+        },
+        { pollMs: 5, isProcessAlive },
+      );
+
+    await Promise.all([critical('A'), critical('B')]);
+
+    expect(maxConcurrent).toBe(1); // exactly one critical section at a time
+    expect(events).toHaveLength(4);
+    expect(events[0]!.split(':')[0]).toBe(events[1]!.split(':')[0]);
+    expect(events[1]).toMatch(/:end$/);
   });
 
   it('reclaims a malformed lock file', async () => {
