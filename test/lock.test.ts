@@ -58,7 +58,10 @@ describe('withLock', () => {
           await delay(15);
           events.push(`${tag}:end`);
         },
-        { pollMs: 5 },
+        // Generous acquire timeout: this asserts mutual exclusion, not a
+        // deadline. Under parallel vitest workers the holder's release can be
+        // scheduling-starved past the 10s default, spuriously throwing LockError.
+        { pollMs: 5, timeoutMs: 60_000 },
       );
 
     await Promise.all([critical('A'), critical('B')]);
@@ -186,7 +189,7 @@ describe('withLock', () => {
           events.push(`${tag}:end`);
           concurrent -= 1;
         },
-        { pollMs: 5, staleMs, timeoutMs: 5000, isProcessAlive: () => true },
+        { pollMs: 5, staleMs, timeoutMs: 60_000, isProcessAlive: () => true },
       );
 
     // A takes the lock first and stays inside its section. B runs with an
@@ -229,7 +232,9 @@ describe('withLock', () => {
           events.push(`${tag}:end`);
           concurrent -= 1;
         },
-        { pollMs: 5, isProcessAlive },
+        // Generous acquire timeout (asserts serialisation, not a deadline) so a
+        // scheduling-starved holder under parallel workers can't spuriously fail.
+        { pollMs: 5, timeoutMs: 60_000, isProcessAlive },
       );
 
     await Promise.all([critical('A'), critical('B')]);
