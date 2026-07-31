@@ -651,6 +651,42 @@ function parseConfig(text: string, item: ConfigKeysItem): unknown {
   return parseJsonConfig(text, item.path);
 }
 
+// ---------------------------------------------------------------------------
+// inspect (read-only) — for `agentenv doctor`
+// ---------------------------------------------------------------------------
+
+/**
+ * The read-only health of an owned config key, anchored to the manifest:
+ * - `clean`   — the key is present and its value still hashes to the record.
+ * - `drifted` — the key is present but its value hash changed (a harness
+ *   reserialised/reformatted/rewrote the file) — reconcilable by parse
+ *   ({@link syncBack} brings the record and store back into agreement).
+ * - `absent`  — the key/element is gone from the file.
+ */
+export type KeyStatus = 'clean' | 'drifted' | 'absent';
+
+/**
+ * Report whether an owned config key still matches its recorded hash, WITHOUT
+ * modifying anything (design D4 doctor). Reuses the same parse + hash the mechanism
+ * trusts, so `doctor` never re-implements config drift detection. Order- and
+ * format-insensitive (the hash is over a stable stringification), so a mere key
+ * reordering is not reported as drift.
+ */
+export async function inspectOwnedKey(item: ConfigKeysItem): Promise<KeyStatus> {
+  const text = await readText(item.path);
+  if (item.mode === 'array-element') {
+    const { found, value } = getAtPath(parseConfig(text, item), item.keyPath);
+    const present =
+      found &&
+      Array.isArray(value) &&
+      value.some((v) => stableStringify(v) === stableStringify(item.value));
+    return present ? 'clean' : 'absent';
+  }
+  const { found, value } = readKeyed(text, item);
+  if (!found) return 'absent';
+  return hashValue(value) === item.hash ? 'clean' : 'drifted';
+}
+
 /**
  * Deep-clone `value` and reset each secret-flagged subpath to its placeholder, so
  * a baked literal is never carried into the store (D6). Best-effort: a subpath

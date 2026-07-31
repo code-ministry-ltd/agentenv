@@ -5,6 +5,7 @@ import { captureCommand } from './capture.js';
 import { createCommand } from './create.js';
 import { defaultCommand } from './default.js';
 import { disownCommand } from './disown.js';
+import { doctorCommand } from './doctor.js';
 import { dropCommand } from './drop.js';
 import { editCommand } from './edit.js';
 import { initCommand } from './init.js';
@@ -43,6 +44,7 @@ export const commands: readonly Command[] = [
   statusCommand,
   remoteCommand,
   syncCommand,
+  doctorCommand,
   runCommand,
   shellInitCommand,
   shimCommand,
