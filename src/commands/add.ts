@@ -1,5 +1,5 @@
 import { access, cp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
@@ -11,13 +11,14 @@ import {
 } from '../content-items.js';
 import type { SkillSourceRecord } from '../env-config.js';
 import { upsertEnvSource } from '../env-config.js';
-import { confirmDefault } from '../prompt.js';
+import { confirmDefault, selectSkillsDefault } from '../prompt.js';
 import {
   diffDirs,
   fetchSkillSource,
   hashDir,
   resolveSkillSource,
   scanSkillDirs,
+  type ParsedSkillSource,
 } from '../skill-source.js';
 import { environmentExists, readEnvConfig, validateEnvName } from '../store.js';
 
@@ -33,7 +34,11 @@ function fail(stderr: string, code = 1): RunResult {
 }
 
 function kindsHelp(): string {
-  return `Kinds: ${KINDS.join(', ')}\nUsage: agentenv add <kind> <env> …\n`;
+  return (
+    `Kinds: ${KINDS.join(', ')}, skills\n` +
+    'Usage: agentenv add <kind> <env> …\n' +
+    '       agentenv add skills <env> <owner/repo[/path][@ref]> [--all]   (scan a git source)\n'
+  );
 }
 
 async function pathExists(p: string): Promise<boolean> {
@@ -170,6 +175,20 @@ function shortSha(sha: string): string {
   return sha.slice(0, 7);
 }
 
+/** Replace the environment's `skills/<name>/` directory with a copy of `sourceDir`. */
+async function copySkillDir(
+  ctx: CommandContext,
+  env: string,
+  name: string,
+  sourceDir: string,
+): Promise<void> {
+  const skillsDir = join(ctx.paths.envDir(env), 'skills');
+  const destDir = join(skillsDir, name);
+  await mkdir(skillsDir, { recursive: true });
+  await rm(destDir, { recursive: true, force: true });
+  await cp(sourceDir, destDir, { recursive: true });
+}
+
 /**
  * Copy a validated skill directory into the environment's store and record its
  * provenance in `env.yaml`'s `sources:` map (design D17). The destination is
@@ -182,11 +201,7 @@ async function writeVendoredSkill(
   sourceDir: string,
   provenance: SkillSourceRecord,
 ): Promise<void> {
-  const skillsDir = join(ctx.paths.envDir(env), 'skills');
-  const destDir = join(skillsDir, name);
-  await mkdir(skillsDir, { recursive: true });
-  await rm(destDir, { recursive: true, force: true });
-  await cp(sourceDir, destDir, { recursive: true });
+  await copySkillDir(ctx, env, name, sourceDir);
   const yamlText = await readFile(ctx.paths.envYaml(env), 'utf8');
   await writeFile(ctx.paths.envYaml(env), upsertEnvSource(yamlText, name, provenance), 'utf8');
 }
@@ -296,6 +311,130 @@ async function addSkillFromGit(
     );
   } finally {
     await rm(fetched.cloneDir, { recursive: true, force: true });
+  }
+}
+
+/** POSIX-style repo path of a skill dir found under a fetched source's scan root. */
+function repoPathOf(subpath: string, scanRoot: string, skillDir: string): string {
+  const rel = relative(scanRoot, skillDir).split(sep).join('/');
+  return [subpath, rel].filter((s) => s !== '').join('/');
+}
+
+/**
+ * `add skills <env> <source> [--all] [--force]` — scan a source for every skill
+ * (design D17), present a checklist (name + description), and install the
+ * selection. `--all` installs everything non-interactively; the checklist is an
+ * injectable selector so tests never need a TTY. A local directory is scanned in
+ * place (no provenance); a git source is cloned and each installed skill records
+ * its own provenance. Name collisions skip-and-warn unless `--force`.
+ */
+async function addSkills(rest: readonly string[], ctx: CommandContext): Promise<RunResult> {
+  const parsed = parseArgs(rest, { booleans: ['all', 'force'] });
+  if (parsed.unknown.length > 0) {
+    return fail(`add skills: unknown option '${parsed.unknown[0]}'\n`);
+  }
+  const resolved = await resolveEnv('skills', parsed.positionals[0], ctx.paths);
+  if ('error' in resolved) return resolved.error;
+  const env = resolved.env;
+
+  const target = parsed.positionals[1];
+  if (target === undefined) {
+    return fail(
+      'add skills: missing source\n' +
+        'Usage: agentenv add skills <env> <owner/repo[/path][@ref]|localDir> [--all] [--force]\n',
+    );
+  }
+  const all = parsed.booleans.has('all');
+  const force = parsed.booleans.has('force');
+
+  // Local existing dir → scan in place (no provenance); otherwise a git source.
+  const localDir = resolve(ctx.cwd, target);
+  let localIsDir: boolean;
+  try {
+    localIsDir = (await stat(localDir)).isDirectory();
+  } catch {
+    localIsDir = false;
+  }
+
+  let scanRoot: string;
+  let cleanup: () => Promise<void> = async () => {};
+  let git: { source: ParsedSkillSource; commit: string; ref: string } | undefined;
+
+  if (localIsDir) {
+    scanRoot = localDir;
+  } else {
+    const source = await resolveSkillSource(target);
+    if ('error' in source) return fail(`add skills: ${source.error}\n`);
+    const fetched = await fetchSkillSource(source);
+    if ('error' in fetched) return fail(`add skills: ${fetched.error}\n`);
+    scanRoot = fetched.scanDir;
+    cleanup = () => rm(fetched.cloneDir, { recursive: true, force: true });
+    git = { source, commit: fetched.commit, ref: fetched.ref };
+  }
+
+  try {
+    const candidates = await scanSkillDirs(scanRoot);
+    if (candidates.length === 0) {
+      return fail(`add skills: no skills (SKILL.md) found at '${target}'\n`);
+    }
+
+    let selected: readonly string[];
+    if (all) {
+      selected = candidates.map((c) => c.name);
+    } else {
+      const selector = ctx.options.selectSkills ?? selectSkillsDefault;
+      selected = await selector(candidates.map((c) => ({ name: c.name, description: c.description })));
+    }
+    if (selected.length === 0) {
+      return ok('No skills selected; nothing installed. (pass --all to install everything found)\n');
+    }
+
+    const wanted = new Set(selected);
+    const chosen = candidates.filter((c) => wanted.has(c.name));
+    const installed: string[] = [];
+    const skipped: string[] = [];
+    const errors: string[] = [];
+
+    for (const c of chosen) {
+      const validation = await validateSkillDir(c.dir);
+      if ('error' in validation) {
+        errors.push(`${c.name}: ${validation.error}`);
+        continue;
+      }
+      const name = validation.name;
+      const destDir = join(ctx.paths.envDir(env), 'skills', name);
+      if ((await pathExists(destDir)) && !force) {
+        skipped.push(`${name} (already exists; \`agentenv add skill\` to update, or --force)`);
+        continue;
+      }
+      if (git) {
+        const hash = await hashDir(c.dir);
+        await writeVendoredSkill(ctx, env, name, c.dir, {
+          repo: git.source.repo,
+          path: repoPathOf(git.source.subpath, scanRoot, c.dir),
+          ref: git.ref,
+          commit: git.commit,
+          hash,
+        });
+      } else {
+        await copySkillDir(ctx, env, name, c.dir);
+      }
+      installed.push(name);
+    }
+
+    const lines: string[] = [];
+    if (installed.length > 0) {
+      lines.push(`Installed ${installed.length} skill(s) into '${env}': ${installed.join(', ')}.`);
+    }
+    if (skipped.length > 0) lines.push(`Skipped: ${skipped.join('; ')}.`);
+    if (errors.length > 0) lines.push(`Errors: ${errors.join('; ')}.`);
+    const text = `${lines.join('\n')}\n`;
+    if (installed.length === 0 && errors.length > 0) {
+      return fail(text);
+    }
+    return ok(text);
+  } finally {
+    await cleanup();
   }
 }
 
@@ -501,6 +640,8 @@ export const addCommand: Command = {
     switch (kind) {
       case 'skill':
         return addSkill(rest, ctx);
+      case 'skills':
+        return addSkills(rest, ctx);
       case 'mcp':
         return addMcp(rest, ctx);
       case 'instructions':
