@@ -375,6 +375,102 @@ export async function scanSkillDirs(root: string): Promise<SkillCandidate[]> {
   return found;
 }
 
+/** Relative POSIX-style paths of every file under `dir` (excluding `.git`), sorted. */
+async function listFiles(dir: string): Promise<string[]> {
+  const files: string[] = [];
+  const walk = async (current: string): Promise<void> => {
+    let entries;
+    try {
+      entries = await readdir(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name === '.git') continue;
+      const full = join(current, entry.name);
+      if (entry.isDirectory()) await walk(full);
+      else if (entry.isFile()) files.push(relative(dir, full).split(sep).join('/'));
+    }
+  };
+  await walk(dir);
+  return files.sort((a, b) => a.localeCompare(b));
+}
+
+/** A line-level diff (LCS) between two texts, unified-style (` `/`-`/`+`). */
+function lineDiff(oldText: string, newText: string): string[] {
+  const a = oldText.split('\n');
+  const b = newText.split('\n');
+  const n = a.length;
+  const m = b.length;
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i]![j] = a[i] === b[j] ? dp[i + 1]![j + 1]! + 1 : Math.max(dp[i + 1]![j]!, dp[i]![j + 1]!);
+    }
+  }
+  const out: string[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      out.push(` ${a[i]}`);
+      i++;
+      j++;
+    } else if (dp[i + 1]![j]! >= dp[i]![j + 1]!) {
+      out.push(`-${a[i]}`);
+      i++;
+    } else {
+      out.push(`+${b[j]}`);
+      j++;
+    }
+  }
+  while (i < n) out.push(`-${a[i++]}`);
+  while (j < m) out.push(`+${b[j++]}`);
+  return out;
+}
+
+async function readMaybe(p: string): Promise<string | null> {
+  try {
+    return await readFile(p, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A human-readable diff between two skill directories — the v1 update path
+ * (design D17). Lists added/removed files and, for changed text files, a
+ * unified line diff. Returns '' when the trees are byte-identical.
+ */
+export async function diffDirs(oldDir: string, newDir: string): Promise<string> {
+  const oldFiles = new Set(await listFiles(oldDir));
+  const newFiles = new Set(await listFiles(newDir));
+  const all = [...new Set([...oldFiles, ...newFiles])].sort((a, b) => a.localeCompare(b));
+  const lines: string[] = [];
+  for (const rel of all) {
+    const inOld = oldFiles.has(rel);
+    const inNew = newFiles.has(rel);
+    if (inOld && !inNew) {
+      lines.push(`  removed: ${rel}`);
+      continue;
+    }
+    if (!inOld && inNew) {
+      lines.push(`  added:   ${rel}`);
+      continue;
+    }
+    const oldText = await readMaybe(join(oldDir, rel));
+    const newText = await readMaybe(join(newDir, rel));
+    if (oldText === null || newText === null) {
+      if (oldText !== newText) lines.push(`  changed: ${rel} (binary)`);
+      continue;
+    }
+    if (oldText === newText) continue;
+    lines.push(`  changed: ${rel}`);
+    for (const dl of lineDiff(oldText, newText)) lines.push(`    ${dl}`);
+  }
+  return lines.join('\n');
+}
+
 async function readDescription(dir: string): Promise<string> {
   let text: string;
   try {
