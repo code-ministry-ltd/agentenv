@@ -693,17 +693,40 @@ function splitDotted(dotted: string): string[] {
   return segments;
 }
 
-/** Set `leaf` at a dotted subpath within an object value; a missing segment is a no-op. */
+/**
+ * Resolve a path segment to a valid ARRAY index, or `undefined` when `cur` is not an
+ * array or the segment is not an in-bounds non-negative integer — so restore can
+ * reach an array-nested placeholder (canonical MCP `args.<i>`), mirroring the
+ * substitute side in `secrets.ts`.
+ */
+function arrayIndexSegment(cur: JsonValue, seg: string): number | undefined {
+  if (!Array.isArray(cur) || !/^\d+$/.test(seg)) return undefined;
+  const idx = Number(seg);
+  return idx < cur.length ? idx : undefined;
+}
+
+/** Set `leaf` at a dotted subpath within an object OR array value; a missing segment is a no-op. */
 function setAtDottedPath(root: JsonValue, path: string[], leaf: string): void {
   let cur: JsonValue = root;
   for (let i = 0; i < path.length - 1; i++) {
-    if (cur === null || typeof cur !== 'object' || Array.isArray(cur)) return;
     const seg = path[i] as string;
+    const idx = arrayIndexSegment(cur, seg);
+    if (idx !== undefined) {
+      cur = (cur as JsonValue[])[idx] as JsonValue;
+      continue;
+    }
+    if (cur === null || typeof cur !== 'object' || Array.isArray(cur)) return;
     if (!Object.prototype.hasOwnProperty.call(cur, seg)) return;
     cur = (cur as { [k: string]: JsonValue })[seg] as JsonValue;
   }
+  const last = path[path.length - 1] as string;
+  const lastIdx = arrayIndexSegment(cur, last);
+  if (lastIdx !== undefined) {
+    (cur as JsonValue[])[lastIdx] = leaf;
+    return;
+  }
   if (cur === null || typeof cur !== 'object' || Array.isArray(cur)) return;
-  (cur as { [k: string]: JsonValue })[path[path.length - 1] as string] = leaf;
+  (cur as { [k: string]: JsonValue })[last] = leaf;
 }
 
 // ---------------------------------------------------------------------------

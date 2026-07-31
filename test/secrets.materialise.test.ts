@@ -40,6 +40,12 @@ afterEach(() => {
 const FAKE_TOKEN = `ghp_${'A1'.repeat(18)}`;
 /** A distinct real-shaped token the user bakes over a passthrough placeholder (7b). */
 const BAKED_TOKEN = `ghp_${'B2'.repeat(18)}`;
+/**
+ * An OPAQUE literal (no provider prefix) baked over an ARRAY-nested `${VAR}` (7c).
+ * Deliberately NOT token-shaped, so the D9 token-pattern scan cannot save it — only
+ * restoring the placeholder on write-back keeps it out of the store.
+ */
+const OPAQUE_BAKED = 'Kp7mNq2wXt9vRb4zLc6yHa1dFe3gJh5nMs8pQr0T';
 
 /** All committed blobs + working tree of the store, joined — for a "token never present" scan. */
 function storeHistoryAndTree(storeDir: string): string {
@@ -150,6 +156,61 @@ describe('secrets materialise 7b: passthrough rung strips a baked literal on wri
     expect(storeYaml).not.toContain(BAKED_TOKEN);
     // The baked literal is in NO store commit and NO working-tree file.
     expect(storeHistoryAndTree(paths.store)).not.toContain(BAKED_TOKEN);
+  });
+});
+
+describe('secrets materialise 7c: an array-nested baked literal is stripped on write-back', () => {
+  it('a literal baked over ${VAR} inside stdio args is restored to the placeholder', async () => {
+    const th = gitHome();
+    const paths = resolvePaths(th.env);
+    const realHome = join(th.home, 'claude-copy');
+    mkdirSync(realHome, { recursive: true });
+    writeFileSync(
+      join(realHome, '.claude.json'),
+      `${JSON.stringify({ hasCompletedOnboarding: true }, null, 2)}\n`,
+    );
+    const env: NodeJS.ProcessEnv = { ...th.env, CLAUDE_CONFIG_DIR: realHome };
+    const opts = { env, adapters: [claudeAdapter] };
+
+    await run(['init'], { env });
+    await run(['create', 'research'], { env });
+    mkdirSync(join(paths.envDir('research'), 'mcp'), { recursive: true });
+    // Canonical MCP `args` carries the ${VAR} as an ARRAY element (D6 passthrough).
+    writeFileSync(
+      join(paths.envDir('research'), 'mcp', 'servers.yaml'),
+      [
+        'context7:',
+        '  command: npx',
+        '  args:',
+        '    - "-y"',
+        '    - "@upstash/context7-mcp"',
+        '    - "--api-key"',
+        '    - "${CTX_API_KEY}"',
+        '',
+      ].join('\n'),
+    );
+
+    const used = await run(['use', 'research', '--global'], opts);
+    expect(used.code).toBe(0);
+
+    // Passthrough: the placeholder is KEPT verbatim in the real config (no secret).
+    const cfg1 = JSON.parse(readFileSync(join(realHome, '.claude.json'), 'utf8'));
+    expect(cfg1.mcpServers.context7.args).toContain('${CTX_API_KEY}');
+
+    // The user BAKES an opaque literal over the array-nested placeholder, mid-session.
+    const idx = cfg1.mcpServers.context7.args.indexOf('${CTX_API_KEY}');
+    cfg1.mcpServers.context7.args[idx] = OPAQUE_BAKED;
+    writeFileSync(join(realHome, '.claude.json'), `${JSON.stringify(cfg1, null, 2)}\n`);
+
+    // Next invocation: drift sweep write-back must restore the placeholder to the store.
+    const again = await run(['use', 'research', '--global'], opts);
+    expect(again.code).toBe(0);
+
+    const storeYaml = readFileSync(join(paths.envDir('research'), 'mcp', 'servers.yaml'), 'utf8');
+    expect(storeYaml).toContain('${CTX_API_KEY}');
+    expect(storeYaml).not.toContain(OPAQUE_BAKED);
+    // The baked literal is in NO store commit and NO working-tree file.
+    expect(storeHistoryAndTree(paths.store)).not.toContain(OPAQUE_BAKED);
   });
 });
 

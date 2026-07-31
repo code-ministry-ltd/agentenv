@@ -197,13 +197,34 @@ export function substituteSecretFields(
   return { value: clone, unresolved };
 }
 
+/**
+ * Resolve a path segment to a valid ARRAY index, or `undefined` when `cur` is not an
+ * array or the segment is not an in-bounds non-negative integer. Lets navigation
+ * descend into an array-nested placeholder (canonical MCP `args.<i>`) so both
+ * substitution here and restoration in `config-keys.ts` reach an array element.
+ */
+function arrayIndexSegment(cur: JsonValue, seg: string): number | undefined {
+  if (!Array.isArray(cur) || !/^\d+$/.test(seg)) return undefined;
+  const idx = Number(seg);
+  return idx < cur.length ? idx : undefined;
+}
+
+/** Step one segment into `cur`, through an object key OR an array index; else `undefined`. */
+function stepInto(cur: JsonValue, seg: string): JsonValue | undefined {
+  const idx = arrayIndexSegment(cur, seg);
+  if (idx !== undefined) return (cur as JsonValue[])[idx] as JsonValue;
+  if (cur === null || typeof cur !== 'object' || Array.isArray(cur)) return undefined;
+  if (!Object.prototype.hasOwnProperty.call(cur, seg)) return undefined;
+  return (cur as { [k: string]: JsonValue })[seg] as JsonValue;
+}
+
 /** Read the string at a dot-path within a JSON value; `undefined` if absent/non-string. */
 function getStringAt(root: JsonValue, path: string[]): string | undefined {
   let cur: JsonValue = root;
   for (const seg of path) {
-    if (cur === null || typeof cur !== 'object' || Array.isArray(cur)) return undefined;
-    if (!Object.prototype.hasOwnProperty.call(cur, seg)) return undefined;
-    cur = (cur as { [k: string]: JsonValue })[seg] as JsonValue;
+    const next = stepInto(cur, seg);
+    if (next === undefined) return undefined;
+    cur = next;
   }
   return typeof cur === 'string' ? cur : undefined;
 }
@@ -212,13 +233,18 @@ function getStringAt(root: JsonValue, path: string[]): string | undefined {
 function setStringAt(root: JsonValue, path: string[], leaf: string): void {
   let cur: JsonValue = root;
   for (let i = 0; i < path.length - 1; i++) {
-    if (cur === null || typeof cur !== 'object' || Array.isArray(cur)) return;
-    const seg = path[i] as string;
-    if (!Object.prototype.hasOwnProperty.call(cur, seg)) return;
-    cur = (cur as { [k: string]: JsonValue })[seg] as JsonValue;
+    const next = stepInto(cur, path[i] as string);
+    if (next === undefined) return;
+    cur = next;
+  }
+  const last = path[path.length - 1] as string;
+  const idx = arrayIndexSegment(cur, last);
+  if (idx !== undefined) {
+    (cur as JsonValue[])[idx] = leaf;
+    return;
   }
   if (cur === null || typeof cur !== 'object' || Array.isArray(cur)) return;
-  (cur as { [k: string]: JsonValue })[path[path.length - 1] as string] = leaf;
+  (cur as { [k: string]: JsonValue })[last] = leaf;
 }
 
 /**

@@ -120,6 +120,15 @@ function collectPlaceholders(value: unknown, prefix: string, out: Record<string,
     if (prefix !== '' && /\$\{[^}]+\}/.test(value)) out[prefix] = value;
     return;
   }
+  // Descend ARRAYS too (canonical MCP `args: [...]` holds `${VAR}` as an element):
+  // emit a numeric index segment so an array-nested placeholder is flagged and can
+  // be restored on write-back, not left as a baked literal (secret-safety fix).
+  if (Array.isArray(value)) {
+    value.forEach((v, i) => {
+      collectPlaceholders(v, prefix === '' ? String(i) : `${prefix}.${i}`, out);
+    });
+    return;
+  }
   if (isObject(value)) {
     for (const [k, v] of Object.entries(value)) {
       collectPlaceholders(v, prefix === '' ? k : `${prefix}.${k}`, out);
