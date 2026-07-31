@@ -298,10 +298,28 @@ function manualPending(files: readonly ConflictedFile[], notices: readonly strin
 
 /**
  * Which of `files` still carry git conflict markers on disk (i.e. are NOT yet
- * resolved). Requires BOTH a `<<<<<<<` and a `>>>>>>>` start/end marker at line
- * start, so a Markdown `=======` heading underline in a legitimately-resolved store
- * file is never mistaken for an unresolved conflict. Unreadable files are treated as
- * resolved (nothing to gate on).
+ * resolved). This is the gate that keeps agentenv from ever committing a
+ * marker-laden tree, so it stays deliberately FAIL-SAFE: when in doubt it treats a
+ * file as still-conflicted (the caller then aborts, keeps local, and commits
+ * nothing — never the reverse).
+ *
+ * It requires all THREE standard git markers to be present, each at line start: an
+ * opening `<<<<<<< `, a bare `=======` divider, and a closing `>>>>>>> `. A real git
+ * conflict ALWAYS writes all three, so no real conflict slips through — the CRITICAL
+ * garbage-commit guard depends on that. Requiring the `=======` divider too (not just
+ * the `<<<<<<<`/`>>>>>>>` pair) narrows a false positive: a legitimately-resolved
+ * store file that DOCUMENTS the angle markers at line start (e.g. a skill whose body
+ * shows a `<<<<<<< … >>>>>>>` example) is no longer mistaken for an unresolved
+ * conflict unless it also happens to contain a bare `=======` line between them.
+ *
+ * KNOWN LIMITATION (fail-safe, accepted): a resolution whose final content itself
+ * documents ALL THREE raw markers at line start — opener, bare divider, and closer —
+ * is genuinely ambiguous and is still treated as unresolved. That only ever costs
+ * availability (the guided resolve refuses; the local store keeps working), never
+ * safety. Such a resolution must be completed with raw git (`git rebase --continue`).
+ * Do NOT relax this so that real markers could slip through.
+ *
+ * Unreadable files are treated as resolved (nothing to gate on).
  */
 async function filesStillMarked(files: readonly ConflictedFile[]): Promise<string[]> {
   const marked: string[] = [];
@@ -312,7 +330,9 @@ async function filesStillMarked(files: readonly ConflictedFile[]): Promise<strin
     } catch {
       continue;
     }
-    if (/^<{7}[ \t]/m.test(text) && /^>{7}[ \t]/m.test(text)) marked.push(f.path);
+    if (/^<{7}[ \t]/m.test(text) && /^={7}[ \t\r]*$/m.test(text) && /^>{7}[ \t]/m.test(text)) {
+      marked.push(f.path);
+    }
   }
   return marked;
 }
