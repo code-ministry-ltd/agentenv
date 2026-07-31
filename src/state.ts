@@ -257,7 +257,7 @@ export async function writeState(paths: Paths, manifest: StateManifest): Promise
  * item; {@link addItem} upserts by it and {@link removeItem} matches by it.
  */
 export function itemIdentity(item: ManifestItemBase): string {
-  return `${item.surface} ${item.path} ${item.key ?? ''}`;
+  return `${item.surface}\0${item.path}\0${item.key ?? ''}`;
 }
 
 /** The first record that owns `path` (whole-file surfaces have at most one). */
