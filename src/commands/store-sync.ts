@@ -37,10 +37,23 @@ export function noteBlockedCommit(result: CommitResult, notices: string[]): void
   }
 }
 
-/** Commit one store mutation with a descriptive message, noting a secret-scan block. */
+/**
+ * Commit one store mutation with a descriptive message, noting a secret-scan block.
+ *
+ * Fail-soft (D9, symmetric with {@link beginStoreSync}'s drift-commit): the local
+ * mutation has already landed on disk, so a git commit that throws (a locked index,
+ * a broken repo) must only WARN — never abort the command that made the change.
+ */
 export async function commitMutation(ctx: SyncCtx, message: string, notices: string[]): Promise<void> {
-  const result = await commitStore(ctx.paths, ctx.env, message, ctx.options.gitRun);
-  noteBlockedCommit(result, notices);
+  try {
+    const result = await commitStore(ctx.paths, ctx.env, message, ctx.options.gitRun);
+    noteBlockedCommit(result, notices);
+  } catch (err) {
+    notices.push(
+      `agentenv: commit skipped — ${(err as Error).message}. ` +
+        'Your change is saved locally in the store working tree; the next store command will commit it.',
+    );
+  }
 }
 
 /** START the sync lifecycle: pull-on-invoke + post-pull safeguards (design D9). */

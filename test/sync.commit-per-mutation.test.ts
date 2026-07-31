@@ -1,9 +1,10 @@
 import { execFileSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { existsSync } from 'node:fs';
 import { afterEach, describe, expect, it } from 'vitest';
 import { run } from '../src/cli.js';
-import { commitStore } from '../src/git.js';
+import { commitStore, defaultGitRunner, type GitRunner } from '../src/git.js';
 import { resolvePaths } from '../src/paths.js';
 import { makeFixtureRepo, makeTempHome, type FixtureRepo, type TempHome } from './helpers.js';
 
@@ -93,6 +94,33 @@ describe('sync: commit-per-mutation (D9)', () => {
       'agentenv: add skill beta → writing',
       'agentenv: add skill gamma → writing',
     ]);
+  });
+});
+
+describe('sync: the per-mutation commit is fail-soft (D9, F4)', () => {
+  it('a failing commit (e.g. locked index) warns and never aborts the command', async () => {
+    const th = gitHome();
+    const paths = resolvePaths(th.env);
+    await run(['init'], { env: th.env });
+
+    // Every `git commit` fails as if the index were locked; other git ops succeed.
+    const lockedIndex: GitRunner = (args, opts) =>
+      args.includes('commit')
+        ? Promise.resolve({
+            code: 1,
+            stdout: '',
+            stderr: "fatal: Unable to create '.git/index.lock': File exists.",
+            timedOut: false,
+          })
+        : defaultGitRunner(args, opts);
+
+    // The mutation itself must still land locally, exit 0, and only WARN about the
+    // commit — symmetric with the drift-commit's fail-soft path.
+    const res = await run(['create', 'writing'], { env: th.env, gitRun: lockedIndex });
+    expect(res.code).toBe(0);
+    expect(existsSync(paths.envDir('writing'))).toBe(true); // the local change is on disk
+    expect(res.stderr ?? '').toMatch(/commit/i);
+    expect(res.stderr ?? '').toMatch(/index\.lock/i);
   });
 });
 
