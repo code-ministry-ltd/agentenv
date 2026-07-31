@@ -314,13 +314,61 @@ const FIXTURE_MARKER_IN_TOKEN_RE =
 const ALLOW_SECRET_RE = /agentenv:allow-secret/i;
 
 /**
+ * Extract the value of a KEYLESS list item — a YAML block-sequence entry (`- x`) or a
+ * JSON array string element (a quoted string alone on its line, no `key:`). Returns
+ * `undefined` for anything else. This is where an array-nested secret lands (canonical
+ * MCP `args: [..., "<secret>"]`), which the key:value and provider-shape rules miss.
+ */
+function bareListItemValue(line: string): string | undefined {
+  const yaml = /^\s*-\s+(.+?)\s*$/.exec(line);
+  if (yaml) {
+    const raw = yaml[1] as string;
+    const q = /^(["'])(.*)\1$/.exec(raw);
+    return q ? (q[2] as string) : raw;
+  }
+  const json = /^\s*"((?:[^"\\]|\\.)*)"\s*,?\s*$/.exec(line);
+  if (json) return json[1] as string;
+  return undefined;
+}
+
+/** Shannon entropy in bits-per-character — a cheap randomness signal. */
+function shannonEntropyBits(v: string): number {
+  const freq = new Map<string, number>();
+  for (const ch of v) freq.set(ch, (freq.get(ch) ?? 0) + 1);
+  let bits = 0;
+  for (const count of freq.values()) {
+    const p = count / v.length;
+    bits -= p * Math.log2(p);
+  }
+  return bits;
+}
+
+/**
+ * Whether a bare value looks like an opaque high-entropy secret. Deliberately
+ * CONSERVATIVE so ordinary list items (skill names, short args, package specs,
+ * lowercase-hex hashes) never trip it: ≥24 chars, token charset only, MIXED case
+ * AND a digit, real randomness (Shannon ≥3.5 bits/char), and never a `${VAR}`
+ * placeholder or fixture word.
+ */
+function looksHighEntropyToken(v: string): boolean {
+  if (v.length < 24) return false;
+  if (PLACEHOLDER_RE.test(v) || FIXTURE_WORD_RE.test(v)) return false;
+  if (!/^[A-Za-z0-9_+/=-]+$/.test(v)) return false;
+  if (!/[a-z]/.test(v) || !/[A-Z]/.test(v) || !/[0-9]/.test(v)) return false;
+  return shannonEntropyBits(v) >= 3.5;
+}
+
+/**
  * Scan one text for suspected secrets, returning a finding per offending line.
- * Two rules, both conservative to avoid blocking legitimate commits:
+ * Three rules, all conservative to avoid blocking legitimate commits:
  *
  * 1. **Known token shapes** — unambiguous provider prefixes/formats.
  * 2. **Secret-named assignment** — a `secret|token|password|api_key…` key set to a
  *    value that *looks real* (≥16 chars, has a letter AND a digit) and is not a
  *    `${VAR}` placeholder or an obvious fixture word.
+ * 3. **Keyless high-entropy list item** — a bare `- <secret>` / JSON array element
+ *    with no key, so an OPAQUE array-nested secret (canonical MCP `args`) is caught
+ *    even when it carries no provider prefix (belt-and-braces, D9).
  */
 export function scanTextForSecrets(text: string): { line: number; reason: string }[] {
   const out: { line: number; reason: string }[] = [];
@@ -351,6 +399,15 @@ export function scanTextForSecrets(text: string): { line: number; reason: string
       }
     }
     if (matched) continue;
+
+    // Keyless high-entropy list item (`- <secret>` / a JSON array string element):
+    // the last line of defence for an opaque array-nested secret with no provider
+    // prefix. The `allow-secret` override at the top of the loop still exempts it.
+    const listItem = bareListItemValue(line);
+    if (listItem !== undefined && looksHighEntropyToken(listItem)) {
+      out.push({ line: i + 1, reason: 'high-entropy value in a keyless list item' });
+      continue;
+    }
 
     // Secret-named assignment with a real-looking value.
     const assign = /(["']?)([A-Za-z0-9_.-]+)\1\s*[:=]\s*(.+)$/.exec(line.trim());
