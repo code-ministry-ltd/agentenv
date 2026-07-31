@@ -4,6 +4,7 @@ import {
   mkdirSync,
   readFileSync,
   readlinkSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
@@ -154,6 +155,81 @@ describe('dir-merge surface', () => {
 
       // Nothing was recorded as owned — so a later drop can't touch it.
       expect(findOwner(await readState(p), at)).toBeUndefined();
+    });
+  });
+
+  describe('force: back up, take over, and restore on drop (D1)', () => {
+    it('takes over a user DIRECTORY and dematerialise restores it byte-identically', async () => {
+      const p = paths();
+      const targetDir = join(temp.home, 'claude', 'skills');
+      const userDir = makeUserItem(targetDir, 'sharpen', 'the users own sharpen\n');
+      writeFileSync(join(userDir, 'extra.txt'), 'a second user file\n');
+      const source = makeStoreItem('sharpen', '# env sharpen\n');
+      const at = join(targetDir, 'sharpen');
+
+      const item = materialised(
+        await materialise(p, {
+          ownerEnv: 'writing',
+          sourcePath: source,
+          targetDir,
+          itemName: 'sharpen',
+          mode: 'symlink',
+          force: true,
+        }),
+      );
+
+      // The env item now owns the name: a symlink to the store, backed by a
+      // directory backup so the takeover is reversible.
+      expect(lstatSync(at).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(at)).toBe(source);
+      expect(readFileSync(join(at, 'SKILL.md'), 'utf8')).toBe('# env sharpen\n');
+      expect(item.backupRef).toEqual({ kind: 'directory', id: expect.any(String) });
+
+      await dematerialise(p, item);
+
+      // The user's original directory is restored byte-identically — a real
+      // dir (not a symlink), with every file intact.
+      expect(lstatSync(at).isSymbolicLink()).toBe(false);
+      expect(lstatSync(at).isDirectory()).toBe(true);
+      expect(readFileSync(join(at, 'SKILL.md'), 'utf8')).toBe('the users own sharpen\n');
+      expect(readFileSync(join(at, 'extra.txt'), 'utf8')).toBe('a second user file\n');
+      expect(findOwner(await readState(p), at)).toBeUndefined();
+    });
+
+    it('takes over a user SYMLINK and dematerialise restores link-ness and target', async () => {
+      const p = paths();
+      const targetDir = join(temp.home, 'claude', 'skills');
+      mkdirSync(targetDir, { recursive: true });
+      // The user's item is itself a symlink (e.g. an `npx skills` install).
+      const userTarget = join(temp.home, 'elsewhere', 'sharpen');
+      mkdirSync(userTarget, { recursive: true });
+      writeFileSync(join(userTarget, 'SKILL.md'), 'linked user skill\n');
+      const at = join(targetDir, 'sharpen');
+      symlinkSync(userTarget, at);
+      const source = makeStoreItem('sharpen', '# env sharpen\n');
+
+      const item = materialised(
+        await materialise(p, {
+          ownerEnv: 'writing',
+          sourcePath: source,
+          targetDir,
+          itemName: 'sharpen',
+          mode: 'symlink',
+          force: true,
+        }),
+      );
+
+      // Now points at the store, backed by a symlink backup.
+      expect(readlinkSync(at)).toBe(source);
+      expect(item.backupRef).toEqual({ kind: 'symlink', target: userTarget });
+
+      await dematerialise(p, item);
+
+      // The user's symlink is restored as a symlink to its original target,
+      // never a materialised copy.
+      expect(lstatSync(at).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(at)).toBe(userTarget);
+      expect(readFileSync(join(at, 'SKILL.md'), 'utf8')).toBe('linked user skill\n');
     });
   });
 });

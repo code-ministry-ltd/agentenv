@@ -1,4 +1,4 @@
-import { lstat, mkdir, symlink } from 'node:fs/promises';
+import { lstat, mkdir, rm, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { backup, restore, type BackupRef } from './backups.js';
 import { beginTransaction } from './journal.js';
@@ -56,6 +56,13 @@ export interface MaterialiseOptions {
   itemName: string;
   /** Placement mechanism; defaults to `symlink`. */
   mode?: DirMergeMode;
+  /**
+   * Take over a conflicting non-owned item instead of skipping it: back it up
+   * (dir, symlink or file — {@link backup} handles each) and record the ref so
+   * {@link dematerialise} restores it. Defaults to `false` (D1). No effect on a
+   * free name or an item we already own.
+   */
+  force?: boolean;
   /** Where skip-and-warn notices go. Defaults to {@link console.warn}. */
   onWarn?: (message: string) => void;
 }
@@ -104,6 +111,7 @@ export async function materialise(
     targetDir,
     itemName,
     mode = 'symlink',
+    force = false,
     onWarn = (m: string) => console.warn(m),
   } = options;
   const targetPath = join(targetDir, itemName);
@@ -112,13 +120,16 @@ export async function materialise(
     await mkdir(targetDir, { recursive: true });
 
     const owned = findOwner(await readState(paths), targetPath);
-    if (await lexists(targetPath)) {
-      // Something already holds the name. If we own it, this is an idempotent
-      // re-activation — return the existing record untouched. If we do NOT own
-      // it, a non-owned item always wins (D1/D7): skip and warn, never clobber.
-      if (owned) {
-        return { status: 'materialised', item: owned as DirMergeItem };
-      }
+    const present = await lexists(targetPath);
+
+    // Something already holds the name. If we own it, this is an idempotent
+    // re-activation — return the existing record untouched.
+    if (present && owned) {
+      return { status: 'materialised', item: owned as DirMergeItem };
+    }
+    // A non-owned item always wins (D1/D7): skip and warn unless `force` takes
+    // it over.
+    if (present && !force) {
       onWarn(
         `agentenv: skipping '${itemName}' for env '${ownerEnv}' — a non-agentenv item ` +
           `already exists at ${targetPath}`,
@@ -126,7 +137,11 @@ export async function materialise(
       return { status: 'skipped', reason: 'conflict', path: targetPath, itemName };
     }
 
-    const backupRef: BackupRef = { kind: 'absent' };
+    // Free name → create. Non-owned + force → take over: back up the existing
+    // item first (dir/symlink/file) so the takeover is reversible on drop or
+    // crash (D1/D4). `present` here implies `force` (the skip branch returned).
+    const takeover = present;
+    const backupRef: BackupRef = takeover ? await backup(paths, targetPath) : { kind: 'absent' };
     const item: DirMergeItem = {
       surface: 'dir-merge',
       action: mode,
@@ -138,9 +153,10 @@ export async function materialise(
 
     const tx = await beginTransaction(paths);
     try {
-      await tx.apply({ op: 'add', item, undo: { path: targetPath, backupRef } }, () =>
-        placeItem(mode, sourcePath, targetPath),
-      );
+      await tx.apply({ op: 'add', item, undo: { path: targetPath, backupRef } }, async () => {
+        if (takeover) await rm(targetPath, { recursive: true, force: true });
+        await placeItem(mode, sourcePath, targetPath);
+      });
       await tx.commit();
     } catch (err) {
       await tx.rollback();
