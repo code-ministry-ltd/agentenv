@@ -69,14 +69,46 @@ export const defaultExecHarness: ExecHarness = (spec) =>
     });
   });
 
-/** The production capture: spawn with piped stdout/stderr and collect both. */
-export const defaultCapture: CaptureFn = (binaryPath, args, env) =>
-  new Promise((resolve) => {
-    const child = spawn(binaryPath, [...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
-    child.stdout?.on('data', (d: Buffer) => (stdout += d.toString()));
-    child.stderr?.on('data', (d: Buffer) => (stderr += d.toString()));
-    child.on('exit', (code) => resolve({ code, stdout, stderr }));
-    child.on('error', () => resolve({ code: 127, stdout, stderr }));
-  });
+/**
+ * Default self-check capture timeout (ms). A self-check probe spawns the harness;
+ * a hung harness must not hang the launch (M3) — the spike hard-times every
+ * harness call. On timeout the child is killed and the capture resolves with
+ * `code: null`, so the self-check sees no matching root → `ok: false` → fail-open.
+ */
+export const CAPTURE_TIMEOUT_MS = 10_000;
+
+/**
+ * Build a spawn-and-capture that kills the child and resolves after `timeoutMs`,
+ * so a self-check against a hanging harness can never block the launch.
+ */
+export function makeCapture(timeoutMs: number): CaptureFn {
+  return (binaryPath, args, env) =>
+    new Promise((resolve) => {
+      const child = spawn(binaryPath, [...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      let settled = false;
+      const settle = (r: { code: number | null; stdout: string; stderr: string }): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(r);
+      };
+      const timer = setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* already gone */
+        }
+        settle({ code: null, stdout, stderr: `${stderr}\n[agentenv: self-check timed out after ${timeoutMs}ms]` });
+      }, timeoutMs);
+      timer.unref?.(); // never keep the event loop alive for the probe timer
+      child.stdout?.on('data', (d: Buffer) => (stdout += d.toString()));
+      child.stderr?.on('data', (d: Buffer) => (stderr += d.toString()));
+      child.on('exit', (code) => settle({ code, stdout, stderr }));
+      child.on('error', () => settle({ code: 127, stdout, stderr }));
+    });
+}
+
+/** The production capture: spawn with piped stdout/stderr, collect both, time out. */
+export const defaultCapture: CaptureFn = makeCapture(CAPTURE_TIMEOUT_MS);
