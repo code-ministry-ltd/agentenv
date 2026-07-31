@@ -123,6 +123,8 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
       // by (Codex trust); thread it through to config-keys compilation (H3).
       projectRoot: cwd,
       isGloballyOwned: (p) => ownedRealPaths.has(p),
+      // The shell env resolves the substitute rung's ${VAR} over secrets.env (D6).
+      env,
       now: req.now,
       onWarn: (m) => notices.push(m),
     });

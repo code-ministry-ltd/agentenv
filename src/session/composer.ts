@@ -22,6 +22,7 @@ import {
 import { appendRegion, closeMarker, openMarker } from '../file-block.js';
 import { writeFileAtomic } from '../fs-atomic.js';
 import type { Paths } from '../paths.js';
+import { loadResolver, substituteSecretFields } from '../secrets.js';
 
 /**
  * The session view composer (D15). Given an adapter, an env stack and the real
@@ -47,8 +48,12 @@ const COMPOSER_VERSION = 1;
 /** A surface the composer did not fully apply, surfaced to `status` (D6/D7). */
 export interface SurfaceSkip {
   surfaceId: string;
-  /** `unsupported` (adapter says so), `collision` (user/earlier item won), or `format`. */
-  reason: 'unsupported' | 'collision' | 'format';
+  /**
+   * `unsupported` (adapter says so), `collision` (user/earlier item won), `format`
+   * (TOML seeding unimplemented), or `secret-unresolved` (a substitute-rung `${VAR}`
+   * resolved to nothing → the server is skipped, fail-closed per server, D6).
+   */
+  reason: 'unsupported' | 'collision' | 'format' | 'secret-unresolved';
   detail: string;
 }
 
@@ -74,6 +79,12 @@ export interface ComposeRequest {
    * owned (session-only, the Phase-1 case). Wired to the manifest by the launch.
    */
   isGloballyOwned?: (realPath: string) => boolean;
+  /**
+   * The shell env the harness will launch under. `secrets.env` layers over it to
+   * resolve the substitute rung's `${VAR}` placeholders (D6). Defaults to
+   * `process.env`; passing nothing is safe — passthrough surfaces never read it.
+   */
+  env?: NodeJS.ProcessEnv;
   onWarn?: (message: string) => void;
   /** Injectable clock for the build timestamp (tests). */
   now?: () => number;
@@ -361,6 +372,11 @@ async function composeConfigKeysFile(
     return;
   }
 
+  // Secrets resolver for the substitute rung (D6): secrets.env first, then the
+  // launching shell's env. The private view is derived and never synced, so a
+  // resolved literal here reaches only the ephemeral view — never the store.
+  const resolver = await loadResolver(paths, req.env ?? process.env);
+
   const seedText = await readFileOrEmpty(join(realConfigRoot, file));
   const seed = (seedText.trim() === '' ? {} : parseJsonc(seedText)) as Record<string, unknown>;
   const userSnapshot = structuredClone(seed);
@@ -384,9 +400,9 @@ async function composeConfigKeysFile(
         onWarn(`agentenv: env '${env}' ${surface.id} compile failed: ${(err as Error).message}`);
         continue;
       }
-      // COUPLING (Task 2.4): compiled `secretFields` placeholders must be resolved
-      // to their machine-local values HERE too — this divergent merge path currently
-      // ignores them (safe now: secrets are not yet materialised, a gap when 2.4 lands).
+      // Substitute rung (D6): a surface the harness can't interpolate has its
+      // compiled `secretFields` placeholders resolved to literals HERE, so the
+      // private view is functional; a passthrough surface keeps the `${VAR}`.
       for (const inj of injections) {
         if (inj.style === 'keyed') {
           // A value the USER already had at this path wins (D7); an earlier env's is
@@ -397,6 +413,22 @@ async function composeConfigKeysFile(
             skipped.push({ surfaceId: surface.id, reason: 'collision', detail });
             continue;
           }
+          // Resolve substitute-rung placeholders; unresolved → fail closed per server.
+          let value = inj.value;
+          if (
+            surface.substitutePlaceholders &&
+            inj.secretFields &&
+            Object.keys(inj.secretFields).length > 0
+          ) {
+            const sub = substituteSecretFields(inj.value, inj.secretFields, (n) => resolver.resolve(n));
+            if (sub.unresolved.length > 0) {
+              const detail = `${surface.id} key '${inj.keyPath.join('.')}' skipped — unresolved secret(s): ${sub.unresolved.join(', ')}`;
+              onWarn(`agentenv: ${detail} (env '${env}')`);
+              skipped.push({ surfaceId: surface.id, reason: 'secret-unresolved', detail });
+              continue;
+            }
+            value = sub.value;
+          }
           const pathKey = JSON.stringify([...inj.keyPath]);
           const prevEnv = keyedOwner.get(pathKey);
           if (prevEnv !== undefined && prevEnv !== env) {
@@ -405,7 +437,7 @@ async function composeConfigKeysFile(
             skipped.push({ surfaceId: surface.id, reason: 'collision', detail });
           }
           keyedOwner.set(pathKey, env);
-          setAtPath(seed, inj.keyPath, inj.value);
+          setAtPath(seed, inj.keyPath, value);
         } else {
           const arr = ensureArray(seed, inj.arrayPath);
           if (!arr.some((v) => stableEqual(v, inj.value))) arr.push(inj.value);
