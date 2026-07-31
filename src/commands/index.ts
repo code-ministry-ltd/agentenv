@@ -1,5 +1,6 @@
 import type { Command } from '../command.js';
 import { createCommand } from './create.js';
+import { editCommand } from './edit.js';
 import { listCommand } from './list.js';
 import { rmCommand } from './rm.js';
 import { showCommand } from './show.js';
@@ -13,6 +14,7 @@ export const commands: readonly Command[] = [
   createCommand,
   listCommand,
   showCommand,
+  editCommand,
   rmCommand,
 ];
 
