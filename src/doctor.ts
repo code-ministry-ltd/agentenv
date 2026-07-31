@@ -1,6 +1,8 @@
-import { readdir, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { access, readdir, rm, stat } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import type { BackupRef } from './backups.js';
+import { materialise as dmMaterialise, type DirMergeItem } from './dir-merge.js';
 import { recoverState } from './journal.js';
 import { withLock } from './lock.js';
 import type { Paths } from './paths.js';
@@ -47,6 +49,50 @@ export interface RepairResult {
   actions: string[];
   /** Problems still present after repair (should be empty on success). */
   remaining: DoctorProblem[];
+}
+
+// ---------------------------------------------------------------------------
+// small fs helpers
+// ---------------------------------------------------------------------------
+
+/** Whether `p` exists (following symlinks — a broken link reads as absent). */
+async function resolves(p: string): Promise<boolean> {
+  try {
+    await stat(p);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw err;
+  }
+}
+
+/** Whether `p` exists WITHOUT following symlinks (the link/file/dir is present). */
+async function exists(p: string): Promise<boolean> {
+  try {
+    await access(p, constants.F_OK);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return false;
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// dir-merge: a manifest-owned link whose on-disk target no longer resolves
+// ---------------------------------------------------------------------------
+
+/**
+ * A manifest-owned dir-merge SYMLINK is dangling when its store source still
+ * EXISTS but the on-disk link no longer resolves (broken, or replaced by a broken
+ * link) — re-materialisable from the manifest + store. When the store source
+ * itself is gone the item is store-vs-manifest drift instead (a later slice), so
+ * that case is excluded here.
+ */
+async function isDangling(item: DirMergeItem): Promise<boolean> {
+  if (item.action !== 'symlink') return false;
+  if (!(await exists(item.target))) return false; // store source gone → store-drift, not dangling
+  return !(await resolves(item.path)); // link present but resolves to nothing
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +161,23 @@ function detectJournal(paths: Paths, manifest: StateManifest): DoctorProblem[] {
   ];
 }
 
+/** Manifest-owned dir-merge links whose target no longer resolves (design D4). */
+async function detectDanglingSymlinks(manifest: StateManifest): Promise<DoctorProblem[]> {
+  const out: DoctorProblem[] = [];
+  for (const item of manifest.items) {
+    if (item.surface !== 'dir-merge') continue;
+    const dm = item as DirMergeItem;
+    if (!(await isDangling(dm))) continue;
+    out.push({
+      kind: 'dangling-symlink',
+      where: dm.path,
+      what: `owned dir-merge link '${dm.path}' does not resolve (its store source is present)`,
+      repair: `re-materialise the symlink to ${dm.target}`,
+    });
+  }
+  return out;
+}
+
 /** Orphaned content/directory backups under `~/.agentenv/backups/` (design D4). */
 async function detectOrphanedBackups(
   paths: Paths,
@@ -141,6 +204,7 @@ export async function diagnose(paths: Paths): Promise<DoctorProblem[]> {
   const manifest = await readState(paths);
   const problems: DoctorProblem[] = [];
   problems.push(...detectJournal(paths, manifest));
+  problems.push(...(await detectDanglingSymlinks(manifest)));
   problems.push(...(await detectOrphanedBackups(paths, manifest)));
   return problems;
 }
@@ -152,6 +216,35 @@ export async function diagnose(paths: Paths): Promise<DoctorProblem[]> {
 /** Delete an orphaned backup entry (file or directory subtree). */
 async function removeBackupEntry(paths: Paths, name: string): Promise<void> {
   await rm(join(paths.backups, name), { recursive: true, force: true });
+}
+
+/**
+ * Re-materialise every dangling dir-merge symlink from the manifest + store. The
+ * broken link is removed first (raw), because `dir-merge.materialise` treats an
+ * already-present owned link as an idempotent no-op and would not replace it; the
+ * fresh materialise is then journalled and lock-guarded. A crash between the two
+ * leaves the record with a missing link + present source, which the next run
+ * re-detects and re-repairs (idempotent).
+ */
+async function repairDanglingSymlinks(
+  paths: Paths,
+  manifest: StateManifest,
+  actions: string[],
+): Promise<void> {
+  for (const item of manifest.items) {
+    if (item.surface !== 'dir-merge') continue;
+    const dm = item as DirMergeItem;
+    if (!(await isDangling(dm))) continue;
+    await rm(dm.path, { recursive: true, force: true });
+    await dmMaterialise(paths, {
+      ownerEnv: dm.ownerEnv,
+      sourcePath: dm.target,
+      targetDir: dirname(dm.path),
+      itemName: basename(dm.path),
+      mode: 'symlink',
+    });
+    actions.push(`re-materialised dangling link ${dm.path}`);
+  }
 }
 
 /**
@@ -178,6 +271,9 @@ export async function repair(paths: Paths): Promise<RepairResult> {
       `rolled back ${recovery.rolledBack} journalled mutation(s) from an interrupted transaction`,
     );
   }
+
+  // 2. Re-drive broken owned surfaces from the manifest + store.
+  await repairDanglingSymlinks(paths, await readState(paths), actions);
 
   // 3. Orphaned backups: GC against the final manifest.
   const manifest = await readState(paths);
