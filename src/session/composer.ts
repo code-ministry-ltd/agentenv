@@ -12,10 +12,12 @@ import {
 } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parse as parseJsonc } from 'jsonc-parser';
+import { parse as parseToml, stringify as stringifyToml } from 'smol-toml';
 import {
   storeToken,
   surfaceRootRelativePath,
   type Adapter,
+  type ConfigFormat,
   type ConfigKeysInjection,
   type SurfaceDeclaration,
 } from '../adapter.js';
@@ -345,16 +347,16 @@ async function instructionSources(
   return out;
 }
 
-const TOML_SKIP = 'TOML config-keys view seeding lands with the Codex adapter (Task 4.x)';
-
 /**
  * config-keys: seed the view's config file ONCE from the real one (a discardable
  * copy — mixed-file drift is dropped at session end, D15), then apply the compiled
  * keys of EVERY surface that targets this file, then write ONCE (H4). A shared
  * file (Pi's two-array `settings.json`) is otherwise clobbered by re-seeding per
  * surface. A pre-existing user value wins a collision (D7); later envs win earlier
- * ones (D5). JSON/JSONC only in Phase 1; TOML seeding lands with the Codex adapter
- * (Task 4.x) and is recorded as a skip until then.
+ * ones (D5). Format-aware: JSON/JSONC parse + reserialise via jsonc-parser/JSON;
+ * TOML (Codex `config.toml`, Task 4.1) via smol-toml — a whole-file reserialise is
+ * fine for the EPHEMERAL view (unlike the real-config injection, which must be
+ * surgical). All surfaces grouped on one file share its format.
  */
 async function composeConfigKeysFile(
   req: ComposeRequest,
@@ -365,12 +367,7 @@ async function composeConfigKeysFile(
 ): Promise<void> {
   const { paths, adapter, envs, realConfigRoot } = req;
   const file = surfaces[0]!.rootRelativePath;
-
-  // Whole-file TOML seeding is unimplemented in Phase 1: record every surface.
-  if (surfaces.every((s) => s.format === 'toml')) {
-    for (const s of surfaces) skipped.push({ surfaceId: s.id, reason: 'format', detail: TOML_SKIP });
-    return;
-  }
+  const format = surfaces[0]!.format;
 
   // Secrets resolver for the substitute rung (D6): secrets.env first, then the
   // launching shell's env. The private view is derived and never synced, so a
@@ -378,17 +375,13 @@ async function composeConfigKeysFile(
   const resolver = await loadResolver(paths, req.env ?? process.env);
 
   const seedText = await readFileOrEmpty(join(realConfigRoot, file));
-  const seed = (seedText.trim() === '' ? {} : parseJsonc(seedText)) as Record<string, unknown>;
+  const seed = parseConfigDoc(format, seedText);
   const userSnapshot = structuredClone(seed);
   // Which env last set each keyed path, so a later env overriding an earlier one
   // records a skip that NAMES the loser (L2 / D5), as dir-merge already does.
   const keyedOwner = new Map<string, string>();
 
   for (const surface of surfaces) {
-    if (surface.format === 'toml') {
-      skipped.push({ surfaceId: surface.id, reason: 'format', detail: TOML_SKIP });
-      continue;
-    }
     for (const env of envs) {
       let injections: ConfigKeysInjection[];
       try {
@@ -446,7 +439,20 @@ async function composeConfigKeysFile(
     }
   }
 
-  await writeFileAtomic(join(buildDir, file), `${JSON.stringify(seed, null, 2)}\n`);
+  await writeFileAtomic(join(buildDir, file), serializeConfigDoc(format, seed));
+}
+
+/** Parse a config-keys document by format; an empty/absent file is an empty object. */
+function parseConfigDoc(format: ConfigFormat, text: string): Record<string, unknown> {
+  if (text.trim() === '') return {};
+  if (format === 'toml') return parseToml(text) as Record<string, unknown>;
+  return parseJsonc(text) as Record<string, unknown>;
+}
+
+/** Reserialise a config-keys document by format, with a trailing newline. */
+function serializeConfigDoc(format: ConfigFormat, seed: Record<string, unknown>): string {
+  if (format === 'toml') return `${stringifyToml(seed)}\n`;
+  return `${JSON.stringify(seed, null, 2)}\n`;
 }
 
 // ---------------------------------------------------------------------------
