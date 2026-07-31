@@ -2,6 +2,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Adapter, SurfaceDeclaration } from '../src/adapter.js';
+import { cursorAdapter } from '../src/adapters/cursor.js';
 import { run } from '../src/cli.js';
 import { resolvePaths } from '../src/paths.js';
 import { FIXTURE_CONFIG_ENV, makeFixtureAdapter } from './fixtures/fixture-adapter.js';
@@ -92,5 +93,22 @@ describe('engine: status', () => {
     expect(res.code).toBe(0);
     expect(res.stdout.toLowerCase()).toContain('shadow');
     expect(res.stdout).toContain('shared');
+  });
+
+  it('surfaces an adapter-level session-unsupported harness (Cursor is global-only, D11/D15)', async () => {
+    const th = home();
+    const res = await run(['status'], { env: th.env, adapters: [cursorAdapter] });
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain('cursor');
+    // The adapter-level line names it global-only and carries the reason.
+    expect(res.stdout).toContain('session-unsupported (global only)');
+    expect(res.stdout).toContain('CURSOR_CONFIG_DIR');
+  });
+
+  it('a session-supported adapter shows no session-unsupported line', async () => {
+    const th = home();
+    const res = await run(['status'], { env: th.env, adapters: [makeFixtureAdapter()] });
+    expect(res.code).toBe(0);
+    expect(res.stdout).not.toContain('session-unsupported');
   });
 });

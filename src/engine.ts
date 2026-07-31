@@ -639,6 +639,10 @@ export interface SurfaceStatus {
 /** Per-adapter global status. */
 export interface AdapterStatus {
   adapterId: string;
+  /** Whether this harness can be session-activated at all (Cursor is global-only, D11/D15). */
+  sessionSupported: boolean;
+  /** Why session mode is unavailable, when {@link sessionSupported} is `false`. */
+  sessionUnsupportedReason?: string;
   surfaces: SurfaceStatus[];
   /** Shadowing / user-collision skips the active global stack would incur (D7). */
   skips: GlobalSkip[];
@@ -700,7 +704,15 @@ export async function describeGlobal(req: {
         skips.push(...(await dirMergeStatusSkips(paths, adapter, surface, realRoot, stack, manifest)));
       }
     }
-    out.push({ adapterId: adapter.id, surfaces, skips });
+    out.push({
+      adapterId: adapter.id,
+      sessionSupported: adapter.sessionSupported,
+      ...(adapter.sessionUnsupportedReason
+        ? { sessionUnsupportedReason: adapter.sessionUnsupportedReason }
+        : {}),
+      surfaces,
+      skips,
+    });
   }
   return { stack, orphanedEnvs, adapters: out };
 }
