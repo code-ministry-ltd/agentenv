@@ -3,6 +3,9 @@ import { createCommand } from './create.js';
 import { editCommand } from './edit.js';
 import { listCommand } from './list.js';
 import { rmCommand } from './rm.js';
+import { runCommand } from './run.js';
+import { shellInitCommand } from './shell-init.js';
+import { shimCommand } from './shim.js';
 import { showCommand } from './show.js';
 
 /**
@@ -16,6 +19,9 @@ export const commands: readonly Command[] = [
   showCommand,
   editCommand,
   rmCommand,
+  runCommand,
+  shellInitCommand,
+  shimCommand,
 ];
 
 export function findCommand(name: string): Command | undefined {

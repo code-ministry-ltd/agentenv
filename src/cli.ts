@@ -14,10 +14,11 @@ function helpText(): string {
     '',
   ];
 
-  if (commands.length > 0) {
-    const width = Math.max(...commands.map((c) => commandInvocation(c).length));
+  const visible = commands.filter((c) => !c.hidden);
+  if (visible.length > 0) {
+    const width = Math.max(...visible.map((c) => commandInvocation(c).length));
     lines.push('Commands:');
-    for (const c of commands) {
+    for (const c of visible) {
       lines.push(`  ${commandInvocation(c).padEnd(width)}  ${c.summary}`);
     }
     lines.push('');

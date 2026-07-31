@@ -1,0 +1,104 @@
+import { resolveAdapter } from '../adapter.js';
+import { adapters as realAdapters } from '../adapters/index.js';
+import type { Command, RunOptions, RunResult } from '../command.js';
+import type { Paths } from '../paths.js';
+import { defaultExecHarness } from '../session/exec.js';
+import { launchHarness, type LaunchResult } from '../session/launch.js';
+import { resolveProjectRoot, resolveSessionBinding } from '../session/registry.js';
+import { resolveBinaryOnPath, sanitisePath } from '../session/resolve.js';
+
+/**
+ * `agentenv __shim <harness> -- <args…>` — the Node side of the PATH shim (D15).
+ * The generated shim delegates here; this resolves the shell's binding, composes
+ * a view when bound, and execs the real harness. It fails OPEN: an unknown
+ * harness, an unreadable registry, or any compose error launches the real binary
+ * untouched (the failure paths are the launch core's — see {@link launchHarness}).
+ *
+ * Internal: users never type it. Hidden from `--help`.
+ */
+export const shimCommand: Command = {
+  name: '__shim',
+  usage: '<harness> -- [args…]',
+  summary: 'Internal: PATH shim entrypoint',
+  hidden: true,
+
+  async run({ args, paths, env, cwd, options }) {
+    const binaryName = args[0];
+    if (!binaryName) {
+      return { stdout: '', stderr: 'agentenv __shim: missing harness name\n', code: 2 };
+    }
+    const sep = args.indexOf('--');
+    const harnessArgs = sep === -1 ? args.slice(1) : args.slice(sep + 1);
+
+    const adapters = options.adapters ?? realAdapters;
+    const adapter = resolveAdapter(adapters, binaryName);
+
+    // Unknown harness (no adapter registered): fail open — real binary untouched.
+    if (!adapter) {
+      return execUnmanaged(paths, binaryName, harnessArgs, env, cwd, options);
+    }
+
+    const notices: string[] = [];
+    const session = env.AGENTENV_SESSION;
+    let envs: string[] | null = null;
+    try {
+      const projectRoot = await resolveProjectRoot(cwd);
+      const resolved = await resolveSessionBinding({ paths, session, projectRoot, env });
+      if (resolved.note) notices.push(`agentenv: ${resolved.note}`);
+      const b = resolved.binding;
+      if (resolved.source === 'explicit' && b && !b.global && appliesToHarness(b.harnesses, adapter)) {
+        envs = b.envs;
+      }
+    } catch (err) {
+      // Unreadable session registry → fail open: launch unbound (D15).
+      notices.push(
+        `agentenv: session registry unreadable (${(err as Error).message}) — launching ${binaryName} unbound`,
+      );
+    }
+
+    const result = await launchHarness({
+      paths,
+      adapter,
+      envs,
+      session: session ?? 'no-session',
+      args: harnessArgs,
+      env,
+      cwd,
+      execHarness: options.execHarness,
+      capture: options.capture,
+      now: options.now,
+    });
+    return toRunResult(result, notices);
+  },
+};
+
+/** Whether a binding's optional --harness scoping includes this harness. */
+function appliesToHarness(harnesses: string[] | undefined, adapter: { id: string; binaryName: string }): boolean {
+  if (!harnesses || harnesses.length === 0) return true;
+  return harnesses.includes(adapter.id) || harnesses.includes(adapter.binaryName);
+}
+
+/** Exec a harness we have no adapter for: real binary, untouched, shims off PATH. */
+async function execUnmanaged(
+  paths: Paths,
+  binaryName: string,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+  cwd: string,
+  options: RunOptions,
+): Promise<RunResult> {
+  const exec = options.execHarness ?? defaultExecHarness;
+  const bin = await resolveBinaryOnPath(binaryName, env, [paths.shims]);
+  if (!bin) {
+    return { stdout: '', stderr: `agentenv: '${binaryName}' not found on PATH\n`, code: 127 };
+  }
+  const sanitisedEnv: NodeJS.ProcessEnv = { ...env, PATH: sanitisePath(env.PATH ?? '', [paths.shims]) };
+  const code = await exec({ binaryPath: bin, args, env: sanitisedEnv, cwd });
+  return { stdout: '', stderr: '', code };
+}
+
+/** Fold a {@link LaunchResult} (+ command-level notices) into a {@link RunResult}. */
+export function toRunResult(result: LaunchResult, extraNotices: readonly string[] = []): RunResult {
+  const lines = [...extraNotices, ...result.notices];
+  return { stdout: '', stderr: lines.length > 0 ? `${lines.join('\n')}\n` : '', code: result.code };
+}

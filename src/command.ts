@@ -1,4 +1,6 @@
+import type { Adapter } from './adapter.js';
 import type { Paths } from './paths.js';
+import type { CaptureFn, ExecHarness } from './session/exec.js';
 
 /** Outcome of a CLI invocation: text to print and a process exit code. */
 export interface RunResult {
@@ -27,6 +29,18 @@ export interface RunOptions {
    * so `edit` never spawns a real editor.
    */
   launchEditor?: (command: string, args: readonly string[]) => Promise<number>;
+  /**
+   * The adapter registry the session commands (`run`, `__shim`, `shell-init`)
+   * resolve harnesses against. Defaults to the real registry (empty in Phase 1);
+   * tests inject the fixture adapter so the machinery runs with no real harness.
+   */
+  adapters?: readonly Adapter[];
+  /** Exec seam for session launches; defaults to spawning with inherited stdio. */
+  execHarness?: ExecHarness;
+  /** Capture seam for adapter self-check probes; defaults to spawning captured. */
+  capture?: CaptureFn;
+  /** Injectable clock (view build timestamps). */
+  now?: () => number;
 }
 
 /** Everything a command handler receives for one invocation. */
@@ -51,5 +65,7 @@ export interface Command {
   summary: string;
   /** Argument summary shown in `--help`, e.g. `<name>`. */
   usage: string;
+  /** Internal commands (e.g. the `__shim` entrypoint) are hidden from `--help`. */
+  hidden?: boolean;
   run(ctx: CommandContext): Promise<RunResult>;
 }
