@@ -1,7 +1,11 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { Adapter } from './adapter.js';
-import { syncBack as cfgSyncBack, type ConfigKeysItem } from './config-keys.js';
+import type { Adapter, ConfigKeysSurface } from './adapter.js';
+import {
+  syncBack as cfgSyncBack,
+  type ConfigKeysItem,
+  type JsonValue,
+} from './config-keys.js';
 import { syncBack as dmSyncBack, type DirMergeItem } from './dir-merge.js';
 import { syncBack as fbSyncBack, type FileBlockItem } from './file-block.js';
 import { writeFileAtomic } from './fs-atomic.js';
@@ -20,11 +24,12 @@ import { readState } from './state.js';
  * - **inline file-block sub-blocks** → `file-block.syncBack` writes an edited
  *   region back to its store instruction file, then refreshes the block.
  * - **injected config keys** → `config-keys.syncBack` reconciles the manifest hash
- *   with the current file value and restores secret placeholders (D6). NOTE: the
- *   frozen adapter interface is one-way (`compileConfigKeys`) with no reverse
- *   mapping, so pushing the canonical value back into the store's `mcp/servers.yaml`
- *   needs adapter reverse-compilation and is deferred (Task 2.4 / adapter tasks).
- *   The reconciliation here still makes the edit non-lossy and unblocks `drop`.
+ *   with the current file value and restores secret placeholders (D6). When the
+ *   owning adapter implements the OPTIONAL `syncBackConfigKeys` reverse hook, the
+ *   placeholder-restored `canonicalValue` is ALSO written back to the env's
+ *   canonical store (e.g. `mcp/servers.yaml`), completing spec criterion 4. An
+ *   adapter that omits the hook degrades to non-lossy hash reconciliation, which
+ *   still keeps the edit and unblocks `drop`.
  * - **session-generated instruction files on disk** (D15) → an edited inline
  *   sub-block in any `live/<session>/<harness>/<instr>` view (including dead
  *   sessions') is written back to its store file, so a change made moments before
@@ -109,8 +114,10 @@ export async function driftSweep(req: DriftSweepRequest): Promise<DriftSweepResu
   }
 
   // C) config-keys → reconcile the manifest hash with drifted file values, under
-  // one transaction. (Store write-back needs adapter reverse-compilation — see the
-  // module note — so it is deferred; reconciliation still makes the edit non-lossy.)
+  // one transaction. When the owning adapter implements the optional reverse hook,
+  // the placeholder-restored value is ALSO written back to the env's canonical store
+  // (spec criterion 4); an adapter without the hook keeps today's non-lossy hash
+  // reconciliation.
   const configItems = manifest.items.filter((i): i is ConfigKeysItem => i.surface === 'config-keys');
   if (configItems.length > 0) {
     await withLock(paths, async () => {
@@ -118,7 +125,9 @@ export async function driftSweep(req: DriftSweepRequest): Promise<DriftSweepResu
       try {
         for (const item of configItems) {
           const sync = await cfgSyncBack(paths, tx, item);
-          if (sync.drifted) result.configKeysDrifted += 1;
+          if (!sync.drifted) continue;
+          result.configKeysDrifted += 1;
+          await writeBackConfigDrift(req, item, sync.canonicalValue, result, onWarn);
         }
         await tx.commit();
       } catch (err) {
@@ -137,6 +146,71 @@ export async function driftSweep(req: DriftSweepRequest): Promise<DriftSweepResu
   // performs no git.
 
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// C') config-keys reverse write-back (spec criterion 4) — optional adapter hook
+// ---------------------------------------------------------------------------
+
+/**
+ * When the adapter owning a drifted config-keys item implements the optional
+ * {@link Adapter.syncBackConfigKeys} reverse hook, reverse-compile the drifted
+ * (placeholder-restored) value into the env's canonical store and write the returned
+ * mutation(s) atomically (spec criterion 4). Best-effort: a hook or store-write
+ * failure is warned, never fatal — the manifest hash was already reconciled by
+ * {@link cfgSyncBack}, so the edit stays non-lossy regardless. An adapter without
+ * the hook (or a non-drift/absent value) is a no-op.
+ */
+async function writeBackConfigDrift(
+  req: DriftSweepRequest,
+  item: ConfigKeysItem,
+  canonicalValue: JsonValue | undefined,
+  result: DriftSweepResult,
+  onWarn: (m: string) => void,
+): Promise<void> {
+  if (canonicalValue === undefined) return;
+  const match = findConfigSurface(req.adapters, req.env, item);
+  if (!match || !match.adapter.syncBackConfigKeys) return;
+  const envContentDir = req.paths.envDir(item.ownerEnv);
+  try {
+    const mutations = await match.adapter.syncBackConfigKeys(
+      match.surface,
+      { style: item.mode, keyPath: item.keyPath, canonicalValue },
+      { envContentDir, projectRoot: null },
+    );
+    for (const mutation of mutations) {
+      const abs = join(envContentDir, mutation.storeRelativePath);
+      await writeFileAtomic(abs, mutation.content);
+      result.storePathsChanged.push(abs);
+    }
+  } catch (err) {
+    onWarn(
+      `agentenv: config-keys write-back for env '${item.ownerEnv}' failed (${(err as Error).message})`,
+    );
+  }
+}
+
+/**
+ * Find the adapter + config-keys surface whose real target file is `item.path`, so
+ * the reverse hook and its {@link ConfigKeysSurface} can be resolved for a manifest
+ * item (which records only the file path). Matches the same real-root + relative-path
+ * mapping the engine used to inject the key.
+ */
+function findConfigSurface(
+  adapters: readonly Adapter[],
+  env: NodeJS.ProcessEnv,
+  item: ConfigKeysItem,
+): { adapter: Adapter; surface: ConfigKeysSurface } | null {
+  for (const adapter of adapters) {
+    const realRoot = adapter.realConfigRoot(env);
+    for (const surface of adapter.surfaces) {
+      if (surface.mechanism !== 'config-keys') continue;
+      if (join(realRoot, surface.rootRelativePath) === item.path) {
+        return { adapter, surface };
+      }
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------

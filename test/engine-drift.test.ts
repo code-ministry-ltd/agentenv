@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { Adapter } from '../src/adapter.js';
 import { run } from '../src/cli.js';
 import type { ConfigKeysItem } from '../src/config-keys.js';
 import { driftSweep } from '../src/drift.js';
@@ -79,6 +80,63 @@ describe('engine: drift sweep', () => {
     expect(readFileSync(join(paths.envDir('writing'), 'instructions', 'base.md'), 'utf8')).toContain(
       'EDITED body',
     );
+  });
+
+  it('criterion 4: a drifted config key is written back to the env store, ${VAR} placeholder preserved', async () => {
+    const th = home();
+    const paths = resolvePaths(th.env);
+    const realHome = join(th.home, 'real');
+    mkdirSync(realHome, { recursive: true });
+    writeFileSync(join(realHome, 'INSTRUCTIONS.md'), '# user\n');
+    writeFileSync(join(realHome, 'config.json'), '{}\n');
+    const envDir = paths.envDir('writing');
+    mkdirSync(join(envDir, 'mcp'), { recursive: true });
+    // A server whose token is a ${VAR} placeholder — never a baked literal (D6).
+    writeFileSync(
+      join(envDir, 'mcp', 'servers.yaml'),
+      'linear:\n  url: https://original\n  env:\n    TOKEN: "${GH_TOKEN}"\n',
+    );
+    const env: NodeJS.ProcessEnv = { ...th.env, [FIXTURE_CONFIG_ENV]: realHome };
+    await run(['use', 'writing', '--global'], { env, adapters: [makeFixtureAdapter()] });
+
+    // The harness edits the real file: change the url AND bake a literal over the
+    // secret placeholder (as a leaked token would).
+    const cfgPath = join(realHome, 'config.json');
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+    cfg.mcpServers.linear.url = 'https://EDITED';
+    cfg.mcpServers.linear.env.TOKEN = 'ghp_LEAKED_LITERAL';
+    writeFileSync(cfgPath, `${JSON.stringify(cfg, null, 2)}\n`);
+
+    const result = await driftSweep({ paths, adapters: [makeFixtureAdapter()], env });
+    expect(result.configKeysDrifted).toBe(1);
+
+    const storePath = join(envDir, 'mcp', 'servers.yaml');
+    expect(result.storePathsChanged).toContain(storePath);
+    const written = readFileSync(storePath, 'utf8');
+    expect(written).toContain('https://EDITED'); // the real edit is persisted to the store
+    expect(written).toContain('${GH_TOKEN}'); // the secret placeholder is restored
+    expect(written).not.toContain('ghp_LEAKED_LITERAL'); // the baked literal never reaches the store (D6)
+  });
+
+  it('an adapter WITHOUT the reverse hook still reconciles config drift (no store write)', async () => {
+    const th = home();
+    const { paths, realHome, env } = scenario(th);
+    // Strip the optional reverse hook: reconciliation must still be non-lossy.
+    const noHook: Adapter = { ...makeFixtureAdapter(), syncBackConfigKeys: undefined };
+    await run(['use', 'writing', '--global'], { env, adapters: [noHook] });
+
+    const storePath = join(paths.envDir('writing'), 'mcp', 'servers.yaml');
+    const storeBefore = readFileSync(storePath, 'utf8');
+
+    const cfgPath = join(realHome, 'config.json');
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+    cfg.mcpServers.linear.url = 'https://EDITED';
+    writeFileSync(cfgPath, `${JSON.stringify(cfg, null, 2)}\n`);
+
+    const result = await driftSweep({ paths, adapters: [noHook], env });
+    expect(result.configKeysDrifted).toBe(1); // hash still reconciled
+    expect(readFileSync(storePath, 'utf8')).toBe(storeBefore); // store untouched
+    expect(result.storePathsChanged).not.toContain(storePath);
   });
 
   it('is a clean no-op when nothing has drifted', async () => {

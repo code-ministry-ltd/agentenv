@@ -157,6 +157,39 @@ export type ConfigKeysInjection =
       value: JsonValue;
     };
 
+/**
+ * The inverse of one {@link ConfigKeysInjection}: a config-keys value that DRIFTED
+ * in the real file, handed to {@link Adapter.syncBackConfigKeys} so the adapter can
+ * persist it into the env's canonical store (spec criterion 4). Carries the
+ * placeholder-restored value — secret `${VAR}` subfields already reset, never a
+ * baked literal (D6).
+ */
+export interface ConfigKeysDrift {
+  /** Keyed (object property) vs array-element ownership — matches the injection style. */
+  style: ConfigKeysStyle;
+  /** The owned key path (keyed) or the array's path (array-element), as recorded. */
+  keyPath: readonly (string | number)[];
+  /**
+   * The canonical value now in the real file, with every secret-flagged subfield
+   * restored to its `${VAR}` placeholder (D6) — exactly the {@link import(
+   * './config-keys.js').SyncBackResult}'s `canonicalValue`.
+   */
+  canonicalValue: JsonValue;
+}
+
+/**
+ * One store-file mutation {@link Adapter.syncBackConfigKeys} asks the drift sweep to
+ * apply: a store-RELATIVE path under `environments/<env>/` plus its full new content.
+ * Declarative (path + bytes) so the sweep writes it atomically without the adapter
+ * touching the filesystem — mirroring how {@link ConfigKeysInjection} is data, not I/O.
+ */
+export interface ConfigKeysStoreMutation {
+  /** Path relative to the env's content dir (`environments/<env>/`), e.g. `mcp/servers.yaml`. */
+  storeRelativePath: string;
+  /** The full new file content to write at {@link storeRelativePath}. */
+  content: string;
+}
+
 /** The set of environment variables that point a harness at a private root. */
 export type OverrideEnv = Record<string, string>;
 
@@ -302,6 +335,30 @@ export interface Adapter {
     surface: ConfigKeysSurface,
     ctx: ConfigKeysContext,
   ): Promise<ConfigKeysInjection[]>;
+
+  /**
+   * OPTIONAL inverse of {@link compileConfigKeys} (spec criterion 4): given a
+   * config-keys value that drifted in the REAL file, produce the mutation(s) that
+   * persist it into the env's CANONICAL store content (`environments/<env>/…`, e.g.
+   * `mcp/servers.yaml`), so a config key edited mid-session is written back to the
+   * store on the next invocation. The drift sweep calls this with the drifted
+   * {@link ConfigKeysDrift.canonicalValue} (secret `${VAR}` placeholders already
+   * restored — never a literal, D6), writes each returned mutation atomically, and
+   * reports the store path in `storePathsChanged`.
+   *
+   * The {@link ConfigKeysContext} mirrors {@link compileConfigKeys} so the hook can
+   * read sibling store content (e.g. merge one changed MCP server without clobbering
+   * the rest) and key project-scoped stores by `projectRoot`.
+   *
+   * OPTIONAL: an adapter that omits it degrades to today's non-lossy hash
+   * reconciliation (blocks nothing), exactly like {@link validateConfigFile}.
+   * Declared now so the frozen contract need not be reopened for a real adapter.
+   */
+  syncBackConfigKeys?(
+    surface: ConfigKeysSurface,
+    drift: ConfigKeysDrift,
+    ctx: ConfigKeysContext,
+  ): Promise<ConfigKeysStoreMutation[]>;
 
   // — launch self-check (D15 fail-closed) —
 

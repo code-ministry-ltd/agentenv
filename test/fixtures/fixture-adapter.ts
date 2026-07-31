@@ -2,11 +2,13 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'n
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parse as parseYaml } from 'yaml';
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import type {
   Adapter,
   ConfigKeysContext,
+  ConfigKeysDrift,
   ConfigKeysInjection,
+  ConfigKeysStoreMutation,
   ConfigKeysSurface,
   EntryBucket,
   SelfCheckContext,
@@ -84,6 +86,24 @@ const SURFACES: readonly SurfaceDeclaration[] = [
 const MANAGED_ENTRIES = new Set(['skills', 'INSTRUCTIONS.md', 'config.json']);
 
 /**
+ * Record every string subfield shaped like `${VAR}` as a secret placeholder, keyed
+ * by its dot-joined subpath WITHIN the injected value (e.g. `env.TOKEN`). Mirrors a
+ * real adapter flagging passthrough secrets so drift write-back restores the
+ * placeholder rather than a baked literal (D6).
+ */
+function collectPlaceholders(value: unknown, prefix: string, out: Record<string, string>): void {
+  if (typeof value === 'string') {
+    if (prefix !== '' && /\$\{[^}]+\}/.test(value)) out[prefix] = value;
+    return;
+  }
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    for (const [k, v] of Object.entries(value)) {
+      collectPlaceholders(v, prefix === '' ? k : `${prefix}.${k}`, out);
+    }
+  }
+}
+
+/**
  * The fixture adapter (Task 1.6, Deliver B): a full {@link Adapter} implementation
  * over the fake harness, so the session machinery is testable with no real
  * harness. Exercises all three surface mechanisms (skills→dir-merge,
@@ -135,11 +155,38 @@ export function makeFixtureAdapter(opts: FixtureAdapterOptions = {}): Adapter {
         | undefined;
       if (!parsed || typeof parsed !== 'object') return [];
       // One keyed injection per server, owned independently under mcpServers (D3/D6).
-      return Object.entries(parsed).map(([name, def]) => ({
-        style: 'keyed' as const,
-        keyPath: ['mcpServers', name],
-        value: def as JsonValue,
-      }));
+      // A string value shaped like `${VAR}` is a secret placeholder → flag its subpath
+      // so drift write-back restores the placeholder, never a baked literal (D6).
+      return Object.entries(parsed).map(([name, def]) => {
+        const secretFields: Record<string, string> = {};
+        collectPlaceholders(def, '', secretFields);
+        return {
+          style: 'keyed' as const,
+          keyPath: ['mcpServers', name],
+          value: def as JsonValue,
+          ...(Object.keys(secretFields).length > 0 ? { secretFields } : {}),
+        };
+      });
+    },
+
+    async syncBackConfigKeys(
+      surface: ConfigKeysSurface,
+      drift: ConfigKeysDrift,
+      ctx: ConfigKeysContext,
+    ): Promise<ConfigKeysStoreMutation[]> {
+      // The inverse of compileConfigKeys (spec criterion 4): fold the one drifted
+      // server (keyPath ['mcpServers', <name>]) back into the env's servers.yaml,
+      // leaving sibling servers untouched. `canonicalValue` already has secret
+      // ${VAR} placeholders restored, so the store never gains a baked literal (D6).
+      if (surface.id !== 'mcp' || drift.style !== 'keyed') return [];
+      const name = drift.keyPath[drift.keyPath.length - 1];
+      if (typeof name !== 'string') return [];
+      const serversFile = join(ctx.envContentDir, 'mcp', 'servers.yaml');
+      const existing = existsSync(serversFile)
+        ? ((parseYaml(readFileSync(serversFile, 'utf8')) as Record<string, unknown> | null) ?? {})
+        : {};
+      existing[name] = drift.canonicalValue;
+      return [{ storeRelativePath: join('mcp', 'servers.yaml'), content: stringifyYaml(existing) }];
     },
 
     async selfCheck(viewRoot: string, ctx: SelfCheckContext): Promise<SelfCheckResult> {

@@ -81,4 +81,15 @@ describe('session adapter contract', () => {
       detail: '/x/mcp.json rejected',
     });
   });
+
+  it('criterion 4: syncBackConfigKeys is an OPTIONAL reverse hook adapters need not implement', () => {
+    const a = makeFixtureAdapter();
+    // The fixture DOES implement it (proves the frozen shape); an adapter MAY omit it.
+    expect(typeof a.syncBackConfigKeys).toBe('function');
+    expect(validateAdapter(a)).toBeNull();
+
+    const without: Adapter = { ...a, syncBackConfigKeys: undefined };
+    expect(without.syncBackConfigKeys).toBeUndefined(); // omitting it is still valid
+    expect(validateAdapter(without)).toBeNull();
+  });
 });
