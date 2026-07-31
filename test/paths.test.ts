@@ -14,6 +14,7 @@ describe('resolvePaths', () => {
     expect(p.environments).toBe(join(base, 'store', 'environments'));
     expect(p.storeReadme).toBe(join(base, 'store', 'README.md'));
     expect(p.state).toBe(join(base, 'state.json'));
+    expect(p.lock).toBe(join(base, 'lock'));
     expect(p.secrets).toBe(join(base, 'secrets.env'));
     expect(p.backups).toBe(join(base, 'backups'));
     expect(p.live).toBe(join(base, 'live'));

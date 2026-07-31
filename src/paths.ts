@@ -21,6 +21,8 @@ export interface Paths {
   storeReadme: string;
   /** Machine-local write-ahead journal + manifest (task 1.2). */
   state: string;
+  /** Serialises the tool's own store/global mutations (task 1.2, design D11). */
+  lock: string;
   /** Machine-local `${VAR}` values, never synced (task 2.4). */
   secrets: string;
   /** Content-addressed pre-mutation backups, never synced (task 1.6). */
@@ -60,6 +62,7 @@ export function resolvePaths(env: NodeJS.ProcessEnv = process.env): Paths {
     environments,
     storeReadme: join(store, 'README.md'),
     state: join(base, 'state.json'),
+    lock: join(base, 'lock'),
     secrets: join(base, 'secrets.env'),
     backups: join(base, 'backups'),
     live: join(base, 'live'),

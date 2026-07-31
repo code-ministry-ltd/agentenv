@@ -1,0 +1,281 @@
+import { readdirSync, writeFileSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { resolvePaths } from '../src/paths.js';
+import {
+  STATE_SCHEMA_VERSION,
+  STATE_SCHEMA_VERSION_STRING,
+  StateError,
+  addItem,
+  emptyManifest,
+  findItemsByEnv,
+  findOwner,
+  findOwners,
+  readState,
+  removeItem,
+  writeState,
+  type ManifestItem,
+} from '../src/state.js';
+import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot } from './helpers.js';
+
+function symlinkItem(over: Partial<ManifestItem> = {}): ManifestItem {
+  return {
+    action: 'symlink',
+    surface: 'dir-merge',
+    path: '/home/u/.claude/skills/research',
+    ownerEnv: 'work',
+    backupRef: { kind: 'absent' },
+    ...over,
+  } as ManifestItem;
+}
+
+describe('state manifest', () => {
+  let temp: ReturnType<typeof makeTempHome>;
+  let realBefore: ReturnType<typeof realHomeSnapshot>;
+
+  beforeEach(() => {
+    realBefore = realHomeSnapshot();
+    temp = makeTempHome();
+  });
+
+  afterEach(() => {
+    temp.cleanup();
+    expectRealHomeUntouched(realBefore);
+  });
+
+  const paths = () => resolvePaths(temp.env);
+
+  describe('read/write', () => {
+    it('returns a fresh empty manifest when state.json does not exist', async () => {
+      const manifest = await readState(paths());
+      expect(manifest).toEqual({
+        version: STATE_SCHEMA_VERSION_STRING,
+        items: [],
+        journal: null,
+      });
+    });
+
+    it('round-trips items through write then read', async () => {
+      const p = paths();
+      const manifest = emptyManifest();
+      addItem(manifest, symlinkItem());
+      addItem(manifest, symlinkItem({ path: '/home/u/.claude/skills/writing', ownerEnv: 'writing' }));
+      await writeState(p, manifest);
+
+      const reloaded = await readState(p);
+      expect(reloaded.items).toHaveLength(2);
+      expect(reloaded.items[0]).toMatchObject({ surface: 'dir-merge', ownerEnv: 'work' });
+    });
+
+    it('writes atomically, leaving no temp debris beside state.json', async () => {
+      const p = paths();
+      await writeState(p, emptyManifest());
+      const entries = readdirSync(p.base);
+      expect(entries).toContain('state.json');
+      expect(entries.filter((e) => e.includes('.tmp-'))).toHaveLength(0);
+    });
+
+    it('stamps the current CLI schema version on write', async () => {
+      const p = paths();
+      const manifest = emptyManifest();
+      manifest.version = '1.0'; // regardless of what the caller holds
+      await writeState(p, manifest);
+      const reloaded = await readState(p);
+      expect(reloaded.version).toBe(STATE_SCHEMA_VERSION_STRING);
+    });
+
+    it('omits an empty journal from disk', async () => {
+      const p = paths();
+      await writeState(p, emptyManifest());
+      const reloaded = await readState(p);
+      expect(reloaded.journal).toBeNull();
+    });
+  });
+
+  describe('version tolerance (behaves like env.yaml)', () => {
+    it('accepts a newer MINOR and preserves unknown fields', async () => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({
+          version: `${STATE_SCHEMA_VERSION.major}.${STATE_SCHEMA_VERSION.minor + 7}`,
+          items: [],
+          futureTopLevel: { anything: true },
+        }),
+      );
+      const manifest = await readState(p);
+      expect(manifest.version).toBe(`${STATE_SCHEMA_VERSION.major}.${STATE_SCHEMA_VERSION.minor + 7}`);
+      expect(manifest['futureTopLevel']).toEqual({ anything: true });
+    });
+
+    it('preserves unknown fields through a write (round-trip)', async () => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({ version: STATE_SCHEMA_VERSION_STRING, items: [], futureTopLevel: 7 }),
+      );
+      const manifest = await readState(p);
+      await writeState(p, manifest);
+      const reloaded = await readState(p);
+      expect(reloaded['futureTopLevel']).toBe(7);
+    });
+
+    it('rejects a newer MAJOR with an upgrade message, not a schema error', async () => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({ version: `${STATE_SCHEMA_VERSION.major + 1}.0`, items: [] }),
+      );
+      await expect(readState(p)).rejects.toThrow(/state newer than CLI — upgrade agentenv/);
+    });
+
+    it('rejects corrupt JSON with a clear error naming the file', async () => {
+      const p = paths();
+      writeFileSync(p.state, '{ this is not: valid json');
+      let thrown: unknown;
+      try {
+        await readState(p);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(StateError);
+      expect((thrown as StateError).message).toMatch(/corrupt state\.json/);
+      expect((thrown as StateError).file).toBe(p.state);
+    });
+
+    it('rejects a missing version field', async () => {
+      const p = paths();
+      writeFileSync(p.state, JSON.stringify({ items: [] }));
+      await expect(readState(p)).rejects.toThrow(/version/);
+    });
+
+    it('rejects a non-object top level', async () => {
+      const p = paths();
+      writeFileSync(p.state, JSON.stringify(['a', 'list']));
+      await expect(readState(p)).rejects.toBeInstanceOf(StateError);
+    });
+  });
+
+  describe('journal validation on read', () => {
+    const goodItem = { action: 'symlink', surface: 'dir-merge', path: '/x', ownerEnv: 'w' };
+    const goodUndo = { path: '/x', backupRef: { kind: 'absent' } };
+
+    it('rejects a malformed journal entry with a StateError naming the file', async () => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({
+          version: STATE_SCHEMA_VERSION_STRING,
+          items: [],
+          journal: [{ op: 'frobnicate', item: goodItem, undo: goodUndo }],
+        }),
+      );
+      let thrown: unknown;
+      try {
+        await readState(p);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(StateError);
+      expect((thrown as StateError).message).toMatch(/journal.*op/i);
+      expect((thrown as StateError).file).toBe(p.state);
+    });
+
+    it('rejects a journal entry whose undo lacks a backupRef', async () => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({
+          version: STATE_SCHEMA_VERSION_STRING,
+          items: [],
+          journal: [{ op: 'add', item: goodItem, undo: { path: '/x' } }],
+        }),
+      );
+      await expect(readState(p)).rejects.toThrow(/undo\.backupRef/i);
+    });
+
+    it('rejects a journal entry that is not an object', async () => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({ version: STATE_SCHEMA_VERSION_STRING, items: [], journal: ['nope'] }),
+      );
+      await expect(readState(p)).rejects.toBeInstanceOf(StateError);
+    });
+
+    it('accepts a well-formed pending journal', async () => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({
+          version: STATE_SCHEMA_VERSION_STRING,
+          items: [],
+          journal: [{ op: 'add', item: goodItem, undo: goodUndo }],
+        }),
+      );
+      const manifest = await readState(p);
+      expect(manifest.journal).toHaveLength(1);
+    });
+  });
+
+  describe('query + mutation helpers', () => {
+    it('finds who owns a path', () => {
+      const manifest = emptyManifest();
+      addItem(manifest, symlinkItem({ path: '/x/a', ownerEnv: 'work' }));
+      addItem(manifest, symlinkItem({ path: '/x/b', ownerEnv: 'writing' }));
+
+      expect(findOwner(manifest, '/x/b')?.ownerEnv).toBe('writing');
+      expect(findOwner(manifest, '/x/missing')).toBeUndefined();
+    });
+
+    it('finds all owners of a shared path (config-keys share a file)', () => {
+      const manifest = emptyManifest();
+      addItem(manifest, {
+        action: 'config-key',
+        surface: 'config-keys',
+        path: '/home/u/.claude.json',
+        key: 'mcpServers.github',
+        ownerEnv: 'work',
+      } as ManifestItem);
+      addItem(manifest, {
+        action: 'config-key',
+        surface: 'config-keys',
+        path: '/home/u/.claude.json',
+        key: 'mcpServers.linear',
+        ownerEnv: 'work',
+      } as ManifestItem);
+
+      expect(findOwners(manifest, '/home/u/.claude.json')).toHaveLength(2);
+      // Distinct identities (different key) => two records, not an upsert.
+      expect(manifest.items).toHaveLength(2);
+    });
+
+    it('upserts by identity: same surface+path+key replaces, updating fields', () => {
+      const manifest = emptyManifest();
+      addItem(manifest, symlinkItem({ path: '/x/a', hash: 'old' }));
+      addItem(manifest, symlinkItem({ path: '/x/a', hash: 'new' }));
+
+      expect(manifest.items).toHaveLength(1);
+      expect((manifest.items[0] as { hash?: string }).hash).toBe('new');
+    });
+
+    it('removes a record by identity and reports whether one was removed', () => {
+      const manifest = emptyManifest();
+      addItem(manifest, symlinkItem({ path: '/x/a' }));
+
+      expect(removeItem(manifest, symlinkItem({ path: '/x/a' }))).toBe(true);
+      expect(manifest.items).toHaveLength(0);
+      // Removing again is a safe no-op.
+      expect(removeItem(manifest, symlinkItem({ path: '/x/a' }))).toBe(false);
+    });
+
+    it('lists all items owned by an environment', () => {
+      const manifest = emptyManifest();
+      addItem(manifest, symlinkItem({ path: '/x/a', ownerEnv: 'work' }));
+      addItem(manifest, symlinkItem({ path: '/x/b', ownerEnv: 'work' }));
+      addItem(manifest, symlinkItem({ path: '/x/c', ownerEnv: 'writing' }));
+
+      expect(findItemsByEnv(manifest, 'work')).toHaveLength(2);
+      expect(findItemsByEnv(manifest, 'writing')).toHaveLength(1);
+    });
+  });
+});
