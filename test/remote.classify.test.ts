@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -58,6 +58,23 @@ function emptyBare(): { dir: string; url: string } {
   return { dir, url: pathToFileURL(dir).href };
 }
 
+/**
+ * A bare repo that SHARES the local store's history (its baseline commit) and adds a
+ * divergent commit on top — the "related" fixture. Cloned from the local store as it
+ * stands, then given a commit the local store does not have.
+ */
+function relatedBare(storeDir: string, divergentFile = 'REMOTE.md', divergentBody = 'remote\n'): { dir: string; url: string } {
+  const bare = join(scratch('bare-related'), 'store.git');
+  execFileSync('git', ['init', '--bare', '-b', 'main', bare], { encoding: 'utf8' });
+  const wc = scratch('wc-related');
+  execFileSync('git', ['clone', storeDir, wc], { env: GIT_ENV });
+  writeFileSync(join(wc, divergentFile), divergentBody, 'utf8');
+  g(wc, 'add', '-A');
+  g(wc, 'commit', '-m', 'remote-divergent');
+  g(wc, 'push', bare, 'main');
+  return { dir: bare, url: pathToFileURL(bare).href };
+}
+
 /** Commit subjects of a repo's HEAD history (bare or working). */
 function subjects(dir: string): string[] {
   return execFileSync('git', ['log', '--format=%s'], { cwd: dir, encoding: 'utf8' })
@@ -94,6 +111,12 @@ function assertNoForcePush(calls: string[][]): void {
     expect(argv).not.toContain('-f');
     expect(argv).not.toContain('--force-with-lease');
     for (const a of argv) expect(a.startsWith('+')).toBe(false); // no `+refspec` force
+  }
+}
+
+function assertNoUnrelatedMerge(calls: string[][]): void {
+  for (const argv of calls) {
+    expect(argv).not.toContain('--allow-unrelated-histories');
   }
 }
 
@@ -167,5 +190,81 @@ describe('remote 2.3: first-connect to an empty remote still works (2.1 behaviou
     expect(res.code).toBe(0);
     expect(originUrl(paths.store)).toBe(remote.url);
     expect(subjects(remote.dir)).toContain('agentenv: initialise store');
+  });
+});
+
+describe('remote 2.3: RELATED candidate → integrate then adopt', () => {
+  it('integrates a related history and adopts it: both histories present, no force-push', async () => {
+    const th = gitHome();
+    const paths = resolvePaths(th.env);
+    const oldRemote = emptyBare();
+    await run(['init'], { env: th.env });
+    await run(['remote', oldRemote.url], { env: th.env });
+
+    // A related bare that shares the baseline and adds a divergent commit.
+    const related = relatedBare(paths.store);
+    // A LOCAL-only commit the related remote does not have → genuine divergence.
+    await run(['create', 'writing'], { env: th.env });
+
+    const rec = recordingRunner();
+    const res = await run(['remote', related.url], { env: th.env, gitRun: rec.run });
+    expect(res.code).toBe(0);
+    expect(originUrl(paths.store)).toBe(related.url); // adopted
+
+    // Both histories are present locally AND on the adopted remote.
+    const local = subjects(paths.store);
+    expect(local).toContain('agentenv: initialise store'); // shared baseline
+    expect(local).toContain('remote-divergent'); // remote's commit
+    expect(local).toContain('agentenv: create env writing'); // local commit
+    expect(subjects(related.dir)).toEqual(local); // remote received the reconciled history
+
+    assertNoForcePush(rec.calls());
+    assertNoUnrelatedMerge(rec.calls());
+  });
+
+  it('a conflict is aborted: OLD url stays and local content is intact', async () => {
+    const th = gitHome();
+    const paths = resolvePaths(th.env);
+    const oldRemote = emptyBare();
+    await run(['init'], { env: th.env });
+    await run(['remote', oldRemote.url], { env: th.env });
+
+    // Related remote whose divergent commit edits .gitignore.
+    const related = relatedBare(paths.store, '.gitignore', 'remote-conflicting-line\n');
+    // Local edits the SAME file differently (as uncommitted drift the command flushes).
+    writeFileSync(join(paths.store, '.gitignore'), 'local-conflicting-line\n', 'utf8');
+
+    const rec = recordingRunner();
+    const res = await run(['remote', related.url], { env: th.env, gitRun: rec.run });
+    expect(res.code).not.toBe(0); // refused
+    expect(res.stderr).toMatch(/conflict/i);
+    expect(originUrl(paths.store)).toBe(oldRemote.url); // OLD url intact
+
+    // The local drift was flushed to a commit and survives (content intact/recoverable).
+    expect(execFileSync('git', ['show', 'HEAD:.gitignore'], { cwd: paths.store, encoding: 'utf8' })).toContain(
+      'local-conflicting-line',
+    );
+    assertNoForcePush(rec.calls());
+    assertNoUnrelatedMerge(rec.calls());
+  });
+
+  it('a fetch failure during classification leaves the OLD remote unchanged', async () => {
+    const th = gitHome();
+    const paths = resolvePaths(th.env);
+    const oldRemote = emptyBare();
+    await run(['init'], { env: th.env });
+    await run(['remote', oldRemote.url], { env: th.env });
+    const localBefore = subjects(paths.store);
+
+    const related = relatedBare(paths.store);
+    const failFetch: GitRunner = (args, opts) =>
+      args[0] === 'fetch'
+        ? Promise.resolve({ code: 1, stdout: '', stderr: 'simulated fetch failure', timedOut: false })
+        : defaultGitRunner(args, opts);
+
+    const res = await run(['remote', related.url], { env: th.env, gitRun: failFetch });
+    expect(res.code).not.toBe(0);
+    expect(originUrl(paths.store)).toBe(oldRemote.url); // unchanged
+    expect(subjects(paths.store)).toEqual(localBefore); // local intact
   });
 });

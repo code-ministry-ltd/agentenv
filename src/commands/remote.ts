@@ -7,11 +7,14 @@ import {
   commitStore,
   ensureStoreRepo,
   getRemoteUrl,
+  headCommit,
+  integrateCandidate,
   normaliseRemoteUrl,
   pushStore,
   pushUrl,
   rebaseInProgress,
   redactRemoteUrl,
+  resetHardTo,
   setRemoteUrl,
 } from '../git.js';
 import { ensureStore } from '../store.js';
@@ -92,17 +95,16 @@ export const remoteCommand: Command = {
     // Classify the candidate against the local store. `origin` is untouched here.
     const classification = await classifyRemoteHistory(paths, env, url, options.gitRun ? { run: options.gitRun } : {});
     try {
+      // `return await` (not bare `return`) is REQUIRED inside this try/finally: a bare
+      // `return asyncFn()` hands back a pending promise and lets the `finally` run
+      // cleanupCandidateRefs CONCURRENTLY — deleting the candidate ref mid-integrate.
       switch (classification.status) {
         case 'unreachable':
-          return unreachableCandidate(ctx, url, existing, classification.detail);
+          return await unreachableCandidate(ctx, url, existing, classification.detail);
         case 'empty':
-          return adoptEmpty(ctx, url, existing);
+          return await adoptEmpty(ctx, url, existing);
         case 'related':
-          // Integrate + adopt a related history — implemented in a later slice.
-          return fail(
-            `remote: ${redactRemoteUrl(url)} shares history with the local store (a related remote). ` +
-              'Integrating and adopting a related remote is not yet available; nothing was changed.\n',
-          );
+          return await integrateRelated(ctx, url, classification.candidateRef, existing);
         case 'unrelated':
           // Refuse / archive-and-adopt an unrelated history — implemented in a later slice.
           return fail(
@@ -158,6 +160,58 @@ async function adoptEmpty(ctx: CommandContext, url: string, existing: string | n
   await setRemoteUrl(paths, env, url, options.gitRun);
   const verb = existing ? 'Replaced the remote with' : 'Connected remote';
   return ok(`${verb} ${redacted} and pushed the local store.\n`);
+}
+
+/**
+ * RELATED candidate (design D14): integrate under the normal rebase rules, then flip.
+ * Transactional — the local `HEAD` is captured first, so a push failure AFTER a
+ * successful integrate rolls the local branch back to exactly where it started
+ * (`integrateCandidate` already restores it on a conflict/error). The OLD remote is
+ * never touched until the final flip; a conflict is aborted and refused (never
+ * auto-resolved — the manual `sync --resolve` seam owns conflict UX). Never force-pushes.
+ */
+async function integrateRelated(
+  ctx: CommandContext,
+  url: string,
+  candidateRef: string | undefined,
+  existing: string | null,
+): Promise<RunResult> {
+  const { paths, env, options } = ctx;
+  const redacted = redactRemoteUrl(url);
+  const target = existing ? 'The old remote is' : 'The store is';
+
+  if (!candidateRef) {
+    return fail(`remote: ${redacted} has no branch to integrate; nothing was changed.\n`);
+  }
+
+  // Save-point to roll the local branch back to if the post-integrate push fails.
+  const savePoint = await headCommit(paths, env, options.gitRun);
+
+  const integ = await integrateCandidate(paths, env, candidateRef, options.gitRun ? { run: options.gitRun } : {});
+  if (integ.status === 'conflict') {
+    return fail(
+      `remote: integrating ${redacted} hit a conflict and was aborted — ${target.toLowerCase()} unchanged and your ` +
+        'local store is intact. Resolve the histories first (or choose a different remote); nothing was changed.\n',
+    );
+  }
+  if (integ.status === 'error') {
+    return fail(`remote: could not integrate ${redacted} (${integ.detail ?? 'integration failed'}). ${target} unchanged.\n`);
+  }
+
+  // Integrated locally: push the reconciled history back with a NORMAL non-force push.
+  const push = await pushUrl(paths, env, url, options.gitRun ? { run: options.gitRun } : {});
+  if (push.status !== 'ok' && push.status !== 'nothing') {
+    // Roll the local branch back to its exact pre-integrate state (transactional).
+    if (savePoint) await resetHardTo(paths, env, savePoint, options.gitRun);
+    return fail(
+      `remote: integrated ${redacted} locally but could not push the reconciled history ` +
+        `(${push.detail ?? push.status}). ${target} unchanged and your local store was restored; retry.\n`,
+    );
+  }
+
+  // Push succeeded — flip the configured URL as the final step (design D14).
+  await setRemoteUrl(paths, env, url, options.gitRun);
+  return ok(`Integrated the related remote ${redacted} (both histories present) and adopted it.\n`);
 }
 
 /**

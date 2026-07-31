@@ -730,6 +730,67 @@ export async function setRemoteUrl(paths: Paths, env: NodeJS.ProcessEnv, url: st
   }
 }
 
+/** The local `HEAD` commit sha (for a save-point the caller can roll back to), or `null`. */
+export async function headCommit(paths: Paths, env: NodeJS.ProcessEnv, run?: GitRunner): Promise<string | null> {
+  const ctx = gitContext(paths, env, run);
+  const res = await git(ctx, ['rev-parse', '--verify', 'HEAD']);
+  return res.code === 0 && res.stdout.trim() !== '' ? res.stdout.trim() : null;
+}
+
+/** `git reset --hard <ref>` — restore/adopt the working branch to an exact commit or ref. */
+export async function resetHardTo(paths: Paths, env: NodeJS.ProcessEnv, ref: string, run?: GitRunner): Promise<GitRunResult> {
+  const ctx = gitContext(paths, env, run);
+  return git(ctx, ['reset', '--hard', ref]);
+}
+
+/** Outcome of an {@link integrateCandidate}. A CONFLICT is aborted, never auto-resolved. */
+export interface IntegrateResult {
+  status: 'ok' | 'conflict' | 'error';
+  detail?: string;
+}
+
+/**
+ * Integrate a RELATED candidate history into the local store (design D14): `git
+ * rebase <candidateRef>` replays the local-only commits on top of the candidate's
+ * history, so afterwards the local branch is a fast-forward of the candidate (a
+ * non-force push then sends it back). The candidate ref was already fetched during
+ * classification, so this is offline.
+ *
+ * NEVER auto-resolves: a rebase left mid-flight (a conflict, or any apply failure) is
+ * `--abort`ed so the pre-rebase local state is fully restored — leaving the OLD url
+ * configured and every local commit intact. A conflict is reported so the caller can
+ * refuse and point the user at the manual resolve (Task 2.2's `sync --resolve` seam).
+ * Identity/signing are pinned exactly like {@link commitStore}, and the editor is
+ * disabled so the replay is non-interactive.
+ */
+export async function integrateCandidate(
+  paths: Paths,
+  env: NodeJS.ProcessEnv,
+  candidateRef: string,
+  opts: { run?: GitRunner } = {},
+): Promise<IntegrateResult> {
+  const ctx = gitContext(paths, env, opts.run);
+  const identity = await resolveGitIdentity(ctx);
+  const rebaseEnv: NodeJS.ProcessEnv = { ...env, GIT_EDITOR: 'true', GIT_SEQUENCE_EDITOR: 'true' };
+  const res = await ctx.run([...commitArgs(identity), 'rebase', candidateRef], {
+    cwd: paths.store,
+    env: rebaseEnv,
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+  });
+  if (res.code === 0) return { status: 'ok' };
+
+  const blob = `${res.stdout}\n${res.stderr}`;
+  // A rebase left in-progress means a conflict (or another apply failure). Abort to
+  // restore the exact pre-rebase local state — never leave a half-rebased tree.
+  if (await rebaseInProgress(paths)) {
+    await git(ctx, ['rebase', '--abort']);
+    if (/CONFLICT|could not apply|needs merge|Resolve all conflicts/i.test(blob)) {
+      return { status: 'conflict', detail: 'store history diverged from the candidate remote' };
+    }
+  }
+  return { status: 'error', detail: redactRemoteUrl(firstLine(res.stderr)) || 'integration failed' };
+}
+
 // ---------------------------------------------------------------------------
 // Commit (with pre-commit secret scan)
 // ---------------------------------------------------------------------------
