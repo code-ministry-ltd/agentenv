@@ -1,4 +1,5 @@
 import type { Adapter } from './adapter.js';
+import { adoptSweep, singular } from './adopt.js';
 import { driftSweep } from './drift.js';
 import { effectiveGlobalEnvs } from './engine.js';
 import {
@@ -78,6 +79,13 @@ export interface SyncBeforeRequest {
    * reconciliation before (de)materialise) — skip the redundant sweep here.
    */
   alreadySwept?: boolean;
+  /**
+   * Suppress the per-invocation auto-adopt sweep (D10). Set by the commands that
+   * manage adoption THEMSELVES (`capture`, `adopt`, `disown`) so the lifecycle
+   * does not double-adopt behind them. Default (unset) → the sweep runs, which is
+   * a fast no-op unless a surface was snapshotted (see {@link adoptSweep}).
+   */
+  skipAdopt?: boolean;
   /** Pull network budget (ms). Defaults to git.ts's ~3s. */
   pullTimeoutMs?: number;
 }
@@ -127,6 +135,44 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
           'Remove the secret (use a ${VAR} placeholder) so the drift can be committed. ' +
           'If it is a documented example, mark the line `agentenv:allow-secret`.',
       );
+    }
+
+    // 2b. Auto-adopt sweep (D10): a NEW item an agent created inside an activated
+    //     managed dir since the last snapshot is moved into the store, symlinked
+    //     back, owned, and committed under its OWN `agentenv: adopt <kind> <name>
+    //     → <env>` message — run AFTER the `sync drift` commit so each adoption
+    //     commit is isolated (the tree is clean between them). Guardrails apply in
+    //     adoptSweep; the lifecycle sweep is NON-interactive, so secret-bearing
+    //     items DECLINE (never silently adopted) — `agentenv capture` is the
+    //     interactive path. Suppressed for commands that adopt themselves.
+    if (!req.skipAdopt) {
+      try {
+        await adoptSweep({
+          paths,
+          note: onNotice,
+          onAdopt: async (rec) => {
+            try {
+              const c = await commitStore(
+                paths,
+                env,
+                `agentenv: adopt ${singular(rec.storeKind)} ${rec.name} → ${rec.ownerEnv}`,
+                gitRun,
+              );
+              if (c.status === 'blocked') {
+                onNotice(
+                  `agentenv: adoption of '${rec.name}' NOT committed — a suspected secret is present:\n${describeFindings(c.findings ?? [])}`,
+                );
+              }
+            } catch (err) {
+              onNotice(
+                `agentenv: adopted '${rec.name}' locally but the commit was skipped — ${(err as Error).message}`,
+              );
+            }
+          },
+        });
+      } catch (err) {
+        onNotice(`agentenv: auto-adopt sweep skipped — ${(err as Error).message}`);
+      }
     }
 
     // 3. Pull (rebase, short timeout, silently skipped offline / no-remote).

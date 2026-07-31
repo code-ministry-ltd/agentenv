@@ -1,3 +1,6 @@
+import { join } from 'node:path';
+import type { Adapter } from '../adapter.js';
+import { snapshotInventory, type AdoptSurface } from '../adopt.js';
 import { adapters as realAdapters } from '../adapters/index.js';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
@@ -137,6 +140,16 @@ async function useGlobal(
   });
 
   notices.push(...renderGlobalSkips(result.skips));
+
+  // Snapshot the inventory of every dir-merge surface now materialised (D10), so the
+  // NEXT invocation's sweep can tell an agent-created item from these pre-existing
+  // ones and auto-adopt it into the top env. Taken AFTER materialise, so the env's
+  // own symlinked items are in the baseline (and owned) — never re-adopted.
+  const topEnv = result.stack.at(-1);
+  if (topEnv !== undefined) {
+    await snapshotInventory(paths, globalDirMergeSurfaces(adapters, env, topEnv));
+  }
+
   await closeStoreSync(syncCtx, notices); // Git sync END (D9): one fail-soft push.
   const stderr = notices.length > 0 ? `${notices.join('\n')}\n` : undefined;
   return {
@@ -146,4 +159,34 @@ async function useGlobal(
     ...(stderr ? { stderr } : {}),
     code: 0,
   };
+}
+
+/**
+ * The real dir-merge surfaces (skills / agents / commands) of the in-scope adapters,
+ * as {@link AdoptSurface}s owned by `ownerEnv` — the D10 auto-adoption snapshot set
+ * for global mode. Only supported dir-merge surfaces whose store kind is an adoptable
+ * kind are watched (instructions live in `rules/` but are not agent-created skills).
+ */
+function globalDirMergeSurfaces(
+  adapters: readonly Adapter[],
+  env: NodeJS.ProcessEnv,
+  ownerEnv: string,
+): AdoptSurface[] {
+  const surfaces: AdoptSurface[] = [];
+  for (const adapter of adapters) {
+    const root = adapter.realConfigRoot(env);
+    for (const surface of adapter.surfaces) {
+      if (surface.mechanism !== 'dir-merge' || !surface.supported) continue;
+      if (surface.storeKind !== 'skills' && surface.storeKind !== 'agents' && surface.storeKind !== 'commands') {
+        continue;
+      }
+      surfaces.push({
+        dir: join(root, surface.rootRelativePath),
+        scope: 'global',
+        storeKind: surface.storeKind,
+        ownerEnv,
+      });
+    }
+  }
+  return surfaces;
 }
