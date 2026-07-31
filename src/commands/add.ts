@@ -1,12 +1,18 @@
-import { access, cp, mkdir, rm, stat, writeFile } from 'node:fs/promises';
+import { access, cp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
-import { scaffoldSkillMd, validateSkillDir, validateSkillName } from '../content-items.js';
+import {
+  scaffoldSkillMd,
+  validateItemName,
+  validateSkillDir,
+  validateSkillName,
+} from '../content-items.js';
 import { environmentExists, validateEnvName } from '../store.js';
 
 /** Content kinds `add` understands, in help/usage order. */
-const KINDS = ['skill'] as const;
+const KINDS = ['skill', 'mcp'] as const;
 
 function ok(stdout: string): RunResult {
   return { stdout, code: 0 };
@@ -26,6 +32,16 @@ async function pathExists(p: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+/** Read a file's text, or undefined when it does not exist. */
+async function readFileMaybe(p: string): Promise<string | undefined> {
+  try {
+    return await readFile(p, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw err;
   }
 }
 
@@ -136,6 +152,80 @@ async function addSkill(rest: readonly string[], ctx: CommandContext): Promise<R
   return ok(`Added skill '${target}' to environment '${env}'.\n`);
 }
 
+/** Build one canonical `mcp/servers.yaml` server entry (design D6). */
+function scaffoldMcpServer(name: string, transport: 'stdio' | 'http'): Record<string, unknown> {
+  const varBase = name.toUpperCase().replace(/[^A-Z0-9]+/g, '_');
+  if (transport === 'http') {
+    return {
+      transport: 'http',
+      url: 'https://example.com/mcp',
+      auth: { bearer_env: `${varBase}_TOKEN` },
+    };
+  }
+  return {
+    transport: 'stdio',
+    command: 'npx',
+    args: ['-y', `@modelcontextprotocol/server-${name}`],
+    env: { [`${varBase}_API_KEY`]: `\${${varBase}_API_KEY}` },
+  };
+}
+
+/**
+ * `add mcp <env> <name> [--transport stdio|http]`.
+ *
+ * Scaffolds/appends a server entry in `mcp/servers.yaml` (canonical D6 shape).
+ * Existing servers are preserved; an existing entry of the same name is refused
+ * unless `--force`.
+ */
+async function addMcp(rest: readonly string[], ctx: CommandContext): Promise<RunResult> {
+  const parsed = parseArgs(rest, { booleans: ['force', 'print-path'], values: ['transport'] });
+  if (parsed.unknown.length > 0) {
+    return fail(`add mcp: unknown option '${parsed.unknown[0]}'\n`);
+  }
+  const resolved = await resolveEnv('mcp', parsed.positionals[0], ctx.paths);
+  if ('error' in resolved) return resolved.error;
+  const env = resolved.env;
+
+  const name = parsed.positionals[1];
+  if (name === undefined) {
+    return fail(
+      'add mcp: missing server name\n' +
+        'Usage: agentenv add mcp <env> <name> [--transport stdio|http] [--force] [--print-path]\n',
+    );
+  }
+  const nameError = validateItemName('mcp server', name);
+  if (nameError) return fail(`add mcp: ${nameError}\n`);
+
+  const transport = parsed.values.get('transport') ?? 'stdio';
+  if (transport !== 'stdio' && transport !== 'http') {
+    return fail(`add mcp: unknown --transport '${transport}' (expected 'stdio' or 'http')\n`);
+  }
+
+  const file = join(ctx.paths.envDir(env), 'mcp', 'servers.yaml');
+  if (parsed.booleans.has('print-path')) return ok(`${file}\n`);
+
+  let servers: Record<string, unknown> = {};
+  const existingText = await readFileMaybe(file);
+  if (existingText !== undefined) {
+    const parsedYaml: unknown = parseYaml(existingText);
+    if (parsedYaml !== null && parsedYaml !== undefined) {
+      if (typeof parsedYaml !== 'object' || Array.isArray(parsedYaml)) {
+        return fail(`add mcp: ${file} is not a YAML mapping of server definitions\n`);
+      }
+      servers = parsedYaml as Record<string, unknown>;
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(servers, name) && !parsed.booleans.has('force')) {
+    return fail(`add mcp: server '${name}' already exists in '${env}' (${file}); pass --force to overwrite\n`);
+  }
+
+  servers[name] = scaffoldMcpServer(name, transport);
+  await mkdir(join(ctx.paths.envDir(env), 'mcp'), { recursive: true });
+  await writeFile(file, stringifyYaml(servers), 'utf8');
+  return ok(`Added MCP server '${name}' (${transport}) to environment '${env}'.\n`);
+}
+
 export const addCommand: Command = {
   name: 'add',
   usage: '<kind> <env> …',
@@ -150,6 +240,8 @@ export const addCommand: Command = {
     switch (kind) {
       case 'skill':
         return addSkill(rest, ctx);
+      case 'mcp':
+        return addMcp(rest, ctx);
       default:
         return fail(`add: unknown kind '${kind}'\n${kindsHelp()}`);
     }
