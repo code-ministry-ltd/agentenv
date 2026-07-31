@@ -247,9 +247,10 @@ describe('adapter.opencode — compileConfigKeys: instructions (array-element, a
 });
 
 describe('adapter.opencode — syncBackConfigKeys (criterion 4)', () => {
-  it('folds one drifted server back into servers.yaml, siblings intact', async () => {
+  it('folds one drifted server back into servers.yaml canonical shape, siblings intact', async () => {
+    // servers.yaml is D6-canonical; the drift value is OpenCode's harness shape (F1).
     const dir = envWithServers(
-      'keep:\n  type: local\n  command: ["keep-cmd"]\nlinear:\n  type: remote\n  url: https://old\n',
+      'keep:\n  transport: stdio\n  command: keep-cmd\nlinear:\n  transport: http\n  url: https://old\n',
     );
     const mutations = await opencodeAdapter.syncBackConfigKeys!(
       MCP_SURFACE,
@@ -268,12 +269,14 @@ describe('adapter.opencode — syncBackConfigKeys (criterion 4)', () => {
     expect(mutations).toHaveLength(1);
     expect(mutations[0]!.storeRelativePath).toBe(join('mcp', 'servers.yaml'));
     const written = parseYaml(mutations[0]!.content) as Record<string, JsonValue>;
-    expect(written.keep).toEqual({ type: 'local', command: ['keep-cmd'] });
+    // Sibling preserved verbatim (already canonical).
+    expect(written.keep).toEqual({ transport: 'stdio', command: 'keep-cmd' });
+    // Drifted server reverse-mapped to canonical D6 ({env:VAR} → ${VAR}, remote → http,
+    // Authorization → auth.bearer_env, `enabled`/`type` dropped).
     expect(written.linear).toEqual({
-      type: 'remote',
+      transport: 'http',
       url: 'https://new',
-      enabled: true,
-      headers: { Authorization: 'Bearer {env:LINEAR_TOKEN}' },
+      auth: { bearer_env: 'LINEAR_TOKEN' },
     });
   });
 

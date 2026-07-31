@@ -189,10 +189,10 @@ function toCommandArray(command: JsonValue | undefined, args: JsonValue | undefi
 
 /**
  * Shape one canonical `mcp/servers.yaml` server (D6) into OpenCode's `opencode.json`
- * `mcp.<name>` object. IDEMPOTENT: an entry already in OpenCode's shape (`type`
- * present, no canonical `transport`) passes through unchanged — this is what makes
- * {@link syncBackConfigKeys}'s verbatim write-back round-trip stably
- * (`compile(syncBack(v)) === v`).
+ * `mcp.<name>` object. `servers.yaml` is ALWAYS D6-canonical (F1: every adapter's
+ * {@link syncBackConfigKeys} writes canonical, never its harness shape), so the input
+ * always carries `transport` (or is inferred from `command`/`url`) — there is no
+ * `type`-shaped short-circuit to pass a foreign harness shape through.
  *
  * Mappings from the canonical model:
  *   stdio → `{ type:'local', command:[command, ...args], enabled:true, env? }`
@@ -204,8 +204,6 @@ function toCommandArray(command: JsonValue | undefined, args: JsonValue | undefi
  */
 function shapeOpenCodeServer(def: unknown): JsonValue {
   if (!isObject(def)) return def as JsonValue;
-  // Already OpenCode-shaped (has `type`, not the canonical `transport`): idempotent.
-  if ('type' in def && !('transport' in def)) return def;
 
   const transport =
     typeof def.transport === 'string'
@@ -244,6 +242,77 @@ function shapeOpenCodeServer(def: unknown): JsonValue {
 
   // Unknown transport: pass the user's authored def through (var-converted only).
   return convertVarsDeep(def);
+}
+
+/** Inverse of {@link convertVarsDeep}: rewrite OpenCode `{env:VAR}` back to canonical `${VAR}`. */
+function convertVarsBack(value: JsonValue): JsonValue {
+  if (typeof value === 'string') {
+    return value.replace(/\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g, '${$1}');
+  }
+  if (Array.isArray(value)) return value.map(convertVarsBack);
+  if (isObject(value)) {
+    const out: Record<string, JsonValue> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = convertVarsBack(v);
+    return out;
+  }
+  return value;
+}
+
+/** A header value shaped EXACTLY `Bearer ${VAR}` → the var name, else null. */
+function bearerEnvFromHeader(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const m = /^Bearer \$\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}$/.exec(value);
+  return m ? m[1]! : null;
+}
+
+/**
+ * The inverse of {@link shapeOpenCodeServer}: fold one drifted OpenCode `mcp.<name>`
+ * value back to the canonical `servers.yaml` D6 shape. `{env:VAR}` → `${VAR}`
+ * (canonical), the single `command` array split back into `command` + `args`,
+ * `type:'local'|'remote'` + `enabled` dropped, and an `Authorization: Bearer ${VAR}`
+ * header reconstructed into `auth.bearer_env`. Keeping servers.yaml D6-canonical (never
+ * OpenCode's `{env:}`/array shape) is the Phase-4 decision (F1) so every adapter's
+ * compile reads canonical. A bespoke/unknown entry passes through (var-converted only).
+ */
+function unshapeOpenCodeServer(def: unknown): JsonValue {
+  if (!isObject(def)) return def as JsonValue;
+  const canon = convertVarsBack(def);
+  if (!isObject(canon)) return canon;
+  const type =
+    typeof canon.type === 'string'
+      ? canon.type
+      : canon.command !== undefined
+        ? 'local'
+        : canon.url !== undefined
+          ? 'remote'
+          : undefined;
+
+  if (type === 'local') {
+    const out: Record<string, JsonValue> = { transport: 'stdio' };
+    const cmd = canon.command;
+    if (Array.isArray(cmd)) {
+      if (cmd.length > 0) out.command = cmd[0]!;
+      if (cmd.length > 1) out.args = cmd.slice(1);
+    } else if (cmd !== undefined) {
+      out.command = cmd;
+    }
+    if (canon.env !== undefined) out.env = canon.env;
+    return out;
+  }
+  if (type === 'remote') {
+    const out: Record<string, JsonValue> = { transport: 'http' };
+    if (canon.url !== undefined) out.url = canon.url;
+    const headers: Record<string, JsonValue> = isObject(canon.headers) ? { ...canon.headers } : {};
+    const bearer = bearerEnvFromHeader(headers.Authorization);
+    if (bearer !== null) {
+      out.auth = { bearer_env: bearer };
+      delete headers.Authorization;
+    }
+    if (Object.keys(headers).length > 0) out.headers = headers;
+    return out;
+  }
+  // Unknown/bespoke OpenCode entry: pass through (already var-converted) untouched.
+  return canon;
 }
 
 /** Run `opencode --version`, resolving `true` only on a clean exit 0. Never throws. */
@@ -370,11 +439,12 @@ export const opencodeAdapter: Adapter = {
   ): Promise<ConfigKeysStoreMutation[]> {
     // Inverse of compileConfigKeys (spec criterion 4), consistent with Claude's D6
     // decision: fold the one drifted server (keyPath ['mcp', <name>]) back into
-    // servers.yaml, siblings untouched. `canonicalValue` already has secret
-    // {env:VAR} placeholders restored (D6). It is written in OpenCode's normalised
-    // shape; because shapeOpenCodeServer is idempotent on that shape, a subsequent
-    // compile reproduces it exactly — round-trip stable. Instructions are
-    // array-element (identity IS the value), so they carry no drift to sync back.
+    // servers.yaml, siblings untouched, in the PURE canonical D6 shape — NOT OpenCode's
+    // `{env:}`/`type:'local'`/command-array shape. `canonicalValue` already has secret
+    // {env:VAR} placeholders restored (D6); `unshapeOpenCodeServer` maps its harness
+    // shape back to canonical so servers.yaml stays D6-canonical for EVERY adapter (F1)
+    // and a later compile reproduces the drift exactly — round-trip stable. Instructions
+    // are array-element (identity IS the value), so they carry no drift to sync back.
     if (surface.id !== 'mcp' || drift.style !== 'keyed') return [];
     // A server injection is always keyPath ['mcp', <name>] (length 2); a length-1
     // keyPath would fold a bogus `mcp` "server" into the store.
@@ -385,7 +455,7 @@ export const opencodeAdapter: Adapter = {
     const existing = existsSync(serversFile)
       ? ((parseYaml(await readFile(serversFile, 'utf8')) as Record<string, unknown> | null) ?? {})
       : {};
-    existing[name] = drift.canonicalValue;
+    existing[name] = unshapeOpenCodeServer(drift.canonicalValue);
     return [{ storeRelativePath: join('mcp', 'servers.yaml'), content: stringifyYaml(existing) }];
   },
 

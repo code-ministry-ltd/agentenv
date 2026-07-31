@@ -152,7 +152,10 @@ describe('secrets materialise 7b: passthrough rung strips a baked literal on wri
     expect(again.code).toBe(0);
 
     const storeYaml = readFileSync(join(paths.envDir('writing'), 'mcp', 'servers.yaml'), 'utf8');
-    expect(storeYaml).toContain('${LINEAR_TOKEN}');
+    // The write-back restores the secret INDIRECTION in canonical D6 shape (F1): the
+    // `Bearer ${VAR}` header reverse-maps to `auth.bearer_env: LINEAR_TOKEN` — the token
+    // is a var name, never the baked literal.
+    expect(storeYaml).toContain('bearer_env: LINEAR_TOKEN');
     expect(storeYaml).not.toContain(BAKED_TOKEN);
     // The baked literal is in NO store commit and NO working-tree file.
     expect(storeHistoryAndTree(paths.store)).not.toContain(BAKED_TOKEN);

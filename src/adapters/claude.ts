@@ -142,10 +142,10 @@ function collectPlaceholders(value: unknown, prefix: string, out: Record<string,
 
 /**
  * Shape one canonical `mcp/servers.yaml` server (D6) into Claude's `.claude.json`
- * `mcpServers.<name>` object. The transform is IDEMPOTENT: an entry already in
- * Claude's shape (`type` present, no canonical `transport`) passes through
- * unchanged — this is what makes {@link syncBackConfigKeys}'s verbatim write-back
- * round-trip stably (`compile(syncBack(v)) === v`), proving spec criterion 4.
+ * `mcpServers.<name>` object. `servers.yaml` is ALWAYS D6-canonical (F1: every
+ * adapter's {@link syncBackConfigKeys} writes canonical, never its harness shape), so
+ * the input always carries `transport` (or is inferred from `command`/`url`) — there
+ * is no `type`-shaped short-circuit to pass a foreign harness shape through.
  *
  * Mappings from the canonical model:
  *   stdio → `{ type:'stdio', command, args?, env? }`
@@ -156,8 +156,6 @@ function collectPlaceholders(value: unknown, prefix: string, out: Record<string,
  */
 function shapeClaudeServer(def: unknown): JsonValue {
   if (!isObject(def)) return def as JsonValue;
-  // Already Claude-shaped (has `type`, not the canonical `transport`): idempotent.
-  if ('type' in def && !('transport' in def)) return def;
 
   const transport =
     typeof def.transport === 'string'
@@ -189,6 +187,57 @@ function shapeClaudeServer(def: unknown): JsonValue {
   }
 
   // Unknown transport: pass the user's authored def through untouched.
+  return def;
+}
+
+/** A header value shaped EXACTLY `Bearer ${VAR}` → the var name, else null. */
+function bearerEnvFromHeader(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const m = /^Bearer \$\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}$/.exec(value);
+  return m ? m[1]! : null;
+}
+
+/**
+ * The inverse of {@link shapeClaudeServer}: fold one drifted Claude `mcpServers.<name>`
+ * value back to the canonical `servers.yaml` D6 shape — `transport` + `command`/`url`,
+ * `env` with `${VAR}` kept, and `auth.bearer_env` reconstructed from an
+ * `Authorization: Bearer ${VAR}` header. Keeping servers.yaml D6-canonical (never
+ * Claude's `type`/`headers` shape) is the Phase-4 decision (F1) so EVERY adapter's
+ * compile reads canonical, not Claude's harness shape. A bespoke/unknown entry passes
+ * through untouched (never corrupt a hand-authored server). Mirrors Codex's
+ * `unshapeCodexServer`.
+ */
+function unshapeClaudeServer(def: unknown): JsonValue {
+  if (!isObject(def)) return def as JsonValue;
+  const type =
+    typeof def.type === 'string'
+      ? def.type
+      : def.command !== undefined
+        ? 'stdio'
+        : def.url !== undefined
+          ? 'http'
+          : undefined;
+
+  if (type === 'stdio') {
+    const out: Record<string, JsonValue> = { transport: 'stdio' };
+    if (def.command !== undefined) out.command = def.command;
+    if (def.args !== undefined) out.args = def.args;
+    if (def.env !== undefined) out.env = def.env;
+    return out;
+  }
+  if (type === 'http' || type === 'sse') {
+    const out: Record<string, JsonValue> = { transport: type };
+    if (def.url !== undefined) out.url = def.url;
+    const headers: Record<string, JsonValue> = isObject(def.headers) ? { ...def.headers } : {};
+    const bearer = bearerEnvFromHeader(headers.Authorization);
+    if (bearer !== null) {
+      out.auth = { bearer_env: bearer };
+      delete headers.Authorization;
+    }
+    if (Object.keys(headers).length > 0) out.headers = headers;
+    return out;
+  }
+  // Unknown/bespoke Claude entry: pass through so a hand-authored server survives.
   return def;
 }
 
@@ -286,10 +335,12 @@ export const claudeAdapter: Adapter = {
     ctx: ConfigKeysContext,
   ): Promise<ConfigKeysStoreMutation[]> {
     // Inverse of compileConfigKeys (spec criterion 4): fold the one drifted server
-    // (keyPath ['mcpServers', <name>]) back into servers.yaml, siblings untouched.
-    // `canonicalValue` already has secret ${VAR} placeholders restored (D6). It is
-    // written in Claude's normalised shape; because shapeClaudeServer is idempotent
-    // on that shape, a subsequent compile reproduces it exactly — round-trip stable.
+    // (keyPath ['mcpServers', <name>]) back into servers.yaml, siblings untouched, in
+    // the PURE canonical D6 shape (`transport`/`command`/`url`/`auth`, `${VAR}` kept) —
+    // NOT Claude's `type`/`headers` shape. `canonicalValue` already has secret ${VAR}
+    // placeholders restored (D6); `unshapeClaudeServer` maps its harness shape back to
+    // canonical so servers.yaml stays D6-canonical for EVERY adapter (F1) and a later
+    // compile reproduces the drift exactly — round-trip stable.
     if (surface.id !== 'mcp' || drift.style !== 'keyed') return [];
     // A server injection is always keyPath ['mcpServers', <name>] (length 2); a
     // length-1 keyPath would fold a bogus `mcpServers` "server" into the store.
@@ -300,7 +351,7 @@ export const claudeAdapter: Adapter = {
     const existing = existsSync(serversFile)
       ? ((parseYaml(await readFile(serversFile, 'utf8')) as Record<string, unknown> | null) ?? {})
       : {};
-    existing[name] = drift.canonicalValue;
+    existing[name] = unshapeClaudeServer(drift.canonicalValue);
     return [{ storeRelativePath: join('mcp', 'servers.yaml'), content: stringifyYaml(existing) }];
   },
 

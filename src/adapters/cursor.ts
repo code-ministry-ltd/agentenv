@@ -227,6 +227,61 @@ function shapeCursorServer(def: unknown): JsonValue {
   return def;
 }
 
+/** Inverse of {@link toCursorEnvPlaceholders}: rewrite Cursor `${env:VAR}` back to canonical `${VAR}`. */
+function fromCursorEnvPlaceholders(value: JsonValue): JsonValue {
+  if (typeof value === 'string') {
+    return value.replace(/\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g, '${$1}');
+  }
+  if (Array.isArray(value)) return value.map(fromCursorEnvPlaceholders);
+  if (isObject(value)) {
+    const out: Record<string, JsonValue> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = fromCursorEnvPlaceholders(v);
+    return out;
+  }
+  return value;
+}
+
+/** A header value shaped EXACTLY `Bearer ${VAR}` → the var name, else null. */
+function bearerEnvFromHeader(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const m = /^Bearer \$\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}$/.exec(value);
+  return m ? m[1]! : null;
+}
+
+/**
+ * The inverse of {@link shapeCursorServer} + {@link toCursorEnvPlaceholders}: fold one
+ * drifted Cursor `mcpServers.<name>` value back to the canonical `servers.yaml` D6 shape.
+ * `${env:VAR}` → `${VAR}` (canonical), a bare `command` recognised as stdio, and an
+ * `Authorization: Bearer ${VAR}` header reconstructed into `auth.bearer_env`. Keeping
+ * servers.yaml D6-canonical (never Cursor's `${env:}` shape) is the Phase-4 decision (F1)
+ * so every adapter's compile reads canonical. A bespoke/unknown entry passes through.
+ */
+function unshapeCursorServer(def: unknown): JsonValue {
+  if (!isObject(def)) return def as JsonValue;
+  const canon = fromCursorEnvPlaceholders(def);
+  if (!isObject(canon)) return canon;
+  if (canon.command !== undefined && canon.url === undefined) {
+    const out: Record<string, JsonValue> = { transport: 'stdio', command: canon.command };
+    if (canon.args !== undefined) out.args = canon.args;
+    if (canon.env !== undefined) out.env = canon.env;
+    return out;
+  }
+  if (canon.url !== undefined) {
+    const type = typeof canon.type === 'string' ? canon.type : 'http';
+    const out: Record<string, JsonValue> = { transport: type, url: canon.url };
+    const headers: Record<string, JsonValue> = isObject(canon.headers) ? { ...canon.headers } : {};
+    const bearer = bearerEnvFromHeader(headers.Authorization);
+    if (bearer !== null) {
+      out.auth = { bearer_env: bearer };
+      delete headers.Authorization;
+    }
+    if (Object.keys(headers).length > 0) out.headers = headers;
+    return out;
+  }
+  // Unknown/bespoke Cursor entry: pass through (already var-canonicalised) untouched.
+  return canon;
+}
+
 /** Run `cursor-agent --version`, resolving `true` only on a clean exit 0. Never throws. */
 function versionExitsZero(binaryPath: string): Promise<boolean> {
   return new Promise((resolve) => {
@@ -338,10 +393,10 @@ export const cursorAdapter: Adapter = {
   ): Promise<ConfigKeysStoreMutation[]> {
     // Inverse of compileConfigKeys (spec criterion 4), consistent with Claude: fold the
     // one drifted server (keyPath ['mcpServers', <name>]) back into servers.yaml,
-    // siblings untouched. `canonicalValue` already has secret ${env:VAR} placeholders
-    // restored (D6). It is written in Cursor's normalised shape; because shapeCursorServer
-    // + the ${env:VAR} rewrite are idempotent on that shape, a subsequent compile
-    // reproduces it exactly — round-trip stable.
+    // siblings untouched, in the PURE canonical D6 shape — NOT Cursor's `${env:}` shape.
+    // `canonicalValue` already has secret ${env:VAR} placeholders restored (D6);
+    // `unshapeCursorServer` maps its harness shape back to canonical so servers.yaml stays
+    // D6-canonical for EVERY adapter (F1) and a later compile reproduces the drift exactly.
     if (surface.id !== 'mcp' || drift.style !== 'keyed') return [];
     if (drift.keyPath.length < 2) return [];
     const name = drift.keyPath[drift.keyPath.length - 1];
@@ -350,7 +405,7 @@ export const cursorAdapter: Adapter = {
     const existing = existsSync(serversFile)
       ? ((parseYaml(await readFile(serversFile, 'utf8')) as Record<string, unknown> | null) ?? {})
       : {};
-    existing[name] = drift.canonicalValue;
+    existing[name] = unshapeCursorServer(drift.canonicalValue);
     return [{ storeRelativePath: join('mcp', 'servers.yaml'), content: stringifyYaml(existing) }];
   },
 

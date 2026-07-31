@@ -172,8 +172,9 @@ describe('adapter.claude — compileConfigKeys (MCP → Claude mcpServers, D6)',
 });
 
 describe('adapter.claude — syncBackConfigKeys (criterion 4)', () => {
-  it('folds one drifted server back into servers.yaml, siblings intact', async () => {
-    const dir = envWithServers('keep:\n  type: stdio\n  command: keep-cmd\nlinear:\n  type: http\n  url: https://old\n');
+  it('folds one drifted server back into servers.yaml canonical shape, siblings intact', async () => {
+    // servers.yaml is D6-canonical; the drift value is Claude's harness shape (F1).
+    const dir = envWithServers('keep:\n  transport: stdio\n  command: keep-cmd\nlinear:\n  transport: http\n  url: https://old\n');
     const mutations = await claudeAdapter.syncBackConfigKeys!(
       MCP_SURFACE,
       {
@@ -186,11 +187,13 @@ describe('adapter.claude — syncBackConfigKeys (criterion 4)', () => {
     expect(mutations).toHaveLength(1);
     expect(mutations[0]!.storeRelativePath).toBe(join('mcp', 'servers.yaml'));
     const written = parseYaml(mutations[0]!.content) as Record<string, JsonValue>;
-    expect(written.keep).toEqual({ type: 'stdio', command: 'keep-cmd' });
+    // Sibling preserved verbatim (already canonical).
+    expect(written.keep).toEqual({ transport: 'stdio', command: 'keep-cmd' });
+    // Drifted server reverse-mapped to canonical D6 (Authorization → auth.bearer_env).
     expect(written.linear).toEqual({
-      type: 'http',
+      transport: 'http',
       url: 'https://new',
-      headers: { Authorization: 'Bearer ${LINEAR_TOKEN}' },
+      auth: { bearer_env: 'LINEAR_TOKEN' },
     });
   });
 
