@@ -1,6 +1,7 @@
 import type { Command } from '../command.js';
 import { createCommand } from './create.js';
 import { listCommand } from './list.js';
+import { rmCommand } from './rm.js';
 import { showCommand } from './show.js';
 
 /**
@@ -8,7 +9,12 @@ import { showCommand } from './show.js';
  * exist. `run` dispatches by looking a name up here, and `--help` lists these
  * entries. Each slice appends its command; order here is the display order.
  */
-export const commands: readonly Command[] = [createCommand, listCommand, showCommand];
+export const commands: readonly Command[] = [
+  createCommand,
+  listCommand,
+  showCommand,
+  rmCommand,
+];
 
 export function findCommand(name: string): Command | undefined {
   return commands.find((c) => c.name === name);
