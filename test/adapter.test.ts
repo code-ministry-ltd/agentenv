@@ -59,8 +59,8 @@ describe('session adapter contract', () => {
     expect(validateAdapter(bad)).toContain('unsafe rootRelativePath');
   });
 
-  it('registers the Claude Code (1.8), Codex (4.1) and OpenCode (4.2) adapters; Pi/Cursor are the other 4.x', () => {
-    expect(realAdapters.map((a) => a.id)).toEqual(['claude-code', 'codex', 'opencode']);
+  it('registers Claude Code (1.8), Codex (4.1), OpenCode (4.2) and Pi (4.3); Cursor is the other 4.x', () => {
+    expect(realAdapters.map((a) => a.id)).toEqual(['claude-code', 'codex', 'opencode', 'pi']);
     for (const a of realAdapters) expect(validateAdapter(a)).toBeNull();
   });
 
