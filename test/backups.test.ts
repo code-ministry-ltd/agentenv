@@ -1,5 +1,14 @@
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { existsSync } from 'node:fs';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { backup, restore } from '../src/backups.js';
@@ -118,5 +127,65 @@ describe('content-addressed backups', () => {
     await restore(p, ref, file);
     expect(existsSync(file)).toBe(true);
     expect(readFileSync(file, 'utf8')).toBe('');
+  });
+
+  it('round-trips a symlink, preserving link-ness and target (never follows it)', async () => {
+    const p = paths();
+    const target = join(temp.home, 'real-target.txt');
+    writeFileSync(target, 'target contents');
+    const link = join(temp.home, 'a-link');
+    symlinkSync(target, link);
+
+    const ref = await backup(p, link);
+    expect(ref).toEqual({ kind: 'symlink', target });
+
+    // Mutation replaced the link with a regular file; undo must restore the link.
+    rmSync(link);
+    writeFileSync(link, 'now a regular file');
+    await restore(p, ref, link);
+
+    const st = lstatSync(link);
+    expect(st.isSymbolicLink()).toBe(true); // a symlink, NOT a regular file
+    expect(readlinkSync(link)).toBe(target);
+  });
+
+  it('round-trips a dangling symlink — restored as a dangling link, not deleted', async () => {
+    const p = paths();
+    const missing = join(temp.home, 'no-such-target');
+    const link = join(temp.home, 'dangling-link');
+    symlinkSync(missing, link);
+    expect(existsSync(missing)).toBe(false); // target genuinely absent
+
+    const ref = await backup(p, link);
+    expect(ref).toEqual({ kind: 'symlink', target: missing });
+
+    rmSync(link);
+    await restore(p, ref, link);
+
+    // lstat (does not follow) proves the link itself exists...
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(link)).toBe(missing);
+    // ...and existsSync (follows) proves it is still dangling, not a real file.
+    expect(existsSync(link)).toBe(false);
+  });
+
+  it('round-trips a directory subtree, preserving a nested file and a nested symlink', async () => {
+    const p = paths();
+    const dir = join(temp.home, 'tree');
+    mkdirSync(join(dir, 'sub'), { recursive: true });
+    writeFileSync(join(dir, 'sub', 'file.txt'), 'nested contents');
+    symlinkSync('file.txt', join(dir, 'sub', 'rel-link')); // relative nested symlink
+
+    const ref = await backup(p, dir);
+    expect(ref.kind).toBe('directory');
+
+    // Destroy the tree, then restore it whole.
+    rmSync(dir, { recursive: true, force: true });
+    await restore(p, ref, dir);
+
+    expect(readFileSync(join(dir, 'sub', 'file.txt'), 'utf8')).toBe('nested contents');
+    const linkStat = lstatSync(join(dir, 'sub', 'rel-link'));
+    expect(linkStat.isSymbolicLink()).toBe(true); // nested symlink preserved as a link
+    expect(readlinkSync(join(dir, 'sub', 'rel-link'))).toBe('file.txt');
   });
 });
