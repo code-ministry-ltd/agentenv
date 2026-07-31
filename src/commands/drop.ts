@@ -12,6 +12,7 @@ import {
 } from '../session/registry.js';
 import { parseHarnesses } from './activation.js';
 import { renderGlobalSkips } from './global-report.js';
+import { closeStoreSync, openStoreSync } from './store-sync.js';
 
 /**
  * `agentenv drop [<env>… | --all] [--harness <h>…] [--global]` — deactivate.
@@ -93,6 +94,12 @@ async function dropGlobal(
   // blocked by drift, and preserve mid-session edits to the store first.
   await driftSweep({ paths, adapters, env, onWarn: (m) => notices.push(m) });
 
+  // Git sync START (D9): commit the swept drift, pull, run the post-pull safeguards.
+  // Removal is manifest-driven and safe even on a quarantined pull, so drop proceeds
+  // regardless — the reconcile warning still surfaces a remotely-deleted active env.
+  const syncCtx = { paths, env, options };
+  await openStoreSync(syncCtx, notices, { alreadySwept: true });
+
   const result = await dematerialiseGlobal({
     paths,
     adapters,
@@ -104,6 +111,7 @@ async function dropGlobal(
   });
 
   notices.push(...renderGlobalSkips(result.skips));
+  await closeStoreSync(syncCtx, notices); // Git sync END (D9): one fail-soft push.
   const stderr = notices.length > 0 ? `${notices.join('\n')}\n` : undefined;
   const what = all ? 'the whole global stack' : `[${names.join(', ')}]`;
   return {
