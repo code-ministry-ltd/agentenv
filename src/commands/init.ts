@@ -1,0 +1,57 @@
+import { access, constants } from 'node:fs/promises';
+import { adapters as realAdapters } from '../adapters/index.js';
+import type { Command, RunResult } from '../command.js';
+import { emptyManifest, writeState } from '../state.js';
+import { generateShims } from '../session/shims.js';
+import { ensureStore } from '../store.js';
+
+/**
+ * `agentenv init` — one-time setup, safe to re-run (idempotent):
+ *
+ * 1. `ensureStore` — create `store/environments/` + the generated README.
+ * 2. Initialise `state.json` (the ownership manifest) if it does not exist —
+ *    an existing manifest is NEVER clobbered.
+ * 3. Install one PATH shim per registered adapter via `generateShims` (an empty
+ *    registry — Phase 1 — installs no shims, which is fine).
+ * 4. Print the shell hook line so the user can wire session mode into their rc.
+ */
+export const initCommand: Command = {
+  name: 'init',
+  usage: '',
+  summary: 'Create the store, manifest and shims; print the shell hook line',
+
+  async run({ paths, options }): Promise<RunResult> {
+    await ensureStore(paths);
+
+    // Initialise the manifest only when absent — re-running init must never
+    // discard existing ownership records.
+    if (!(await exists(paths.state))) {
+      await writeState(paths, emptyManifest());
+    }
+
+    const adapters = options.adapters ?? realAdapters;
+    const shims = await generateShims(paths, adapters);
+
+    const lines = [
+      'agentenv initialised.',
+      `  store:  ${paths.store}`,
+      `  state:  ${paths.state}`,
+      `  shims:  ${paths.shims}${shims.length === 0 ? ' (no adapters registered yet)' : ` (${shims.length})`}`,
+      '',
+      'Enable session mode by adding this line to your shell rc (.zshrc / .bashrc):',
+      '',
+      '  eval "$(agentenv shell-init)"',
+      '',
+    ];
+    return { stdout: `${lines.join('\n')}\n`, code: 0 };
+  },
+};
+
+async function exists(p: string): Promise<boolean> {
+  try {
+    await access(p, constants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}

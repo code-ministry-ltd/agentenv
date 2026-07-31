@@ -1,12 +1,16 @@
 import type { Command } from '../command.js';
 import { createCommand } from './create.js';
+import { dropCommand } from './drop.js';
 import { editCommand } from './edit.js';
+import { initCommand } from './init.js';
 import { listCommand } from './list.js';
 import { rmCommand } from './rm.js';
 import { runCommand } from './run.js';
 import { shellInitCommand } from './shell-init.js';
 import { shimCommand } from './shim.js';
 import { showCommand } from './show.js';
+import { statusCommand } from './status.js';
+import { useCommand } from './use.js';
 
 /**
  * The command registry: the single source of truth for which subcommands
@@ -14,11 +18,15 @@ import { showCommand } from './show.js';
  * entries. Each slice appends its command; order here is the display order.
  */
 export const commands: readonly Command[] = [
+  initCommand,
   createCommand,
   listCommand,
   showCommand,
   editCommand,
   rmCommand,
+  useCommand,
+  dropCommand,
+  statusCommand,
   runCommand,
   shellInitCommand,
   shimCommand,
