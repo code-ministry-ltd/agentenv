@@ -252,6 +252,30 @@ describe('sync --resolve: the guided conflict walkthrough (D9, "never auto-resol
     expect(await isConflictPending(paths)).toBe(false);
   });
 
+  it('re-running --resolve before resolving is a safe no-op — never commits conflict markers', async () => {
+    const th = gitHome();
+    const { paths } = await induceConflict(th);
+    const envFile = join(paths.environments, 'writing', 'env.yaml');
+
+    // Enter the conflict (no resolver) → rebase held, markers written to disk.
+    expect((await run(['sync', '--resolve'], { env: th.env })).code).toBe(1);
+    expect(readFileSync(envFile, 'utf8')).toContain('<<<<<<<');
+
+    // Re-run WITHOUT resolving: it must NOT stage+commit the marker-laden file. It
+    // stays pending and re-lists the file; the markers are still on disk.
+    const again = await run(['sync', '--resolve'], { env: th.env });
+    expect(again.code).toBe(1);
+    expect(again.stderr ?? '').toContain('environments/writing/env.yaml');
+    expect(await isConflictPending(paths)).toBe(true);
+    expect(readFileSync(envFile, 'utf8')).toContain('<<<<<<<');
+
+    // Now actually resolve → completes cleanly with no markers anywhere.
+    writeFileSync(envFile, ENV_MERGED, 'utf8');
+    expect((await run(['sync', '--resolve'], { env: th.env })).code).toBe(0);
+    expect(readFileSync(envFile, 'utf8')).toContain('merged-change');
+    expect(readFileSync(envFile, 'utf8')).not.toContain('<<<<<<<');
+  });
+
   it('with no resolver, the guided two-step (show files → edit on disk → re-run) completes', async () => {
     const th = gitHome();
     const { paths } = await induceConflict(th);

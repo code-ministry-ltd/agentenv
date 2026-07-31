@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
 import {
@@ -164,19 +165,16 @@ async function resolveSync(ctx: CommandContext): Promise<RunResult> {
     await writeConflictMarker(paths, pull.detail ?? 'store history diverged');
   }
 
-  const files = await listConflictedFiles(paths, env, options.gitRun);
-  const seam = options.resolveConflicts;
-
-  // Manual entry (no resolver, just entered this invocation): show the files and stop
-  // so the user can resolve on disk, then re-run `--resolve` to continue.
-  if (!seam && !wasInProgress) {
-    return manualPending(files, notices);
-  }
-
-  return driveResolution(ctx, notices, seam);
+  return driveResolution(ctx, notices, options.resolveConflicts);
 }
 
-/** Walk the held rebase to completion: resolve (via the seam or on-disk edits) + continue, then push. */
+/**
+ * Walk the held rebase to completion. The gate before every `git rebase --continue`
+ * is that the conflicted files carry NO leftover conflict markers — so agentenv only
+ * ever commits a genuinely-resolved tree, never a marker-laden one, whether the
+ * resolution came from the injected resolver or the user's on-disk edits. Re-running
+ * `--resolve` before resolving is therefore a safe no-op that just re-lists the files.
+ */
 async function driveResolution(
   ctx: CommandContext,
   notices: string[],
@@ -187,15 +185,34 @@ async function driveResolution(
 
   for (let step = 0; step < MAX_STEPS && (await rebaseInProgress(paths)); step++) {
     const files = await listConflictedFiles(paths, env, options.gitRun);
-    if (files.length > 0 && seam) {
-      const resolved = await seam(files);
-      if (!resolved) {
-        await abortRebase(paths, env, options.gitRun);
-        await clearConflictMarker(paths);
-        return withStderr(
-          { stdout: 'sync --resolve: cancelled — the rebase was aborted; your local store is unchanged.\n', code: 0 },
-          notices,
-        );
+
+    if (files.length > 0) {
+      if (seam) {
+        const resolved = await seam(files);
+        if (!resolved) {
+          await abortRebase(paths, env, options.gitRun);
+          await clearConflictMarker(paths);
+          return withStderr(
+            { stdout: 'sync --resolve: cancelled — the rebase was aborted; your local store is unchanged.\n', code: 0 },
+            notices,
+          );
+        }
+        // Guard: the resolver claimed done but left markers → never commit garbage.
+        const stillMarked = await filesStillMarked(files);
+        if (stillMarked.length > 0) {
+          await abortRebase(paths, env, options.gitRun);
+          await clearConflictMarker(paths);
+          return fail(
+            'sync --resolve: the resolver left unresolved conflict markers in:\n' +
+              `${stillMarked.map((p) => `  ${p}`).join('\n')}\n` +
+              'The rebase was aborted; your local store is unchanged.\n',
+          );
+        }
+      } else {
+        // No resolver: only continue once the human removed the markers on disk.
+        // Until then, list the still-conflicted files and stop (idempotent).
+        const stillMarked = await filesStillMarked(files);
+        if (stillMarked.length > 0) return manualPending(files, notices);
       }
     }
 
@@ -267,6 +284,27 @@ function manualPending(files: readonly ConflictedFile[], notices: readonly strin
       'continue, or `agentenv sync --abort` to cancel and keep your local version.\n',
     code: 1,
   };
+}
+
+/**
+ * Which of `files` still carry git conflict markers on disk (i.e. are NOT yet
+ * resolved). Requires BOTH a `<<<<<<<` and a `>>>>>>>` start/end marker at line
+ * start, so a Markdown `=======` heading underline in a legitimately-resolved store
+ * file is never mistaken for an unresolved conflict. Unreadable files are treated as
+ * resolved (nothing to gate on).
+ */
+async function filesStillMarked(files: readonly ConflictedFile[]): Promise<string[]> {
+  const marked: string[] = [];
+  for (const f of files) {
+    let text: string;
+    try {
+      text = await readFile(f.absPath, 'utf8');
+    } catch {
+      continue;
+    }
+    if (/^<{7}[ \t]/m.test(text) && /^>{7}[ \t]/m.test(text)) marked.push(f.path);
+  }
+  return marked;
 }
 
 /** First non-empty trimmed line — compact diagnostics without leaking a multi-line dump. */
