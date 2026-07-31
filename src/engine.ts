@@ -30,7 +30,7 @@ import {
 import { beginTransaction, recoverState } from './journal.js';
 import { withLock } from './lock.js';
 import type { Paths } from './paths.js';
-import { readState, writeState, type ManifestItem, type StateManifest } from './state.js';
+import { findOwner, readState, writeState, type ManifestItem, type StateManifest } from './state.js';
 
 /**
  * The GLOBAL-mode engine (design D4/D5/D7). `agentenv use … --global` materialises
@@ -429,6 +429,134 @@ async function materialiseConfigKeys(
     }
     return applied;
   });
+}
+
+// ---------------------------------------------------------------------------
+// describe (status) — READ-ONLY view of the global stack + per-surface support
+// ---------------------------------------------------------------------------
+
+/** Per-surface support + ownership, for `status` (never pretends unsupported works, D6). */
+export interface SurfaceStatus {
+  surfaceId: string;
+  mechanism: 'dir-merge' | 'file-block' | 'config-keys';
+  supported: boolean;
+  unsupportedReason?: string;
+  /** Items in the manifest owned by the active global stack for this surface. */
+  ownedItems: number;
+}
+
+/** Per-adapter global status. */
+export interface AdapterStatus {
+  adapterId: string;
+  surfaces: SurfaceStatus[];
+  /** Shadowing / user-collision skips the active global stack would incur (D7). */
+  skips: GlobalSkip[];
+}
+
+/** The read-only global picture `status` renders. */
+export interface GlobalStatus {
+  stack: string[];
+  adapters: AdapterStatus[];
+}
+
+/**
+ * Compute a READ-ONLY description of global mode for `status`: the active stack,
+ * each adapter's per-surface support + owned-item count, and the shadowing /
+ * user-collision skips the stack incurs. Mutates nothing.
+ */
+export async function describeGlobal(req: {
+  paths: Paths;
+  adapters: readonly Adapter[];
+  env: NodeJS.ProcessEnv;
+}): Promise<GlobalStatus> {
+  const { paths, adapters, env } = req;
+  const manifest = await readState(paths);
+  const stack = readGlobalStack(manifest);
+
+  const out: AdapterStatus[] = [];
+  for (const adapter of adapters) {
+    const realRoot = adapter.realConfigRoot(env);
+    const surfaces: SurfaceStatus[] = [];
+    const skips: GlobalSkip[] = [];
+    for (const surface of adapter.surfaces) {
+      surfaces.push({
+        surfaceId: surface.id,
+        mechanism: surface.mechanism,
+        supported: surface.supported,
+        ...(surface.unsupportedReason ? { unsupportedReason: surface.unsupportedReason } : {}),
+        ownedItems: countOwned(manifest, surface, realRoot, stack),
+      });
+      if (!surface.supported) {
+        skips.push({
+          adapterId: adapter.id,
+          surfaceId: surface.id,
+          reason: 'unsupported',
+          detail: surface.unsupportedReason ?? `${adapter.id} does not support '${surface.id}'`,
+        });
+        continue;
+      }
+      if (stack.length > 0 && surface.mechanism === 'dir-merge') {
+        skips.push(...(await dirMergeStatusSkips(paths, adapter, surface, realRoot, stack, manifest)));
+      }
+    }
+    out.push({ adapterId: adapter.id, surfaces, skips });
+  }
+  return { stack, adapters: out };
+}
+
+/** Count manifest items owned by the stack that live under one surface's target. */
+function countOwned(
+  manifest: StateManifest,
+  surface: DirMergeSurface | FileBlockSurface | ConfigKeysSurface,
+  realRoot: string,
+  stack: readonly string[],
+): number {
+  const target = join(realRoot, surface.rootRelativePath);
+  return manifest.items.filter((i) => {
+    if (!stack.includes(i.ownerEnv)) return false;
+    if (surface.mechanism === 'dir-merge') return i.path.startsWith(target + sep);
+    return i.path === target;
+  }).length;
+}
+
+/** Re-derive the shadowing / user-collision skips a dir-merge surface incurs (read-only). */
+async function dirMergeStatusSkips(
+  paths: Paths,
+  adapter: Adapter,
+  surface: DirMergeSurface,
+  realRoot: string,
+  stack: readonly string[],
+  manifest: StateManifest,
+): Promise<GlobalSkip[]> {
+  const targetDir = join(realRoot, surface.rootRelativePath);
+  const claimed = new Set<string>();
+  const skips: GlobalSkip[] = [];
+  for (const env of [...stack].reverse()) {
+    const storeDir = join(paths.envDir(env), surface.storeKind);
+    for (const name of await listNames(storeDir)) {
+      const targetPath = join(targetDir, name);
+      if (claimed.has(name)) {
+        skips.push({
+          adapterId: adapter.id,
+          surfaceId: surface.id,
+          reason: 'shadowed',
+          detail: `'${name}' from env '${env}' shadowed by a higher-precedence item in ${surface.id}`,
+        });
+        continue;
+      }
+      claimed.add(name);
+      const owner = findOwner(manifest, targetPath);
+      if ((await lexists(targetPath)) && (!owner || !stack.includes(owner.ownerEnv))) {
+        skips.push({
+          adapterId: adapter.id,
+          surfaceId: surface.id,
+          reason: 'user-collision',
+          detail: `'${name}' from env '${env}' skipped — a non-agentenv item already exists`,
+        });
+      }
+    }
+  }
+  return skips;
 }
 
 // ---------------------------------------------------------------------------
