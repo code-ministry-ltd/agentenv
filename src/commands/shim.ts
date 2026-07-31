@@ -2,6 +2,7 @@ import { resolveAdapter } from '../adapter.js';
 import { adapters as realAdapters } from '../adapters/index.js';
 import type { Command, RunOptions, RunResult } from '../command.js';
 import type { Paths } from '../paths.js';
+import { confirmDefault } from '../prompt.js';
 import { defaultExecHarness } from '../session/exec.js';
 import { launchHarness, type LaunchResult } from '../session/launch.js';
 import { resolveProjectRoot, resolveSessionBinding } from '../session/registry.js';
@@ -44,10 +45,23 @@ export const shimCommand: Command = {
     let envs: string[] | null = null;
     try {
       const projectRoot = await resolveProjectRoot(cwd);
-      const resolved = await resolveSessionBinding({ paths, session, projectRoot, env });
+      // A `.agentenv` default (D16) needs a one-time approval to apply. The seam
+      // is the shared confirm prompt (real TTY → asks; non-TTY/pipe/agent →
+      // declines), so an unapproved file is skipped, never auto-approved.
+      const approve = async (req: { file: string; envs: string[] }): Promise<boolean> => {
+        const confirm = options.confirm ?? confirmDefault;
+        return confirm(
+          `agentenv: apply this project's .agentenv default [${req.envs.join(', ')}] (from ${req.file})? ` +
+            'One-time approval for this folder. [y/N] ',
+        );
+      };
+      const resolved = await resolveSessionBinding({ paths, session, projectRoot, env, approve, now: options.now });
       if (resolved.note) notices.push(`agentenv: ${resolved.note}`);
       const b = resolved.binding;
-      if (resolved.source === 'explicit' && b && !b.global && appliesToHarness(b.harnesses, adapter)) {
+      // An explicit `use` binding OR an approved `.agentenv` both compose a view.
+      // Neither is global, both run the same missing-env validation below.
+      const bindable = resolved.source === 'explicit' || resolved.source === 'agentenv-file';
+      if (bindable && b && !b.global && appliesToHarness(b.harnesses, adapter)) {
         // Validate the bound envs — one may have been `rm`'d since the binding was
         // written. Drop a missing env with a notice naming it (D16); if none
         // survive, launch unbound rather than silently composing an empty view.
