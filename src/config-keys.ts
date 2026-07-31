@@ -526,6 +526,11 @@ async function removeArrayElement(
       note: `array ${displayPath(item.keyPath)} absent in ${item.path} — nothing to remove`,
     };
   }
+  // NOTE (B3): this filters out EVERY entry equal to our value, so if the user
+  // independently added an identical value we over-remove theirs too. Ownership is
+  // by exact value with no per-entry marker, so the duplicates are indistinguishable;
+  // accepted for the D3 array-element surface (identical-value collisions are rare
+  // and the value is one we injected). No behaviour change.
   const filtered = (arr as JsonValue[]).filter(
     (v) => stableStringify(v) !== stableStringify(item.value),
   );
