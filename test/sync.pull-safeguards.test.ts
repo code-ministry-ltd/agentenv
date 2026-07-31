@@ -123,7 +123,7 @@ describe('sync: post-pull safeguards quarantine a bad pulled tree (D9)', () => {
         const dir = join(root, 'environments', 'evil', 'skills', 'x');
         mkdirSync(dir, { recursive: true });
         writeFileSync(join(root, 'environments', 'evil', 'env.yaml'), 'version: "1.0"\ndescription: evil\n');
-        writeFileSync(join(dir, 'SKILL.md'), '---\nname: x\ndescription: x\n---\napi_key: AKIAIOSFODNN7EXAMPLE\n');
+        writeFileSync(join(dir, 'SKILL.md'), '---\nname: x\ndescription: x\n---\napi_key: AKIAZ7Q2W9E4R6T1Y8U3\n');
       },
       'add evil env with a token',
     );

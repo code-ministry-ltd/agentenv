@@ -292,6 +292,21 @@ const SECRET_KEY_RE =
 const PLACEHOLDER_RE = /\$\{[^}]+\}|\{env:[^}]+\}|^\$[A-Za-z_]|<[^>]+>/;
 const FIXTURE_WORD_RE =
   /\b(?:example|sample|dummy|changeme|change-me|placeholder|redacted|your[_-]?|todo|xxxx+|test[_-]?token|fake)\b/i;
+/**
+ * The same fixture markers WITHOUT word boundaries — for matching a marker embedded
+ * INSIDE a token, which is how providers publish documentation keys (AWS's public
+ * `AKIAIOSFODNN7EXAMPLE` / `…EXAMPLEKEY`). Applied only to a matched token (never a
+ * whole line), so it exempts a documented example without weakening a real token.
+ */
+const FIXTURE_MARKER_IN_TOKEN_RE =
+  /example|sample|dummy|changeme|placeholder|redacted|xxxx+|faketoken/i;
+/**
+ * A scoped, inline opt-out (D6): mark a legitimately token-shaped line — the store
+ * is designed to hold vendored + security skills that legitimately contain
+ * token-shaped strings — so a documented token is not an unrecoverable wedge. The
+ * scan blocks loudly by DEFAULT; this marker is the deliberate, per-line override.
+ */
+const ALLOW_SECRET_RE = /agentenv:allow-secret/i;
 
 /**
  * Scan one text for suspected secrets, returning a finding per offending line.
@@ -307,10 +322,25 @@ export function scanTextForSecrets(text: string): { line: number; reason: string
   const lines = text.split('\n');
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] ?? '';
+    // Scoped override (D6): an `agentenv:allow-secret` marker on the line — or the
+    // line immediately above — exempts a legitimately token-shaped line, so a
+    // vendored/security skill is never an unrecoverable wedge.
+    if (ALLOW_SECRET_RE.test(line) || ALLOW_SECRET_RE.test(lines[i - 1] ?? '')) continue;
     let matched = false;
     for (const { re, reason } of TOKEN_PATTERNS) {
-      if (re.test(line)) {
-        out.push({ line: i + 1, reason });
+      const m = re.exec(line);
+      if (m) {
+        // A documented example / placeholder / ${VAR} is never a real secret (D6).
+        // The exemption now covers the token-shape rule too (not just the value rule
+        // below): a `${VAR}`/`<...>` placeholder, a fixture WORD on the line (a
+        // comment marker), or a fixture marker embedded IN the matched token (AWS's
+        // public `AKIAIOSFODNN7EXAMPLE`) exempts it — while a REAL token on an
+        // unmarked line still trips.
+        const exempt =
+          PLACEHOLDER_RE.test(line) ||
+          FIXTURE_WORD_RE.test(line) ||
+          FIXTURE_MARKER_IN_TOKEN_RE.test(m[0]);
+        if (!exempt) out.push({ line: i + 1, reason });
         matched = true;
         break;
       }
@@ -372,6 +402,37 @@ export async function scanStoreForSecrets(paths: Paths): Promise<SecretFinding[]
     }
   };
   await walk(paths.store);
+  findings.sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line);
+  return findings;
+}
+
+/**
+ * Scan only the STAGED changes for secrets (D6/D9) — the files THIS commit would
+ * write, not the whole working tree. So a pre-existing, unrelated flagged file can
+ * never block an unrelated commit (it is not in the staged diff), and the gate
+ * inspects exactly what is being committed. Runs after `git add -A`, so the working
+ * tree of each changed path equals its staged blob. Deletions/binaries are skipped.
+ *
+ * The untrusted post-pull path deliberately stays a WHOLE-tree scan (see {@link
+ * validatePulledStore} / {@link scanStoreForSecrets}) — a pulled remote tree is
+ * shared input, so every file of it is suspect.
+ */
+async function scanStagedForSecrets(ctx: GitContext, paths: Paths): Promise<SecretFinding[]> {
+  const listed = await git(ctx, ['diff', '--cached', '--name-only', '-z']);
+  const names = listed.stdout.split('\0').filter((n) => n !== '');
+  const findings: SecretFinding[] = [];
+  for (const rel of names) {
+    if (!isProbablyText(rel)) continue;
+    let text: string;
+    try {
+      text = await readFile(join(paths.store, ...rel.split('/')), 'utf8');
+    } catch {
+      continue; // a staged deletion / unreadable / binary — nothing to scan
+    }
+    for (const hit of scanTextForSecrets(text)) {
+      findings.push({ file: rel, line: hit.line, reason: hit.reason });
+    }
+  }
   findings.sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line);
   return findings;
 }
@@ -503,9 +564,12 @@ export interface CommitResult {
 
 /**
  * Stage everything in the store and commit it under `message`, after a pre-commit
- * secret scan (D6/D9). A clean tree is a `nothing` no-op. A secret in the tree
- * BLOCKS the commit (findings returned, staging reset) rather than writing a leak
- * into history. No-op (`no-repo`) when the store is not a git repo.
+ * secret scan of the STAGED DIFF (D6/D9). A clean tree is a `nothing` no-op. A
+ * secret in what is being committed BLOCKS the commit (findings returned, staging
+ * reset) rather than writing a leak into history — but a pre-existing, unrelated
+ * flagged file elsewhere in the tree never blocks an unrelated commit, and a
+ * documented example / `agentenv:allow-secret`-marked line is exempt. No-op
+ * (`no-repo`) when the store is not a git repo.
  */
 export async function commitStore(
   paths: Paths,
@@ -520,7 +584,7 @@ export async function commitStore(
   const staged = await git(ctx, ['diff', '--cached', '--name-only']);
   if (staged.stdout.trim() === '') return { status: 'nothing' };
 
-  const findings = await scanStoreForSecrets(paths);
+  const findings = await scanStagedForSecrets(ctx, paths);
   if (findings.length > 0) {
     await git(ctx, ['reset']); // unstage — never leave a secret staged
     return { status: 'blocked', findings };

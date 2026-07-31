@@ -97,7 +97,9 @@ describe('sync: URL handling never leaks credentials', () => {
 
 describe('sync: secret scan (D6/D9)', () => {
   it('flags known token shapes', () => {
-    expect(scanTextForSecrets('AWS_KEY=AKIAIOSFODNN7EXAMPLE').length).toBe(1);
+    // A real-SHAPED AWS key with no example marker (AKIAIOSFODNN7EXAMPLE is AWS's
+    // public docs key and is now exempt — see the F2 secret-scan tests).
+    expect(scanTextForSecrets('AWS_KEY=AKIAZ7Q2W9E4R6T1Y8U3').length).toBe(1);
     expect(scanTextForSecrets('token: ghp_' + 'a'.repeat(36)).length).toBe(1);
     expect(scanTextForSecrets('-----BEGIN OPENSSH PRIVATE KEY-----').length).toBe(1);
   });

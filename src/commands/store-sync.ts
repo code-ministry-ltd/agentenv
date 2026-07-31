@@ -31,7 +31,8 @@ export function noteBlockedCommit(result: CommitResult, notices: string[]): void
     notices.push(
       'agentenv: NOT committed — a suspected secret would be written to the synced store:\n' +
         `${describeFindings(result.findings ?? [])}\n` +
-        'Replace it with a ${VAR} placeholder (values live in ~/.agentenv/secrets.env), then re-run.',
+        'Replace it with a ${VAR} placeholder (values live in ~/.agentenv/secrets.env), then re-run. ' +
+        'If it is a documented example (not a real secret), mark the line `agentenv:allow-secret`.',
     );
   }
 }

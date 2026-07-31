@@ -104,8 +104,10 @@ describe('sync: pre-commit secret scan BLOCKS a leak (D6/D9)', () => {
     await run(['create', 'writing'], { env: th.env });
     const headBefore = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: paths.store, encoding: 'utf8' }).trim();
 
-    // Simulate an editor baking a real token into a store file.
-    writeFileSync(join(paths.envDir('writing'), 'leaked.txt'), 'api_key: AKIAIOSFODNN7EXAMPLE\n');
+    // Simulate an editor baking a real token into a store file. Use a real-SHAPED
+    // key (not AWS's public AKIAIOSFODNN7EXAMPLE, which is a documented example and
+    // is exempt — see the F2 secret-scan tests).
+    writeFileSync(join(paths.envDir('writing'), 'leaked.txt'), 'api_key: AKIAZ7Q2W9E4R6T1Y8U3\n');
     const result = await commitStore(paths, th.env, 'agentenv: should be blocked');
     expect(result.status).toBe('blocked');
     expect(result.findings?.length).toBeGreaterThan(0);

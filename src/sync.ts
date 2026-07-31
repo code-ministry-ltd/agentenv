@@ -89,7 +89,8 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
       onNotice(
         'agentenv: BLOCKED committing store drift — a suspected secret is present:\n' +
           `${describeFindings(drift.findings ?? [])}\n` +
-          'Remove the secret (use a ${VAR} placeholder) so the drift can be committed.',
+          'Remove the secret (use a ${VAR} placeholder) so the drift can be committed. ' +
+          'If it is a documented example, mark the line `agentenv:allow-secret`.',
       );
     }
 
