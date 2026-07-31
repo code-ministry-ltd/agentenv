@@ -62,4 +62,23 @@ describe('session adapter contract', () => {
   it('the real adapter registry is empty in Phase 1 (real adapters are 1.8 / 4.x)', () => {
     expect(realAdapters).toEqual([]);
   });
+
+  it('M5: validateConfigFile is an OPTIONAL whole-file hook adapters need not implement', () => {
+    const a = makeFixtureAdapter();
+    expect(a.validateConfigFile).toBeUndefined(); // not implemented → still valid
+    expect(validateAdapter(a)).toBeNull();
+
+    // An adapter MAY provide it; the frozen shape is (absPath, content) => SelfCheckResult.
+    const withHook: Adapter = {
+      ...a,
+      validateConfigFile: (absPath, content) =>
+        content.includes('BAD') ? { ok: false, detail: `${absPath} rejected` } : { ok: true },
+    };
+    expect(validateAdapter(withHook)).toBeNull();
+    expect(withHook.validateConfigFile!('/x/mcp.json', '{ "ok": true }')).toEqual({ ok: true });
+    expect(withHook.validateConfigFile!('/x/mcp.json', 'BAD')).toEqual({
+      ok: false,
+      detail: '/x/mcp.json rejected',
+    });
+  });
 });

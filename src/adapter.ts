@@ -312,6 +312,20 @@ export interface Adapter {
    * shim execs with no overrides plus a notice — never a half-applied view.
    */
   selfCheck(viewRoot: string, ctx: SelfCheckContext): Promise<SelfCheckResult>;
+
+  // — whole-file config validation (global mode, M5) —
+
+  /**
+   * OPTIONAL post-write validation of a whole config file the composer produced,
+   * for a harness whose CLI rejects the ENTIRE file on one bad entry — Cursor
+   * rejects all of `~/.cursor/mcp.json` if any single server entry is malformed
+   * (4.4). Applied in GLOBAL mode (Task 1.7 / 4.x) after a config-keys file is
+   * written: a `{ ok: false }` result rolls the write back rather than shipping a
+   * file the harness will reject wholesale. Declared now to avoid re-freezing the
+   * contract later; OPTIONAL, so session mode and harnesses with per-entry
+   * tolerance need not implement it.
+   */
+  validateConfigFile?(absPath: string, content: string): SelfCheckResult;
 }
 
 /** The `<harness>` token for per-harness store files (defaults to the id). */
