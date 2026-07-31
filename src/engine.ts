@@ -1,4 +1,4 @@
-import { lstat, readdir } from 'node:fs/promises';
+import { lstat, readdir, readFile } from 'node:fs/promises';
 import { join, sep } from 'node:path';
 import {
   storeToken,
@@ -65,11 +65,19 @@ export interface GlobalSkip {
   surfaceId: string;
   /**
    * `unsupported` (adapter says so), `shadowed` (a later env or a user item won),
-   * `user-collision` (a non-owned real item/key won), `compile-error`, or
+   * `user-collision` (a non-owned real item/key won), `compile-error`,
    * `secret-unresolved` (a substitute-rung `${VAR}` resolved to nothing → the server
-   * is skipped, fail-closed per server, D6).
+   * is skipped, fail-closed per server, D6), or `validation-failed` (the written
+   * config-keys file was rejected wholesale by `adapter.validateConfigFile`, so the
+   * whole surface's write was rolled back — fail-closed, F2/M5).
    */
-  reason: 'unsupported' | 'shadowed' | 'user-collision' | 'compile-error' | 'secret-unresolved';
+  reason:
+    | 'unsupported'
+    | 'shadowed'
+    | 'user-collision'
+    | 'compile-error'
+    | 'secret-unresolved'
+    | 'validation-failed';
   detail: string;
 }
 
@@ -376,6 +384,7 @@ async function materialiseConfigKeys(
   const { paths, adapters, envs, env } = req;
 
   interface Planned {
+    adapter: Adapter;
     adapterId: string;
     surface: ConfigKeysSurface;
     file: string;
@@ -420,7 +429,7 @@ async function materialiseConfigKeys(
             }
             claimedKeys.add(k);
           }
-          planned.push({ adapterId: adapter.id, surface, file, env: envName, injection });
+          planned.push({ adapter, adapterId: adapter.id, surface, file, env: envName, injection });
         }
       }
     }
@@ -433,6 +442,18 @@ async function materialiseConfigKeys(
   // resolved to a LITERAL in the real config here, while the manifest keeps the
   // placeholder (below) so drift write-back never carries the literal to the store.
   const resolver = await loadResolver(paths, env);
+
+  // Per-file record of what THIS invocation injected, so a whole-file rejection
+  // (F2/M5) can roll back exactly this surface's write (see validateWrittenConfigFiles).
+  const written = new Map<string, WrittenConfigFile>();
+  const recordWrite = (p: Planned, item: ConfigKeysItem): void => {
+    let w = written.get(p.file);
+    if (!w) {
+      w = { adapter: p.adapter, items: [] };
+      written.set(p.file, w);
+    }
+    w.items.push({ item, surfaceId: p.surface.id, env: p.env });
+  };
 
   return withLock(paths, async () => {
     const tx = await beginTransaction(paths);
@@ -458,7 +479,7 @@ async function materialiseConfigKeys(
             continue;
           }
           try {
-            await injectKeyed(paths, tx, {
+            const item = await injectKeyed(paths, tx, {
               file: p.file,
               format: p.surface.format,
               keyPath: p.injection.keyPath,
@@ -468,6 +489,7 @@ async function materialiseConfigKeys(
               // placeholder regardless of rung, so write-back restores `${VAR}` (D6).
               ...(p.injection.secretFields ? { secretFields: p.injection.secretFields } : {}),
             });
+            recordWrite(p, item);
             applied += 1;
           } catch (err) {
             if (err instanceof ConfigKeysError) {
@@ -484,13 +506,14 @@ async function materialiseConfigKeys(
           }
         } else {
           try {
-            await injectArrayElement(paths, tx, {
+            const item = await injectArrayElement(paths, tx, {
               file: p.file,
               format: p.surface.format,
               arrayPath: p.injection.arrayPath,
               value: p.injection.value,
               ownerEnv: p.env,
             });
+            recordWrite(p, item);
             applied += 1;
           } catch (err) {
             // Same skip-and-warn boundary as the keyed branch above (D7): a user's
@@ -517,8 +540,86 @@ async function materialiseConfigKeys(
       await tx.rollback();
       throw err;
     }
+    // F2/M5: after the batch commits, validate every written config-keys file whose
+    // adapter defines `validateConfigFile` (Cursor's whole-file `mcp.json` check). A
+    // rejected file has THIS invocation's write to it rolled back (fail-closed) so a
+    // bad injection never leaves a whole-file-rejecting config on the user's disk.
+    applied -= await validateWrittenConfigFiles(paths, written, skips, onWarn);
     return applied;
   });
+}
+
+/** What THIS invocation injected into one config-keys file (for whole-file rollback). */
+interface WrittenConfigFile {
+  adapter: Adapter;
+  items: { item: ConfigKeysItem; surfaceId: string; env: string }[];
+}
+
+/** Read a file's text, treating a missing file as empty. */
+async function readFileOrEmpty(file: string): Promise<string> {
+  try {
+    return await readFile(file, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return '';
+    throw err;
+  }
+}
+
+/**
+ * Post-write whole-file validation for config-keys surfaces (F2/M5). For each written
+ * file whose adapter defines {@link Adapter.validateConfigFile}, read the committed file
+ * and validate it; on `{ok:false}` remove EVERY key/element this invocation added to that
+ * file (inject→remove is byte-identical, D3), restoring the user's real config unchanged,
+ * and record a `validation-failed` skip per losing surface. Runs under the caller's lock
+ * (a fresh transaction per rolled-back file). Returns how many items were rolled back, so
+ * the caller can discount them from `applied`. Never throws for a rejection — fail-closed
+ * is the whole point; only an fs/tx fault propagates.
+ */
+async function validateWrittenConfigFiles(
+  paths: Paths,
+  written: Map<string, WrittenConfigFile>,
+  skips: GlobalSkip[],
+  onWarn: (m: string) => void,
+): Promise<number> {
+  let rolledBack = 0;
+  for (const [file, { adapter, items }] of written) {
+    if (!adapter.validateConfigFile || items.length === 0) continue;
+    const content = await readFileOrEmpty(file);
+    const verdict = adapter.validateConfigFile(file, content);
+    if (verdict.ok) continue;
+
+    // Fail-closed: undo this invocation's contribution to the rejected file. Each
+    // removeKey matches the value we just wrote (hash agrees) and prunes any parents
+    // the inject created, so the file returns to its pre-injection bytes.
+    const tx = await beginTransaction(paths);
+    try {
+      for (const { item } of items) await removeKey(paths, tx, item);
+      await tx.commit();
+    } catch (err) {
+      await tx.rollback();
+      throw err;
+    }
+    rolledBack += items.length;
+
+    const detail =
+      verdict.detail ??
+      `${file}: rejected by ${adapter.id} whole-file validation — write rolled back`;
+    onWarn(`agentenv: ${detail}`);
+    // One skip per distinct (surface, env) so every env whose server was dropped is named.
+    const seen = new Set<string>();
+    for (const { surfaceId, env } of items) {
+      const k = JSON.stringify([surfaceId, env]);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      skips.push({
+        adapterId: adapter.id,
+        surfaceId,
+        reason: 'validation-failed',
+        detail: `env '${env}': ${detail}`,
+      });
+    }
+  }
+  return rolledBack;
 }
 
 // ---------------------------------------------------------------------------
