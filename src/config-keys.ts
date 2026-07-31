@@ -191,14 +191,26 @@ function displayPath(path: KeyPath): string {
     .join('');
 }
 
-/** The intra-file `key` discriminator for a keyed ownership record (see {@link ManifestItemBase.key}). */
+/**
+ * The intra-file `key` discriminator for a keyed ownership record (see {@link
+ * ManifestItemBase.key}). Unlike {@link displayPath} (human-readable), this is an
+ * IDENTITY, so it must be injective: literal dots (and backslashes) inside a string
+ * segment are escaped, so `['a.b','c']` and `['a','b','c']` map to distinct keys
+ * rather than both to `"a.b.c"` (fix C2). Segments with no dot render unchanged.
+ */
 function keyedDiscriminator(keyPath: KeyPath): string {
-  return displayPath(keyPath);
+  return keyPath
+    .map((seg, i) => {
+      if (typeof seg === 'number') return `[${seg}]`;
+      const escaped = seg.replace(/\\/g, '\\\\').replace(/\./g, '\\.');
+      return i === 0 ? escaped : `.${escaped}`;
+    })
+    .join('');
 }
 
 /** The intra-file `key` discriminator for an array-element record: array path + exact value. */
 function arrayElementDiscriminator(arrayPath: KeyPath, value: JsonValue): string {
-  return `${displayPath(arrayPath)}[]=${stableStringify(value)}`;
+  return `${keyedDiscriminator(arrayPath)}[]=${stableStringify(value)}`;
 }
 
 /** Deterministic stringification with object keys sorted — so key *reordering* is not drift. */
@@ -643,9 +655,37 @@ function restoreSecrets(value: JsonValue, secretFields?: Record<string, string>)
   if (!secretFields || Object.keys(secretFields).length === 0) return value;
   const clone = structuredClone(value);
   for (const [dotted, placeholder] of Object.entries(secretFields)) {
-    setAtDottedPath(clone, dotted.split('.'), placeholder);
+    setAtDottedPath(clone, splitDotted(dotted), placeholder);
   }
   return clone;
+}
+
+/**
+ * Split a dotted secret-field path into segments on UNescaped dots, unescaping
+ * `\.` → `.` and `\\` → `\` — symmetric with {@link keyedDiscriminator}'s escaping,
+ * so a real key name containing a dot can be addressed as `\.` without being split
+ * into two segments (fix C2).
+ */
+function splitDotted(dotted: string): string[] {
+  const segments: string[] = [];
+  let current = '';
+  let escaped = false;
+  for (const ch of dotted) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+    } else if (ch === '\\') {
+      escaped = true;
+    } else if (ch === '.') {
+      segments.push(current);
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  if (escaped) current += '\\'; // a trailing lone backslash is kept literal
+  segments.push(current);
+  return segments;
 }
 
 /** Set `leaf` at a dotted subpath within an object value; a missing segment is a no-op. */

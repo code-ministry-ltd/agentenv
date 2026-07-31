@@ -211,6 +211,26 @@ describe('config-keys', () => {
       // The user's pre-existing empty object survives — we only prune what we made.
       expect(readFileSync(f, 'utf8')).toBe(original);
     });
+
+    // C2 (NIT): the key discriminator joined segments with "." unescaped, so
+    // ['a.b','c'] and ['a','b','c'] both rendered "a.b.c" — one manifest identity
+    // for two DISTINCT key paths, so the second silently clobbered the first.
+    it('gives distinct key paths distinct ownership identities (no discriminator aliasing)', async () => {
+      const p = paths();
+      const f = file('claude.json');
+      writeFileSync(f, '{}\n');
+
+      const dotted = await inTx(p, (tx) =>
+        injectKeyed(p, tx, { file: f, format: 'json', keyPath: ['a.b', 'c'], value: 1, ownerEnv: 'w' }),
+      );
+      const nested = await inTx(p, (tx) =>
+        injectKeyed(p, tx, { file: f, format: 'json', keyPath: ['a', 'b', 'c'], value: 2, ownerEnv: 'w' }),
+      );
+
+      expect(dotted.key).not.toBe(nested.key); // distinct discriminators
+      const owners = findOwners(await readState(p), f);
+      expect(owners).toHaveLength(2); // both tracked — neither clobbered the other
+    });
   });
 
   describe('config-keys drift + syncBack write-back', () => {
