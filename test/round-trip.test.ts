@@ -12,11 +12,14 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
+import { parse as parseJsonc } from 'jsonc-parser';
 import { afterEach, describe, expect, it } from 'vitest';
 import { claudeAdapter } from '../src/adapters/claude.js';
+import { run } from '../src/cli.js';
 import { resolvePaths } from '../src/paths.js';
 import { composeView } from '../src/session/composer.js';
 import { clearSession, setBinding } from '../src/session/registry.js';
+import { readState } from '../src/state.js';
 
 /**
  * Task 1.11 — the flagship round-trip e2e pair (spec success criterion 1), and
@@ -311,5 +314,90 @@ describe('round-trip integrity (spec criterion 1) — session variant', () => {
     expect(readlinkSync(foreignLink)).toBe(foreignTarget);
     // The strict guarantee: byte-identical outside ~/.agentenv/ at session end.
     expect(hashTree(h.home, exclude)).toBe(step0);
+  });
+});
+
+describe('round-trip integrity (spec criterion 1) — global variant', () => {
+  it('use --global then drop --global --all restores the lived-in home byte-for-byte', async () => {
+    const h = home();
+    const paths = resolvePaths(h.env);
+    seedLivedInClaude(h);
+    const envDir = paths.envDir('writing');
+    seedWritingEnv(envDir);
+
+    const exclude = new Set([paths.base]);
+    const step0 = hashTree(h.home, exclude);
+    const foreignLink = join(h.claudeHome, 'skills', 'vendor-linked');
+    const foreignTarget = readlinkSync(foreignLink);
+
+    const opts = { env: h.env, adapters: [claudeAdapter] };
+
+    // --- use writing --global: materialise skills/agents/commands/rules symlinks
+    //     + .claude.json mcpServers onto the REAL fixture home. ---
+    const used = await run(['use', 'writing', '--global'], opts);
+    expect(used.code).toBe(0);
+    expect(hashTree(h.home, exclude)).not.toBe(step0); // something DID change
+
+    // The env's unique items are symlinked in beside the user's, pointing at the store.
+    for (const [dir, name, storeSub] of [
+      ['skills', 'draft-helper', 'skills'],
+      ['agents', 'draft-agent.md', 'agents'],
+      ['commands', 'draft-cmd.md', 'commands'],
+      ['rules', 'writing-rules.md', 'instructions'], // instructions → rules/ symlink (D2)
+    ] as const) {
+      const link = join(h.claudeHome, dir, name);
+      expect(lstatSync(link).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(link)).toBe(join(envDir, storeSub, name));
+    }
+
+    // The name-colliding env skill is SKIPPED — the user's real skill is untouched,
+    // and no env symlink was placed over it.
+    expect(readFileSync(join(h.claudeHome, 'skills', 'shared-skill', 'SKILL.md'), 'utf8')).toBe(
+      '# the USER shared skill\n',
+    );
+    expect(lstatSync(join(h.claudeHome, 'skills', 'shared-skill')).isSymbolicLink()).toBe(false);
+    // The foreign-manager symlink is untouched (target unchanged).
+    expect(readlinkSync(foreignLink)).toBe(foreignTarget);
+    // CLAUDE.md (never a global surface for Claude) is untouched.
+    expect(readFileSync(join(h.claudeHome, 'CLAUDE.md'), 'utf8')).toBe(
+      '# My CLAUDE.md\n\nRemember to be concise.\n',
+    );
+
+    // config-keys: linear injected beside context7 (shaped, ${VAR}-passthrough header);
+    // the user's onboarding/state keys survive. Read as JSONC — the surgical inject
+    // preserved the file's leading comment, so plain JSON.parse would (correctly) choke.
+    const cfg = parseJsonc(readFileSync(join(h.claudeHome, '.claude.json'), 'utf8'));
+    expect(Object.keys(cfg.mcpServers).sort()).toEqual(['context7', 'linear']);
+    expect(cfg.mcpServers.linear).toEqual({
+      type: 'http',
+      url: 'https://mcp.linear.app/mcp',
+      headers: { Authorization: 'Bearer ${LINEAR_TOKEN}' },
+    });
+    expect(cfg.hasCompletedOnboarding).toBe(true);
+    expect(cfg.numStartups).toBe(42);
+    // bucket-1 credentials never touched by global mode.
+    expect(readFileSync(join(h.claudeHome, '.credentials.json'), 'utf8')).toBe(
+      '{"claudeAiOauth":{"accessToken":"tok"}}\n',
+    );
+
+    // The manifest owns items across all three mechanisms for the writing env.
+    const manifest = await readState(paths);
+    expect(manifest.globalStack).toEqual(['writing']);
+    expect(manifest.items.some((i) => i.surface === 'dir-merge')).toBe(true);
+    expect(
+      manifest.items.some((i) => i.surface === 'config-keys' && i.ownerEnv === 'writing'),
+    ).toBe(true);
+
+    // --- drop --global --all: dematerialise everything from the MANIFEST. ---
+    const dropped = await run(['drop', '--global', '--all'], opts);
+    expect(dropped.code).toBe(0);
+
+    // The strict guarantee: byte-identical outside ~/.agentenv/ — .claude.json
+    // formatting + comments restored surgically, the colliding skill and the
+    // foreign symlink untouched, CLAUDE.md untouched, no stray files/backups.
+    expect(hashTree(h.home, exclude)).toBe(step0);
+    const after = await readState(paths);
+    expect(after.items).toEqual([]);
+    expect(after.globalStack).toEqual([]);
   });
 });
