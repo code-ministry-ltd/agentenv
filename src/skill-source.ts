@@ -1,4 +1,3 @@
-import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { access } from 'node:fs/promises';
@@ -6,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseFrontmatter } from './content-items.js';
+import { defaultGitRunner } from './git.js';
 
 /**
  * A resolved git skill source (design D17). `repo` is the canonical origin
@@ -216,33 +216,36 @@ interface GitResult {
   stderr: string;
 }
 
-/** Run `git <args>` (optionally in `cwd`), capturing output. Never throws on a
+/**
+ * Run `git <args>` (optionally in `cwd`), capturing output. Never throws on a
  * non-zero exit — the caller inspects `code`. A spawn error (git missing) or a
- * timeout resolves with `code: null` and an explanatory `stderr`. */
-function runGit(args: readonly string[], cwd?: string): Promise<GitResult> {
-  return new Promise((resolvePromise) => {
-    const child = spawn('git', [...args], {
-      cwd,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
-    child.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
-    const timer = setTimeout(() => {
-      stderr += '\ngit timed out';
-      child.kill('SIGKILL');
-    }, GIT_TIMEOUT_MS);
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      resolvePromise({ code: null, stdout, stderr: `${stderr}${err.message}` });
-    });
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      resolvePromise({ code, stdout, stderr });
-    });
+ * timeout resolves with `code: null` and an explanatory `stderr`.
+ *
+ * Delegates to the ONE hardened runner ({@link defaultGitRunner}) so a black-holing
+ * remote can never wedge a clone forever (F1): `git clone` spawns a transport helper
+ * (`git-remote-https`) grandchild that inherits git's stdout pipe and survives a
+ * plain `child.kill` (reparented), so resolving on `'close'` would hang past the
+ * timeout. The shared runner spawns `detached`, kills the whole process GROUP on
+ * timeout, and settles on `'exit'`. We keep skill-source's {@link GitResult} shape
+ * (no `timedOut` field) and preserve the historical `\ngit timed out` stderr marker
+ * that {@link firstLine}/{@link cloneError} may surface. `timeoutMs` is injectable
+ * for tests; production uses the generous {@link GIT_TIMEOUT_MS} ceiling.
+ */
+export async function runGit(
+  args: readonly string[],
+  cwd?: string,
+  timeoutMs = GIT_TIMEOUT_MS,
+): Promise<GitResult> {
+  const result = await defaultGitRunner(args, {
+    cwd: cwd ?? process.cwd(),
+    env: process.env,
+    timeoutMs,
   });
+  return {
+    code: result.code,
+    stdout: result.stdout,
+    stderr: result.timedOut ? `${result.stderr}\ngit timed out` : result.stderr,
+  };
 }
 
 /** First non-empty line of git's stderr, for a compact error message. */
