@@ -716,11 +716,15 @@ function wrapPath(keyPath: (string | number)[], value: JsonValue): { [k: string]
  */
 function tomlInjectText(text: string, item: ConfigKeysItem, value: JsonValue): string {
   const key = item.key ?? displayPath(item.keyPath);
+  // Preserve the original file's trailing-newline state so a marker-splice removal
+  // round-trips byte-for-byte (fix C1). A fresh/empty file gets the conventional
+  // trailing newline.
+  const trailer = text === '' || text.endsWith('\n') ? '\n' : '';
   const stripped = tomlStripMarkedBlock(text, key).text;
   const base = removeOwnedTomlTableIfPresent(stripped, item);
   const body = stringifyToml(wrapPath(item.keyPath, value));
   const prefix = base === '' || base.endsWith('\n') ? base : `${base}\n`;
-  return `${prefix}${tomlBeginMarker(key)}\n${body}${tomlEndMarker(key)}\n`;
+  return `${prefix}${tomlBeginMarker(key)}\n${body}${tomlEndMarker(key)}${trailer}`;
 }
 
 /**

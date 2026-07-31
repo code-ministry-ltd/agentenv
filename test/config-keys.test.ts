@@ -443,6 +443,21 @@ transport = "stdio"
       expect(after).toContain('${GITHUB_TOKEN}'); // placeholder restored
       expect(JSON.stringify(synced.canonicalValue)).not.toContain('ghp_REALSECRET123');
     });
+
+    // C1 (NIT): the marker-splice removal previously always re-emitted a trailing
+    // newline, so a file the user wrote WITHOUT one did not round-trip. Inject must
+    // preserve the original's trailing-newline state so removal is byte-identical.
+    it('preserves a no-trailing-newline TOML file across an inject+remove round-trip', async () => {
+      const p = paths();
+      const f = file('config.toml');
+      const original = '[mcp_servers.github]\ntransport = "stdio"'; // NO trailing newline
+      writeFileSync(f, original);
+
+      const item = await injectLinearToml(p, f);
+      const removed = await inTx(p, (tx) => removeKey(p, tx, item));
+      expect(removed.removed).toBe(true);
+      expect(readFileSync(f, 'utf8')).toBe(original); // trailing-newline state intact
+    });
   });
 
   describe('config-keys array-element inject + remove-by-value', () => {
