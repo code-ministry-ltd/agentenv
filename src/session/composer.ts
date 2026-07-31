@@ -102,11 +102,23 @@ interface ViewMeta {
 
 const rand = (): string => randomBytes(6).toString('hex');
 
+/** Reject a value that could escape its intended single path segment (L5). */
+function assertSafeSegment(value: string, label: string): void {
+  if (value === '' || value === '.' || value === '..' || value.includes('..') || /[/\\]/.test(value)) {
+    throw new Error(`unsafe ${label} '${value}': must be a single path segment without '..' or separators`);
+  }
+}
+
 /** Compose (or reuse) the private view for one harness launch. */
 export async function composeView(req: ComposeRequest): Promise<ComposeResult> {
   const { paths, adapter, session } = req;
   const onWarn = req.onWarn ?? ((m: string) => console.warn(m));
   const now = req.now ?? Date.now;
+
+  // The session id becomes a path segment under live/; reject anything that could
+  // escape it (empty, `.`/`..`, or a separator) before it is joined (L5). A throw
+  // here fails open in the launch — a hostile session id never composes.
+  assertSafeSegment(session, 'session id');
 
   const sessionDir = join(paths.live, session);
   const viewRoot = join(sessionDir, adapter.id);
@@ -352,6 +364,9 @@ async function composeConfigKeysFile(
   const seedText = await readFileOrEmpty(join(realConfigRoot, file));
   const seed = (seedText.trim() === '' ? {} : parseJsonc(seedText)) as Record<string, unknown>;
   const userSnapshot = structuredClone(seed);
+  // Which env last set each keyed path, so a later env overriding an earlier one
+  // records a skip that NAMES the loser (L2 / D5), as dir-merge already does.
+  const keyedOwner = new Map<string, string>();
 
   for (const surface of surfaces) {
     if (surface.format === 'toml') {
@@ -382,6 +397,14 @@ async function composeConfigKeysFile(
             skipped.push({ surfaceId: surface.id, reason: 'collision', detail });
             continue;
           }
+          const pathKey = JSON.stringify([...inj.keyPath]);
+          const prevEnv = keyedOwner.get(pathKey);
+          if (prevEnv !== undefined && prevEnv !== env) {
+            const detail = `${surface.id} key '${inj.keyPath.join('.')}' — env '${prevEnv}' overridden by env '${env}'`;
+            onWarn(`agentenv: ${detail}`);
+            skipped.push({ surfaceId: surface.id, reason: 'collision', detail });
+          }
+          keyedOwner.set(pathKey, env);
           setAtPath(seed, inj.keyPath, inj.value);
         } else {
           const arr = ensureArray(seed, inj.arrayPath);
@@ -455,7 +478,12 @@ async function fingerprintInputs(req: ComposeRequest): Promise<string> {
   const parts: unknown[] = [
     COMPOSER_VERSION,
     adapter.id,
+    // Adapter structural declaration (L1): a surface/mechanism/path/keyPath change
+    // or an override-env change — i.e. an adapter UPGRADE — invalidates stale views.
+    adapter.surfaces,
+    adapter.configRootEnv,
     [...envs],
+    req.projectRoot ?? null,
     await dirSignature(realConfigRoot),
   ];
 
@@ -619,6 +647,19 @@ function ensureArray(root: Record<string, unknown>, path: readonly (string | num
   return arr;
 }
 
+/**
+ * Order-insensitive structural equality for array-element dedup (L4): two object
+ * values that differ only in key ORDER are the same element, so a re-run does not
+ * append a duplicate. Sorts object keys recursively before stringifying.
+ */
 function stableEqual(a: unknown, b: unknown): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
+  return stableStringify(a) === stableStringify(b);
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(',')}}`;
 }
