@@ -452,8 +452,8 @@ async function repairReserialisedConfig(
  *
  * 1. `recoverState` first — roll back any pending journal so the manifest is
  *    consistent before any surface is re-driven (design D4).
- * 2. (later slices) re-materialise dangling links, reconcile drifted config,
- *    restore mangled marker regions, drop sourceless materialisations.
+ * 2. re-drive broken owned surfaces: drop sourceless materialisations, re-link
+ *    dangling symlinks, restore mangled marker regions, reconcile drifted config.
  * 3. garbage-collect orphaned backups LAST — repairs above legitimately create
  *    fresh transaction backups that de-reference on commit, so GC runs against the
  *    FINAL manifest to leave `backups/` clean and the next run idempotent.
