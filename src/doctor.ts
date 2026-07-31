@@ -2,7 +2,11 @@ import { access, readdir, rm, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import type { BackupRef } from './backups.js';
-import { materialise as dmMaterialise, type DirMergeItem } from './dir-merge.js';
+import {
+  dematerialise as dmDematerialise,
+  materialise as dmMaterialise,
+  type DirMergeItem,
+} from './dir-merge.js';
 import { recoverState } from './journal.js';
 import { withLock } from './lock.js';
 import type { Paths } from './paths.js';
@@ -95,6 +99,16 @@ async function isDangling(item: DirMergeItem): Promise<boolean> {
   return !(await resolves(item.path)); // link present but resolves to nothing
 }
 
+/**
+ * A manifest dir-merge item is store-vs-manifest drift when its store SOURCE is
+ * gone (the env store folder it points at no longer exists, design D4). It cannot
+ * be re-materialised, so repair drops the orphaned materialisation + its record.
+ * Mutually exclusive with {@link isDangling}, which requires the source present.
+ */
+async function isStoreSourceGone(item: DirMergeItem): Promise<boolean> {
+  return !(await exists(item.target));
+}
+
 // ---------------------------------------------------------------------------
 // backups: referenced set + enumeration
 // ---------------------------------------------------------------------------
@@ -178,6 +192,23 @@ async function detectDanglingSymlinks(manifest: StateManifest): Promise<DoctorPr
   return out;
 }
 
+/** Manifest dir-merge items whose store source is gone (design D4). */
+async function detectStoreDrift(manifest: StateManifest): Promise<DoctorProblem[]> {
+  const out: DoctorProblem[] = [];
+  for (const item of manifest.items) {
+    if (item.surface !== 'dir-merge') continue;
+    const dm = item as DirMergeItem;
+    if (!(await isStoreSourceGone(dm))) continue;
+    out.push({
+      kind: 'store-drift',
+      where: dm.path,
+      what: `owned item '${dm.path}' has no store source — '${dm.target}' is gone`,
+      repair: 'remove the orphaned materialisation and drop its ownership record',
+    });
+  }
+  return out;
+}
+
 /** Orphaned content/directory backups under `~/.agentenv/backups/` (design D4). */
 async function detectOrphanedBackups(
   paths: Paths,
@@ -205,6 +236,7 @@ export async function diagnose(paths: Paths): Promise<DoctorProblem[]> {
   const problems: DoctorProblem[] = [];
   problems.push(...detectJournal(paths, manifest));
   problems.push(...(await detectDanglingSymlinks(manifest)));
+  problems.push(...(await detectStoreDrift(manifest)));
   problems.push(...(await detectOrphanedBackups(paths, manifest)));
   return problems;
 }
@@ -248,6 +280,26 @@ async function repairDanglingSymlinks(
 }
 
 /**
+ * Drop every dir-merge materialisation whose store source is gone: remove the
+ * (now sourceless) link and its ownership record via the manifest-driven,
+ * journalled `dir-merge.dematerialise` — never scan-and-guess. It restores any
+ * recorded takeover backup, so a user item the env had shadowed reappears.
+ */
+async function repairStoreDrift(
+  paths: Paths,
+  manifest: StateManifest,
+  actions: string[],
+): Promise<void> {
+  for (const item of manifest.items) {
+    if (item.surface !== 'dir-merge') continue;
+    const dm = item as DirMergeItem;
+    if (!(await isStoreSourceGone(dm))) continue;
+    await dmDematerialise(paths, dm, () => {});
+    actions.push(`dropped orphaned materialisation ${dm.path} (store source gone)`);
+  }
+}
+
+/**
  * Return every owned surface to a consistent state, then re-scan. Order matters:
  *
  * 1. `recoverState` first — roll back any pending journal so the manifest is
@@ -273,6 +325,7 @@ export async function repair(paths: Paths): Promise<RepairResult> {
   }
 
   // 2. Re-drive broken owned surfaces from the manifest + store.
+  await repairStoreDrift(paths, await readState(paths), actions);
   await repairDanglingSymlinks(paths, await readState(paths), actions);
 
   // 3. Orphaned backups: GC against the final manifest.
