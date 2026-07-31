@@ -70,18 +70,31 @@ export const shimCommand: Command = {
       );
     }
 
-    const result = await launchHarness({
-      paths,
-      adapter,
-      envs,
-      session: session ?? 'no-session',
-      args: harnessArgs,
-      env,
-      cwd,
-      execHarness: options.execHarness,
-      capture: options.capture,
-      now: options.now,
-    });
+    let result: LaunchResult;
+    try {
+      result = await launchHarness({
+        paths,
+        adapter,
+        envs,
+        session: session ?? 'no-session',
+        args: harnessArgs,
+        env,
+        cwd,
+        execHarness: options.execHarness,
+        capture: options.capture,
+        now: options.now,
+      });
+    } catch (err) {
+      // Belt-and-suspenders (M2): launchHarness already fails open internally, but
+      // ANY unexpected throw at this outermost seam must STILL run the user's real
+      // binary untouched — the shim must never brick the tool.
+      notices.push(
+        `agentenv: launch failed (${(err as Error).message}) — launching ${binaryName} untouched`,
+      );
+      const passthrough = await execUnmanaged(paths, binaryName, harnessArgs, env, cwd, options);
+      const stderr = `${[...notices].join('\n')}\n${passthrough.stderr ?? ''}`;
+      return { ...passthrough, stderr };
+    }
     return toRunResult(result, notices);
   },
 };

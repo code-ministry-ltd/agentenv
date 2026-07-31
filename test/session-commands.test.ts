@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { Adapter } from '../src/adapter.js';
 import { run } from '../src/cli.js';
 import type { RunOptions } from '../src/command.js';
 import { resolvePaths } from '../src/paths.js';
@@ -206,5 +207,34 @@ describe('session __shim command', () => {
     expect(res.code).toBe(0);
     expect(calls[0]?.env[FIXTURE_CONFIG_ENV]).toBeTruthy(); // bound — surviving env composed
     expect(res.stderr).toContain("environment 'ghost'");
+  });
+
+  it('M2: an unexpected throw from launchHarness still execs the real binary untouched', async () => {
+    const th = home();
+    const { paths, env } = withHarness(th);
+    const projectRoot = await resolveProjectRoot(th.home);
+    await setBinding(paths, { session: 'S1', projectRoot, envs: ['writing'] });
+    // Force the applied path to throw AFTER compose + self-check: overrideEnv is
+    // only reached at the very end of launchHarness, outside its fail-open guards.
+    const base = makeFixtureAdapter({ forceSelfCheck: { ok: true } });
+    const adapter: Adapter = {
+      ...base,
+      overrideEnv: () => {
+        throw new Error('boom-override');
+      },
+    };
+    const { exec, calls, lastStdout } = capturingExec();
+
+    const res = await run(['__shim', 'fixture-harness', '--', '--print-config-root'], {
+      env: { ...env, AGENTENV_SESSION: 'S1' },
+      cwd: th.home,
+      adapters: [adapter],
+      execHarness: exec,
+    });
+    expect(res.code).toBe(0); // the real binary still ran
+    expect(calls[0]?.binaryPath).toContain('fixture-harness');
+    expect(calls[0]?.env[FIXTURE_CONFIG_ENV]).toBeUndefined(); // untouched — no override
+    expect(lastStdout().trim()).toBeTruthy();
+    expect(res.stderr?.toLowerCase()).toContain('launch failed');
   });
 });
