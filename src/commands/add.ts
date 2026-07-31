@@ -12,7 +12,7 @@ import {
 import { environmentExists, validateEnvName } from '../store.js';
 
 /** Content kinds `add` understands, in help/usage order. */
-const KINDS = ['skill', 'mcp', 'instructions'] as const;
+const KINDS = ['skill', 'mcp', 'instructions', 'agent', 'command'] as const;
 
 function ok(stdout: string): RunResult {
   return { stdout, code: 0 };
@@ -276,6 +276,70 @@ async function addInstructions(rest: readonly string[], ctx: CommandContext): Pr
   return ok(`Added ${label} instructions to environment '${env}'.\n`);
 }
 
+function scaffoldAgentMd(name: string): string {
+  return (
+    '---\n' +
+    `name: ${name}\n` +
+    'description: TODO — describe when this subagent should be used.\n' +
+    '---\n' +
+    '\n' +
+    "TODO: write the subagent's system prompt here.\n"
+  );
+}
+
+function scaffoldCommandMd(name: string): string {
+  return (
+    '---\n' +
+    'description: TODO — one line describing this command.\n' +
+    '---\n' +
+    '\n' +
+    `# ${name}\n` +
+    '\n' +
+    'TODO: write the command / prompt template here.\n'
+  );
+}
+
+/**
+ * `add agent|command <env> <name>`: scaffold a `<name>.md` under the kind's
+ * store subdirectory. Shared by the two near-identical markdown-item kinds.
+ */
+async function addMarkdownItem(
+  kind: 'agent' | 'command',
+  subdir: string,
+  scaffold: (name: string) => string,
+  rest: readonly string[],
+  ctx: CommandContext,
+): Promise<RunResult> {
+  const parsed = parseArgs(rest, { booleans: ['force', 'print-path'] });
+  if (parsed.unknown.length > 0) {
+    return fail(`add ${kind}: unknown option '${parsed.unknown[0]}'\n`);
+  }
+  const resolved = await resolveEnv(kind, parsed.positionals[0], ctx.paths);
+  if ('error' in resolved) return resolved.error;
+  const env = resolved.env;
+
+  const name = parsed.positionals[1];
+  if (name === undefined) {
+    return fail(
+      `add ${kind}: missing ${kind} name\n` +
+        `Usage: agentenv add ${kind} <env> <name> [--force] [--print-path]\n`,
+    );
+  }
+  const nameError = validateItemName(kind, name);
+  if (nameError) return fail(`add ${kind}: ${nameError}\n`);
+
+  const file = join(ctx.paths.envDir(env), subdir, `${name}.md`);
+  if (parsed.booleans.has('print-path')) return ok(`${file}\n`);
+  if ((await pathExists(file)) && !parsed.booleans.has('force')) {
+    return fail(
+      `add ${kind}: ${kind} '${name}' already exists in '${env}' (${file}); pass --force to overwrite\n`,
+    );
+  }
+  await mkdir(join(ctx.paths.envDir(env), subdir), { recursive: true });
+  await writeFile(file, scaffold(name), 'utf8');
+  return ok(`Added ${kind} '${name}' to environment '${env}'.\n`);
+}
+
 export const addCommand: Command = {
   name: 'add',
   usage: '<kind> <env> …',
@@ -294,6 +358,10 @@ export const addCommand: Command = {
         return addMcp(rest, ctx);
       case 'instructions':
         return addInstructions(rest, ctx);
+      case 'agent':
+        return addMarkdownItem('agent', 'agents', scaffoldAgentMd, rest, ctx);
+      case 'command':
+        return addMarkdownItem('command', 'commands', scaffoldCommandMd, rest, ctx);
       default:
         return fail(`add: unknown kind '${kind}'\n${kindsHelp()}`);
     }
