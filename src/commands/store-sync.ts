@@ -60,7 +60,7 @@ export async function commitMutation(ctx: SyncCtx, message: string, notices: str
 export async function openStoreSync(
   ctx: SyncCtx,
   notices: string[],
-  opts: { alreadySwept?: boolean } = {},
+  opts: { alreadySwept?: boolean; skipAdopt?: boolean } = {},
 ): Promise<SyncBeforeResult> {
   const { paths, env, options } = ctx;
   return beginStoreSync({
@@ -70,6 +70,7 @@ export async function openStoreSync(
     onNotice: (n) => notices.push(n),
     ...(options.gitRun ? { gitRun: options.gitRun } : {}),
     ...(opts.alreadySwept ? { alreadySwept: true } : {}),
+    ...(opts.skipAdopt ? { skipAdopt: true } : {}),
   });
 }
 
@@ -102,7 +103,7 @@ export async function withStoreSync(
   ctx: SyncCtx,
   notices: string[],
   body: () => Promise<string | null>,
-  opts: { alreadySwept?: boolean } = {},
+  opts: { alreadySwept?: boolean; skipAdopt?: boolean } = {},
 ): Promise<SyncBeforeResult> {
   const before = await openStoreSync(ctx, notices, opts);
   const message = await body();

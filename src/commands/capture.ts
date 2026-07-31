@@ -42,8 +42,9 @@ async function runCapture(ctx: CommandContext): Promise<RunResult> {
   const syncCtx = { paths, env, options };
 
   // Pull-on-invoke + post-pull safeguards (D9). A quarantined pull means we must
-  // not touch surfaces — abort the sweep and report.
-  const before = await openStoreSync(syncCtx, notices);
+  // not touch surfaces — abort the sweep and report. `skipAdopt`: capture runs its
+  // OWN (interactive) sweep below, so the lifecycle must not also auto-adopt.
+  const before = await openStoreSync(syncCtx, notices, { skipAdopt: true });
   if (before.quarantined) {
     await closeStoreSync(syncCtx, notices);
     return withNotices(

@@ -189,10 +189,13 @@ export async function adoptSweep(req: AdoptSweepRequest): Promise<AdoptSweepResu
   const note = req.note ?? (() => {});
   const result: AdoptSweepResult = { adopted: [], skipped: [], dryRun };
 
-  if (!dryRun) await withLock(paths, () => recoverState(paths));
+  // Fast no-op when nothing was snapshotted (the common case for every command
+  // that never activated a surface): no lock, no recovery, no state write — so
+  // wiring this into the per-invocation lifecycle costs unactivated installs zero.
+  const surfaces = req.surfaces ?? readInventory(await readState(paths));
+  if (surfaces.length === 0) return result;
 
-  const manifest = await readState(paths);
-  const surfaces = req.surfaces ?? readInventory(manifest);
+  if (!dryRun) await withLock(paths, () => recoverState(paths));
 
   for (const surface of surfaces) {
     const current = await listNames(surface.dir);

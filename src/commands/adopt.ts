@@ -87,7 +87,9 @@ async function adoptInto(ctx: CommandContext, name: string, into: string): Promi
 
   const notices: string[] = [];
   const syncCtx = { paths, env, options };
-  const before = await openStoreSync(syncCtx, notices);
+  // `skipAdopt`: this command adopts exactly the named item itself — the lifecycle
+  // sweep must not also auto-adopt other pending items behind it.
+  const before = await openStoreSync(syncCtx, notices, { skipAdopt: true });
   if (before.quarantined) {
     await closeStoreSync(syncCtx, notices);
     return withNotices({ stdout: `Did NOT adopt '${name}' — pulled store changes were quarantined.\n`, code: 0 }, notices);

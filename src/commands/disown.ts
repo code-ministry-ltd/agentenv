@@ -86,7 +86,9 @@ async function disown(ctx: CommandContext, item: AdoptedDirMergeItem, name: stri
 
   const notices: string[] = [];
   const syncCtx = { paths, env, options };
-  const before = await openStoreSync(syncCtx, notices);
+  // `skipAdopt`: disown is the REVERSE of adoption — the lifecycle sweep must not
+  // re-adopt the very item we are restoring (also guarded by markBaseline below).
+  const before = await openStoreSync(syncCtx, notices, { skipAdopt: true });
   if (before.quarantined) {
     await closeStoreSync(syncCtx, notices);
     return withNotices({ stdout: `Did NOT disown '${name}' — pulled store changes were quarantined.\n`, code: 0 }, notices);
