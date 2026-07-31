@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { parse as parseToml, stringify as stringifyToml } from 'smol-toml';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   injectKeyed,
@@ -258,6 +259,73 @@ describe('config-keys', () => {
       // A second sync now sees no drift (hash agrees with the placeholder form).
       const again = await inTx(p, (tx) => syncBack(p, tx, synced.item));
       expect(again.drifted).toBe(false);
+    });
+  });
+
+  describe('config-keys keyed TOML inject + remove', () => {
+    const originalToml = `# my codex config
+[mcp_servers.github]
+transport = "stdio"
+`;
+
+    async function injectLinearToml(
+      p: ReturnType<typeof paths>,
+      f: string,
+    ): Promise<ConfigKeysItem> {
+      return inTx(p, (tx) =>
+        injectKeyed(p, tx, {
+          file: f,
+          format: 'toml',
+          keyPath: ['mcp_servers', 'linear'],
+          value: { transport: 'http', url: 'https://mcp.linear.app/mcp' },
+          ownerEnv: 'writing',
+        }),
+      );
+    }
+
+    it('injects a marked [table] and removes it by marker-splice, preserving the rest', async () => {
+      const p = paths();
+      const f = file('config.toml');
+      writeFileSync(f, originalToml);
+
+      const item = await injectLinearToml(p, f);
+      const injected = readFileSync(f, 'utf8');
+      // Marked block present, user content and its comment untouched.
+      expect(injected).toContain('# >>> agentenv:config-key mcp_servers.linear >>>');
+      expect(injected).toContain('[mcp_servers.linear]');
+      expect(injected).toContain('# my codex config');
+      const parsed = parseToml(injected) as { mcp_servers: { linear: unknown; github: unknown } };
+      expect(parsed.mcp_servers.linear).toEqual({
+        transport: 'http',
+        url: 'https://mcp.linear.app/mcp',
+      });
+      expect(parsed.mcp_servers.github).toEqual({ transport: 'stdio' });
+
+      // Markers present → splice returns the file byte-for-byte to the original.
+      const removed = await inTx(p, (tx) => removeKey(p, tx, item));
+      expect(removed.removed).toBe(true);
+      expect(readFileSync(f, 'utf8')).toBe(originalToml);
+    });
+
+    it('removes by PARSE after a harness reserialised the file and stripped the markers', async () => {
+      const p = paths();
+      const f = file('config.toml');
+      writeFileSync(f, originalToml);
+      const item = await injectLinearToml(p, f);
+
+      // Simulate the harness rewriting the file: parse → stringify drops every
+      // comment, including our ownership markers, and may reorder tables.
+      const reserialised = stringifyToml(parseToml(readFileSync(f, 'utf8')));
+      writeFileSync(f, reserialised);
+      expect(reserialised).not.toContain('agentenv:config-key'); // markers gone
+
+      // Removal must still find and drop our key — by parse, not by text.
+      const removed = await inTx(p, (tx) => removeKey(p, tx, item));
+      expect(removed.removed).toBe(true);
+
+      const after = parseToml(readFileSync(f, 'utf8')) as { mcp_servers?: Record<string, unknown> };
+      expect(after.mcp_servers?.linear).toBeUndefined(); // our key gone
+      expect(after.mcp_servers?.github).toEqual({ transport: 'stdio' }); // user's survives
     });
   });
 });

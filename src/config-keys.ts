@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { applyEdits, modify, parse as parseJsonc } from 'jsonc-parser';
 import type { JSONPath, ParseError } from 'jsonc-parser';
+import { parse as parseToml, stringify as stringifyToml, TomlError } from 'smol-toml';
 import { backup } from './backups.js';
 import { writeFileAtomic } from './fs-atomic.js';
 import type { Transaction } from './journal.js';
@@ -283,7 +284,7 @@ export async function injectKeyed(
  */
 function writeKeyedValueText(text: string, item: ConfigKeysItem, value: JsonValue): string {
   if (item.format === 'toml') {
-    throw new ConfigKeysError(`${item.path}: TOML keyed write not yet implemented`, item.path);
+    return tomlInjectText(text, item, value);
   }
   const base = jsonBaseText(text);
   return applyEdits(base, modify(base, item.keyPath as JSONPath, value, {}));
@@ -355,7 +356,7 @@ function readKeyed(text: string, item: ConfigKeysItem): { found: boolean; value:
 /** Produce file text with the owned keyed value removed, dispatching on format. */
 function removeKeyedText(text: string, item: ConfigKeysItem): string {
   if (item.format === 'toml') {
-    throw new ConfigKeysError(`${item.path}: TOML keyed removal not yet implemented`, item.path);
+    return removeKeyedTomlText(text, item);
   }
   const base = jsonBaseText(text);
   return applyEdits(base, modify(base, item.keyPath as JSONPath, undefined, {}));
@@ -423,7 +424,7 @@ export async function syncBack(
 /** Parse an owned item's file, dispatching on format. */
 function parseConfig(text: string, item: ConfigKeysItem): unknown {
   if (item.format === 'toml') {
-    throw new ConfigKeysError(`${item.path}: TOML parsing not yet implemented`, item.path);
+    return parseTomlConfig(text, item.path);
   }
   return parseJsonConfig(text, item.path);
 }
@@ -453,6 +454,111 @@ function setAtDottedPath(root: JsonValue, path: string[], leaf: string): void {
   }
   if (cur === null || typeof cur !== 'object' || Array.isArray(cur)) return;
   (cur as { [k: string]: JsonValue })[path[path.length - 1] as string] = leaf;
+}
+
+// ---------------------------------------------------------------------------
+// TOML keyed mechanism — append a marked [table]; remove by marker-splice, else
+// fall back to a full parse when a harness reserialised and stripped the markers.
+// ---------------------------------------------------------------------------
+
+/** Parse TOML into a value; a syntax error surfaces as a {@link ConfigKeysError}. */
+function parseTomlConfig(text: string, file: string): unknown {
+  if (text.trim() === '') return {};
+  try {
+    return parseToml(text);
+  } catch (err) {
+    if (err instanceof TomlError) {
+      throw new ConfigKeysError(`${file}: could not parse TOML config (${err.message})`, file);
+    }
+    throw err;
+  }
+}
+
+function tomlBeginMarker(key: string): string {
+  return `# >>> agentenv:config-key ${key} >>> managed by agentenv, do not edit`;
+}
+
+function tomlEndMarker(key: string): string {
+  return `# <<< agentenv:config-key ${key} <<<`;
+}
+
+/** Wrap a value under its key path, e.g. `(['a','b'], v)` → `{ a: { b: v } }`. */
+function wrapPath(keyPath: (string | number)[], value: JsonValue): { [k: string]: JsonValue } {
+  const root: { [k: string]: JsonValue } = {};
+  let cur = root;
+  for (let i = 0; i < keyPath.length - 1; i++) {
+    const seg = String(keyPath[i]);
+    const child: { [k: string]: JsonValue } = {};
+    cur[seg] = child;
+    cur = child;
+  }
+  cur[String(keyPath[keyPath.length - 1])] = value;
+  return root;
+}
+
+/**
+ * Append the owned key as a whole marked `[table]` (format-preserving: the user's
+ * existing TOML is untouched). Idempotent — any prior marked block for this key is
+ * stripped first, so re-injection replaces rather than duplicates.
+ */
+function tomlInjectText(text: string, item: ConfigKeysItem, value: JsonValue): string {
+  const key = item.key ?? displayPath(item.keyPath);
+  const stripped = tomlStripMarkedBlock(text, key).text;
+  const body = stringifyToml(wrapPath(item.keyPath, value));
+  const prefix = stripped === '' || stripped.endsWith('\n') ? stripped : `${stripped}\n`;
+  return `${prefix}${tomlBeginMarker(key)}\n${body}${tomlEndMarker(key)}\n`;
+}
+
+/**
+ * Remove the owned TOML key. First tries a marker-splice (format-preserving for
+ * the rest of the file). If the markers are gone — a harness reserialised the file
+ * and stripped our comments — falls back to a full parse: delete the key path and
+ * re-stringify, so ownership by key path still resolves.
+ */
+function removeKeyedTomlText(text: string, item: ConfigKeysItem): string {
+  const key = item.key ?? displayPath(item.keyPath);
+  const spliced = tomlStripMarkedBlock(text, key);
+  if (spliced.changed) return spliced.text;
+
+  const data = parseTomlConfig(text, item.path) as { [k: string]: unknown };
+  deleteAtPath(data, item.keyPath);
+  return stringifyToml(data);
+}
+
+/** Drop the marker-delimited block for `key`; report whether one was present. */
+function tomlStripMarkedBlock(text: string, key: string): { text: string; changed: boolean } {
+  const beginPrefix = `# >>> agentenv:config-key ${key} >>>`;
+  const endPrefix = `# <<< agentenv:config-key ${key} <<<`;
+  const out: string[] = [];
+  let inside = false;
+  let changed = false;
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!inside && trimmed.startsWith(beginPrefix)) {
+      inside = true;
+      changed = true;
+      continue;
+    }
+    if (inside) {
+      // Drop every line of the block, including its end marker.
+      if (trimmed.startsWith(endPrefix)) inside = false;
+      continue;
+    }
+    out.push(line);
+  }
+  return { text: out.join('\n'), changed };
+}
+
+/** Delete the value at `keyPath` from a parsed object tree; a missing segment is a no-op. */
+function deleteAtPath(root: { [k: string]: unknown }, keyPath: (string | number)[]): void {
+  if (keyPath.length === 0) return;
+  let cur: unknown = root;
+  for (let i = 0; i < keyPath.length - 1; i++) {
+    if (cur === null || typeof cur !== 'object' || Array.isArray(cur)) return;
+    cur = (cur as { [k: string]: unknown })[String(keyPath[i])];
+  }
+  if (cur === null || typeof cur !== 'object' || Array.isArray(cur)) return;
+  delete (cur as { [k: string]: unknown })[String(keyPath[keyPath.length - 1])];
 }
 
 // ---------------------------------------------------------------------------
