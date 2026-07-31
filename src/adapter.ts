@@ -339,6 +339,13 @@ export function validateAdapter(adapter: Adapter): string | null {
     if (rel !== undefined && (rel === '' || rel.startsWith('/') || rel.includes('..'))) {
       return `adapter '${adapter.id}': surface '${surface.id}' has an unsafe rootRelativePath '${rel}'`;
     }
+    // A surface target is a MANAGED bucket-2 entry; it must never classify as
+    // bucket-1 `state`, or the composer would try to pass it through as a
+    // wholesale symlink into the user's real dir (H2). Assert the two agree.
+    const target = rel.split(/[\\/]/)[0] ?? rel;
+    if (adapter.classifyEntry(target) === 'state') {
+      return `adapter '${adapter.id}': surface '${surface.id}' target '${target}' classifies as 'state' but a surface target must be 'managed'`;
+    }
   }
   return null;
 }

@@ -12,7 +12,13 @@ import {
 } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parse as parseJsonc } from 'jsonc-parser';
-import { storeToken, type Adapter, type ConfigKeysInjection, type SurfaceDeclaration } from '../adapter.js';
+import {
+  storeToken,
+  surfaceRootRelativePath,
+  type Adapter,
+  type ConfigKeysInjection,
+  type SurfaceDeclaration,
+} from '../adapter.js';
 import { appendRegion, closeMarker, openMarker } from '../file-block.js';
 import { writeFileAtomic } from '../fs-atomic.js';
 import type { Paths } from '../paths.js';
@@ -157,6 +163,13 @@ async function composeBucketOne(req: ComposeRequest, buildDir: string): Promise<
   const { adapter, realConfigRoot } = req;
   const isGloballyOwned = req.isGloballyOwned ?? (() => false);
 
+  // The top-level names every surface targets. A surface target is bucket-2
+  // territory and is composed privately by its mechanism — it must NEVER become a
+  // wholesale pass-through symlink, regardless of what classifyEntry says (H2). A
+  // mis-classified target would otherwise be symlinked to the real dir and then
+  // have per-item env symlinks written THROUGH it into the user's real location.
+  const surfaceTargets = new Set(adapter.surfaces.map((s) => topLevelSegment(surfaceRootRelativePath(s))));
+
   let entries;
   try {
     entries = await readdir(realConfigRoot, { withFileTypes: true });
@@ -165,12 +178,18 @@ async function composeBucketOne(req: ComposeRequest, buildDir: string): Promise<
     throw err;
   }
   for (const entry of entries) {
+    if (surfaceTargets.has(entry.name)) continue; // a surface owns this — never symlink it
     if (adapter.classifyEntry(entry.name) !== 'state') continue; // bucket 2 → composed by a surface
     const realPath = join(realConfigRoot, entry.name);
     if (isGloballyOwned(realPath)) continue; // represented once via --global (D15 dedup)
     // Per-entry symlink: reads AND writes pass through to the real location.
     await symlink(realPath, join(buildDir, entry.name));
   }
+}
+
+/** The first path segment of a config-root-relative path (`rules/x` → `rules`). */
+function topLevelSegment(rel: string): string {
+  return rel.split(/[\\/]/)[0] ?? rel;
 }
 
 // ---------------------------------------------------------------------------
