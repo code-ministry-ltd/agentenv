@@ -73,8 +73,9 @@ describe('sync: remote connect (empty-remote / first connect, D14)', () => {
     expect(subjects(remote.dir)).toContain('agentenv: initialise store');
   });
 
-  it('is an idempotent no-op for the same URL, and refuses a different remote (2.3 seam)', async () => {
+  it('is an idempotent no-op for the same URL, and safely replaces a different empty remote (2.3)', async () => {
     const th = gitHome();
+    const paths = resolvePaths(th.env);
     const remote = bareRemotePath(true);
     await run(['init'], { env: th.env });
     await run(['remote', remote.url], { env: th.env });
@@ -83,10 +84,15 @@ describe('sync: remote connect (empty-remote / first connect, D14)', () => {
     expect(same.code).toBe(0);
     expect(same.stdout).toContain('no change');
 
+    // A DIFFERENT empty remote is now safely adopted (Task 2.3): push local history,
+    // then flip the configured URL to it.
     const other = bareRemotePath(true);
     const different = await run(['remote', other.url], { env: th.env });
-    expect(different.code).toBe(1);
-    expect(different.stderr).toContain('Task 2.3');
+    expect(different.code).toBe(0);
+    expect(
+      execFileSync('git', ['remote', 'get-url', 'origin'], { cwd: paths.store, encoding: 'utf8' }).trim(),
+    ).toBe(other.url);
+    expect(subjects(other.dir)).toContain('agentenv: initialise store');
   });
 
   it('never logs credentials embedded in a URL', async () => {
