@@ -186,6 +186,11 @@ function keyedDiscriminator(keyPath: KeyPath): string {
   return displayPath(keyPath);
 }
 
+/** The intra-file `key` discriminator for an array-element record: array path + exact value. */
+function arrayElementDiscriminator(arrayPath: KeyPath, value: JsonValue): string {
+  return `${displayPath(arrayPath)}[]=${stableStringify(value)}`;
+}
+
 /** Deterministic stringification with object keys sorted — so key *reordering* is not drift. */
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
@@ -309,6 +314,73 @@ function makeKeyedItem(req: InjectKeyedRequest): ConfigKeysItem {
 }
 
 // ---------------------------------------------------------------------------
+// inject — array-element mode (JSON/JSONC)
+// ---------------------------------------------------------------------------
+
+/**
+ * Inject one value into an array (OpenCode `instructions`, Pi settings arrays).
+ * Ownership is the array path + **exact value**, so later removal is by value and
+ * order-independent — a harness reordering the array is harmless. Appends at the
+ * end; idempotent (a value already present is not duplicated); creates the array
+ * if the path is absent. JSON/JSONC only.
+ *
+ * The whole array literal is rewritten in place (the rest of the document stays
+ * surgical) rather than editing a single index, because jsonc-parser's
+ * position-based array-index edits mishandle the last element of an inline array;
+ * a whole-array replacement is always well-formed.
+ */
+export async function injectArrayElement(
+  paths: Paths,
+  tx: Transaction,
+  req: InjectArrayElementRequest,
+): Promise<ConfigKeysItem> {
+  if (req.format === 'toml') {
+    throw new ConfigKeysError(`${req.file}: array-element injection is JSON/JSONC only`, req.file);
+  }
+  const text = await readText(req.file);
+  const base = jsonBaseText(text);
+  const current = readArray(base, req.arrayPath, req.file);
+  const present = current.some((v) => stableStringify(v) === stableStringify(req.value));
+
+  const next = present
+    ? base // already present — idempotent re-injection
+    : applyEdits(base, modify(base, req.arrayPath as JSONPath, [...current, req.value], {}));
+
+  const item = makeArrayElementItem(req);
+  await applyFileMutation(paths, tx, 'add', item, req.file, next);
+  return item;
+}
+
+/**
+ * Read the array at `arrayPath` from JSON/JSONC text: an empty array if the path
+ * is absent, or {@link ConfigKeysError} if the path exists but is not an array
+ * (refusing to clobber a non-array value the user put there).
+ */
+function readArray(text: string, arrayPath: KeyPath, file: string): JsonValue[] {
+  const { found, value } = getAtPath(parseJsonConfig(text, file), arrayPath);
+  if (!found) return [];
+  if (!Array.isArray(value)) {
+    throw new ConfigKeysError(`${file}: ${displayPath(arrayPath)} is not an array`, file);
+  }
+  return value as JsonValue[];
+}
+
+function makeArrayElementItem(req: InjectArrayElementRequest): ConfigKeysItem {
+  return {
+    action: 'config-key',
+    surface: 'config-keys',
+    path: req.file,
+    key: arrayElementDiscriminator(req.arrayPath, req.value),
+    ownerEnv: req.ownerEnv,
+    mode: 'array-element',
+    format: req.format,
+    keyPath: [...req.arrayPath],
+    value: req.value,
+    hash: hashValue(req.value),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // remove
 // ---------------------------------------------------------------------------
 
@@ -325,7 +397,7 @@ export async function removeKey(
   item: ConfigKeysItem,
 ): Promise<RemoveResult> {
   if (item.mode === 'array-element') {
-    throw new ConfigKeysError(`${item.path}: array-element removal not yet implemented`, item.path);
+    return removeArrayElement(paths, tx, item);
   }
   const text = await readText(item.path);
   const { found, value } = readKeyed(text, item);
@@ -344,6 +416,46 @@ export async function removeKey(
     };
   }
   const next = removeKeyedText(text, item);
+  await applyFileMutation(paths, tx, 'remove', item, item.path, next);
+  return { removed: true };
+}
+
+/**
+ * Remove an owned array element by its exact value (order-independent, so a
+ * reordered array is harmless). A value already absent — because a harness
+ * removed it, or a double-removal — is a logged no-op, never an error (D3).
+ */
+async function removeArrayElement(
+  paths: Paths,
+  tx: Transaction,
+  item: ConfigKeysItem,
+): Promise<RemoveResult> {
+  if (item.format === 'toml') {
+    throw new ConfigKeysError(`${item.path}: array-element removal is JSON/JSONC only`, item.path);
+  }
+  const text = await readText(item.path);
+  const base = jsonBaseText(text);
+  const { found, value: arr } = getAtPath(parseJsonConfig(base, item.path), item.keyPath);
+  if (!found || !Array.isArray(arr)) {
+    return {
+      removed: false,
+      reason: 'absent',
+      note: `array ${displayPath(item.keyPath)} absent in ${item.path} — nothing to remove`,
+    };
+  }
+  const filtered = (arr as JsonValue[]).filter(
+    (v) => stableStringify(v) !== stableStringify(item.value),
+  );
+  if (filtered.length === arr.length) {
+    return {
+      removed: false,
+      reason: 'absent',
+      note: `array element ${item.key ?? ''} already absent — no-op`,
+    };
+  }
+  // Rewrite the whole array (see injectArrayElement's note on the jsonc-parser
+  // index-edit bug). Matching by value makes this order-independent.
+  const next = applyEdits(base, modify(base, item.keyPath as JSONPath, filtered, {}));
   await applyFileMutation(paths, tx, 'remove', item, item.path, next);
   return { removed: true };
 }

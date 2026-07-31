@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { parse as parseToml, stringify as stringifyToml } from 'smol-toml';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  injectArrayElement,
   injectKeyed,
   removeKey,
   syncBack,
@@ -326,6 +327,66 @@ transport = "stdio"
       const after = parseToml(readFileSync(f, 'utf8')) as { mcp_servers?: Record<string, unknown> };
       expect(after.mcp_servers?.linear).toBeUndefined(); // our key gone
       expect(after.mcp_servers?.github).toEqual({ transport: 'stdio' }); // user's survives
+    });
+  });
+
+  describe('config-keys array-element inject + remove-by-value', () => {
+    const storePath = '/store/writing/instructions/base.md';
+
+    it('injects into an array and removes by value even after the harness reorders it', async () => {
+      const p = paths();
+      const f = file('opencode.json');
+      writeFileSync(f, '{\n  "instructions": ["AGENTS.md", "docs/rules.md"],\n  "model": "sonnet"\n}\n');
+
+      const item = await inTx(p, (tx) =>
+        injectArrayElement(p, tx, {
+          file: f,
+          format: 'json',
+          arrayPath: ['instructions'],
+          value: storePath,
+          ownerEnv: 'writing',
+        }),
+      );
+      expect(item).toMatchObject({ mode: 'array-element', keyPath: ['instructions'], value: storePath });
+      expect(JSON.parse(readFileSync(f, 'utf8')).instructions).toContain(storePath);
+
+      // The harness reorders the array (our value moves to the front).
+      const doc = JSON.parse(readFileSync(f, 'utf8'));
+      doc.instructions = [storePath, 'AGENTS.md', 'docs/rules.md'];
+      writeFileSync(f, JSON.stringify(doc, null, 2) + '\n');
+
+      // Removal still finds our value by identity, regardless of position.
+      const removed = await inTx(p, (tx) => removeKey(p, tx, item));
+      expect(removed.removed).toBe(true);
+      const instructions = JSON.parse(readFileSync(f, 'utf8')).instructions;
+      expect(instructions).toEqual(['AGENTS.md', 'docs/rules.md']); // ours gone, user's order kept
+    });
+
+    it('is idempotent on re-injection and a no-op with a note when the value is already absent', async () => {
+      const p = paths();
+      const f = file('opencode.json');
+      writeFileSync(f, '{\n  "instructions": ["AGENTS.md"]\n}\n');
+
+      const req = {
+        file: f,
+        format: 'json' as const,
+        arrayPath: ['instructions'],
+        value: storePath,
+        ownerEnv: 'writing',
+      };
+      const item = await inTx(p, (tx) => injectArrayElement(p, tx, req));
+      // Re-injecting the same value does not duplicate it.
+      await inTx(p, (tx) => injectArrayElement(p, tx, req));
+      const arr = JSON.parse(readFileSync(f, 'utf8')).instructions;
+      expect(arr.filter((v: string) => v === storePath)).toHaveLength(1);
+
+      // First removal succeeds; a second removal of the now-absent value is a
+      // logged no-op, not an error.
+      const first = await inTx(p, (tx) => removeKey(p, tx, item));
+      expect(first.removed).toBe(true);
+      const second = await inTx(p, (tx) => removeKey(p, tx, item));
+      expect(second).toMatchObject({ removed: false, reason: 'absent' });
+      expect(second.note).toMatch(/absent/);
     });
   });
 });
