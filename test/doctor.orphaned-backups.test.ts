@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { backup } from '../src/backups.js';
@@ -29,11 +29,22 @@ async function seed(th: TempHome): Promise<{ orphan: string; referenced: string 
   const realHome = join(th.home, 'real');
   mkdirSync(realHome, { recursive: true });
 
-  // A referenced content backup: a manifest file-block item carries its ref.
-  const userFile = join(realHome, 'INSTRUCTIONS.md');
+  // A referenced content backup, carried by a HEALTHY dir-merge item (as a
+  // takeover backup would be): the item itself must be consistent so only the
+  // orphan-backup detector fires.
+  const userFile = join(realHome, 'taken-over.txt');
   writeFileSync(userFile, '# user\n');
   const referencedRef = await backup(paths, userFile); // kind: content, hash
   const referencedHash = referencedRef.kind === 'content' ? referencedRef.hash : '';
+
+  // A resolvable dir-merge symlink (store source present, link resolves).
+  const storeSource = join(paths.envDir('writing'), 'skills', 'w-skill');
+  mkdirSync(storeSource, { recursive: true });
+  writeFileSync(join(storeSource, 'SKILL.md'), '# w skill\n');
+  const skillsDir = join(realHome, 'skills');
+  mkdirSync(skillsDir, { recursive: true });
+  const linkPath = join(skillsDir, 'w-skill');
+  symlinkSync(storeSource, linkPath);
 
   // An ORPHAN content backup: bytes copied into the store that nothing references.
   const strayFile = join(realHome, 'stray.txt');
@@ -42,13 +53,11 @@ async function seed(th: TempHome): Promise<{ orphan: string; referenced: string 
   const orphanHash = orphanRef.kind === 'content' ? orphanRef.hash : '';
 
   const item: ManifestItem = {
-    action: 'file-block',
-    surface: 'file-block',
-    path: userFile,
-    key: 'writing',
+    action: 'symlink',
+    surface: 'dir-merge',
+    path: linkPath,
+    target: storeSource,
     ownerEnv: 'writing',
-    mode: 'inline',
-    subBlocks: [],
     backupRef: referencedRef,
   } as unknown as ManifestItem;
   const manifest: StateManifest = { version: '1.0', items: [item], journal: null };

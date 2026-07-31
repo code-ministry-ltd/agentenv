@@ -602,3 +602,43 @@ export async function syncBack(paths: Paths, opts: FileBlockTargetOptions): Prom
     return result;
   });
 }
+
+// ---------------------------------------------------------------------------
+// inspect (read-only) — for `agentenv doctor`
+// ---------------------------------------------------------------------------
+
+/**
+ * The read-only health of an env's managed region, anchored to the manifest:
+ * - `clean`    — the file holds exactly the recorded sub-blocks, well-formed.
+ * - `absent`   — the manifest owns a region but no markers claim this env (a
+ *   harness deleted the whole block).
+ * - `conflict` — markers claim this env but were mangled (duplicated, relabelled,
+ *   non-contiguous, nested): a harness rewrite broke them.
+ * - `unowned`  — the manifest has no file-block record for (target, env).
+ */
+export type RegionStatus = 'clean' | 'absent' | 'conflict' | 'unowned';
+
+/** Result of {@link inspectOwnedRegion}: a status and, for `conflict`, why. */
+export interface RegionInspection {
+  status: RegionStatus;
+  detail?: string;
+}
+
+/**
+ * Report whether the manifest-owned marker region in `target` for `env` is intact,
+ * WITHOUT modifying anything (design D4 doctor). Reuses the exact {@link
+ * locateOwnedRegion} anchoring that {@link materialise}/{@link dematerialise}
+ * trust, so `doctor` never re-implements marker parsing and its verdict matches
+ * what a repair would then face.
+ */
+export async function inspectOwnedRegion(
+  paths: Paths,
+  opts: FileBlockTargetOptions,
+): Promise<RegionInspection> {
+  const record = findRecord(await readState(paths), opts.target, opts.env);
+  if (!record) return { status: 'unowned' };
+  const content = await readFileOrEmpty(opts.target);
+  const owned = locateOwnedRegion(content, opts.env, record.subBlocks);
+  if (owned.status === 'conflict') return { status: 'conflict', detail: owned.detail };
+  return { status: owned.status };
+}

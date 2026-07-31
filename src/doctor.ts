@@ -2,11 +2,17 @@ import { access, readdir, rm, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import type { BackupRef } from './backups.js';
+import { restore } from './backups.js';
 import {
   dematerialise as dmDematerialise,
   materialise as dmMaterialise,
   type DirMergeItem,
 } from './dir-merge.js';
+import {
+  inspectOwnedRegion,
+  materialise as fbMaterialise,
+  type FileBlockItem,
+} from './file-block.js';
 import { recoverState } from './journal.js';
 import { withLock } from './lock.js';
 import type { Paths } from './paths.js';
@@ -209,6 +215,44 @@ async function detectStoreDrift(manifest: StateManifest): Promise<DoctorProblem[
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// file-block: a manifest-owned marker region a harness rewrite broke
+// ---------------------------------------------------------------------------
+
+/** The file-block records in the manifest (one per (file, env) region). */
+function fileBlockItems(manifest: StateManifest): FileBlockItem[] {
+  return manifest.items.filter((i): i is FileBlockItem => i.surface === 'file-block');
+}
+
+/** A manifest-owned region that is no longer well-formed: `conflict` or `absent`. */
+async function isRegionBroken(paths: Paths, item: FileBlockItem): Promise<boolean> {
+  const insp = await inspectOwnedRegion(paths, { target: item.path, env: item.ownerEnv });
+  return insp.status === 'conflict' || insp.status === 'absent';
+}
+
+/** Manifest-owned file-block regions whose markers a harness broke (design D4). */
+async function detectMangledMarkers(
+  paths: Paths,
+  manifest: StateManifest,
+): Promise<DoctorProblem[]> {
+  const out: DoctorProblem[] = [];
+  for (const item of fileBlockItems(manifest)) {
+    const insp = await inspectOwnedRegion(paths, { target: item.path, env: item.ownerEnv });
+    if (insp.status !== 'conflict' && insp.status !== 'absent') continue;
+    const why =
+      insp.status === 'conflict'
+        ? `its markers were mangled (${insp.detail ?? 'no longer well-formed'})`
+        : 'its managed marker region is missing';
+    out.push({
+      kind: 'mangled-markers',
+      where: `${item.path} (env '${item.ownerEnv}')`,
+      what: `the region env '${item.ownerEnv}' owns in ${item.path} is broken — ${why}`,
+      repair: 'restore the file to its pre-materialise backup and re-materialise a clean region',
+    });
+  }
+  return out;
+}
+
 /** Orphaned content/directory backups under `~/.agentenv/backups/` (design D4). */
 async function detectOrphanedBackups(
   paths: Paths,
@@ -237,6 +281,7 @@ export async function diagnose(paths: Paths): Promise<DoctorProblem[]> {
   problems.push(...detectJournal(paths, manifest));
   problems.push(...(await detectDanglingSymlinks(manifest)));
   problems.push(...(await detectStoreDrift(manifest)));
+  problems.push(...(await detectMangledMarkers(paths, manifest)));
   problems.push(...(await detectOrphanedBackups(paths, manifest)));
   return problems;
 }
@@ -300,6 +345,36 @@ async function repairStoreDrift(
 }
 
 /**
+ * Restore a broken file-block region. The mechanisms fail CLOSED on mangled
+ * markers (they refuse to reclaim a guessed span), so repair goes back to the
+ * item's preserved pre-materialise backup — removing the mangled markers as bytes,
+ * not by trusting them — then re-materialises a clean region from the manifest's
+ * recorded sub-blocks + store. The re-materialise is journalled and lock-guarded.
+ *
+ * Scope: one region per file. Several envs owning regions in ONE file with mangled
+ * markers is a hardening case (Task 5.1); here each broken region is repaired from
+ * its own backup.
+ */
+async function repairMangledMarkers(
+  paths: Paths,
+  manifest: StateManifest,
+  actions: string[],
+): Promise<void> {
+  for (const item of fileBlockItems(manifest)) {
+    if (!(await isRegionBroken(paths, item))) continue;
+    // Back to the pre-materialise state (markers gone), then rebuild the region.
+    if (item.backupRef) await restore(paths, item.backupRef, item.path);
+    await fbMaterialise(paths, {
+      target: item.path,
+      env: item.ownerEnv,
+      mode: item.mode,
+      sources: item.subBlocks.map((sb) => ({ source: sb.source, storePath: sb.storePath })),
+    });
+    actions.push(`restored mangled marker region in ${item.path} (env '${item.ownerEnv}')`);
+  }
+}
+
+/**
  * Return every owned surface to a consistent state, then re-scan. Order matters:
  *
  * 1. `recoverState` first — roll back any pending journal so the manifest is
@@ -327,6 +402,7 @@ export async function repair(paths: Paths): Promise<RepairResult> {
   // 2. Re-drive broken owned surfaces from the manifest + store.
   await repairStoreDrift(paths, await readState(paths), actions);
   await repairDanglingSymlinks(paths, await readState(paths), actions);
+  await repairMangledMarkers(paths, await readState(paths), actions);
 
   // 3. Orphaned backups: GC against the final manifest.
   const manifest = await readState(paths);
