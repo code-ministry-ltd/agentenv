@@ -58,6 +58,16 @@ export const PULL_TIMEOUT_MS = 3_000;
  * the caller inspects `code`. A spawn error (git missing) or a timeout resolves
  * with `code: null`; `timedOut` distinguishes the two. No shell; credential
  * prompts are disabled so a private remote fails fast instead of hanging.
+ *
+ * Timeout is a HARD bound even against a black-holing remote (F1): git spawns a
+ * transport helper (`git-remote-https`) as a grandchild that inherits git's stdout
+ * pipe. Killing only the direct `git` leaves that helper alive (reparented) holding
+ * the pipe open, so `'close'` — which waits for the stdio to close — never fires and
+ * the promise would hang forever. So we spawn `detached` (git leads its own process
+ * GROUP), kill the whole GROUP on timeout (helper included), and settle on `'exit'`
+ * — which fires on the direct child's death regardless of a grandchild still holding
+ * a pipe. The happy path still settles on `'close'` so full output is captured; a
+ * `settled` guard makes resolution single-shot.
  */
 export const defaultGitRunner: GitRunner = (args, opts) =>
   new Promise<GitRunResult>((resolvePromise) => {
@@ -65,23 +75,51 @@ export const defaultGitRunner: GitRunner = (args, opts) =>
       cwd: opts.cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...opts.env, GIT_TERMINAL_PROMPT: '0' },
+      detached: true, // own process group, so a timeout can kill the transport helper too
     });
     let stdout = '';
     let stderr = '';
     let timedOut = false;
-    child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
-    child.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
+    let settled = false;
+    child.stdout?.on('data', (d: Buffer) => (stdout += d.toString()));
+    child.stderr?.on('data', (d: Buffer) => (stderr += d.toString()));
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGKILL');
+      // Kill the whole process GROUP (negative pid) so the reparented transport
+      // helper dies too; fall back to the direct child if the group kill is denied.
+      try {
+        if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL');
+      } catch {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
     }, opts.timeoutMs);
+    timer.unref?.();
+    const settle = (result: GitRunResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      // Drop the pipes so a lingering grandchild that still holds one open can never
+      // keep the event loop (or a test) alive after we have resolved.
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      resolvePromise(result);
+    };
     child.on('error', (err) => {
-      clearTimeout(timer);
-      resolvePromise({ code: null, stdout, stderr: `${stderr}${err.message}`, timedOut });
+      settle({ code: null, stdout, stderr: `${stderr}${err.message}`, timedOut });
     });
+    // Happy path: 'close' fires once stdio is flushed → full output captured.
     child.on('close', (code) => {
-      clearTimeout(timer);
-      resolvePromise({ code, stdout, stderr, timedOut });
+      settle({ code, stdout, stderr, timedOut });
+    });
+    // Hang path: on timeout the group is killed; 'exit' fires on the direct child's
+    // death even while a grandchild still holds the pipe open (so 'close' may never
+    // come). We settle with whatever output we captured before the kill.
+    child.on('exit', (code) => {
+      if (timedOut) settle({ code, stdout, stderr, timedOut });
     });
   });
 
