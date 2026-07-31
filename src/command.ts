@@ -1,5 +1,5 @@
 import type { Adapter } from './adapter.js';
-import type { GitRunner } from './git.js';
+import type { ConflictedFile, GitRunner } from './git.js';
 import type { Paths } from './paths.js';
 import type { CaptureFn, ExecHarness } from './session/exec.js';
 
@@ -60,6 +60,16 @@ export interface RunOptions {
    * failing or unreachable remote deterministically, with no network.
    */
   gitRun?: GitRunner;
+  /**
+   * Resolve a rebase conflict during `agentenv sync --resolve` (Task 2.2). This is
+   * the "user resolved the files on disk" step, injected so the walkthrough is
+   * testable non-interactively: it receives the conflicted store files and MUST
+   * write the resolved content to each `absPath`, returning `true` to continue the
+   * rebase or `false` to abort and keep local. agentenv NEVER auto-resolves — with
+   * no seam the command runs the guided on-disk two-step flow (show files → edit →
+   * re-run to continue).
+   */
+  resolveConflicts?: (files: readonly ConflictedFile[]) => Promise<boolean>;
 }
 
 /** Everything a command handler receives for one invocation. */

@@ -763,11 +763,16 @@ export interface PullResult {
  * fatal). A rebase CONFLICT is aborted (`git rebase --abort`) so the store stays
  * usable from the working tree — `agentenv sync --resolve` (Task 2.2) owns the
  * resolution UX; here we only refuse to leave a half-rebased tree.
+ *
+ * `opts.holdConflict` (Task 2.2 resolve path) DELIBERATELY skips that abort so the
+ * conflicted rebase is left in progress for {@link continueRebase} to walk through.
+ * The default stays abort-on-conflict, so every OTHER caller (the invocation
+ * lifecycle) keeps the store usable exactly as in 2.1.
  */
 export async function pullRebase(
   paths: Paths,
   env: NodeJS.ProcessEnv,
-  opts: { run?: GitRunner; timeoutMs?: number } = {},
+  opts: { run?: GitRunner; timeoutMs?: number; holdConflict?: boolean } = {},
 ): Promise<PullResult> {
   if (!(await storeIsRepo(paths))) return { status: 'no-repo' };
   const url = await getRemoteUrl(paths, env, opts.run);
@@ -783,10 +788,11 @@ export async function pullRebase(
   if (res.timedOut) return { status: 'offline', detail: 'network timeout' };
 
   const stderr = `${res.stdout}\n${res.stderr}`;
-  // A rebase left in-progress means a real conflict → abort to keep the tree usable.
+  // A rebase left in-progress means a real conflict. By default abort to keep the
+  // tree usable; `holdConflict` leaves it in progress for the guided resolve.
   if (/CONFLICT|could not apply|Resolve all conflicts|needs merge/i.test(stderr)) {
-    await git(ctx, ['rebase', '--abort']);
-    return { status: 'conflict', detail: 'store history diverged — run `agentenv sync --resolve` (Task 2.2)' };
+    if (!opts.holdConflict) await git(ctx, ['rebase', '--abort']);
+    return { status: 'conflict', detail: 'store history diverged — run `agentenv sync --resolve`' };
   }
   // Could-not-connect / unknown host / repository-not-found → treat as offline.
   if (/could not read|unable to access|Could not resolve host|Connection|repository .* not found|does not appear to be a git repository|No such file/i.test(stderr)) {
@@ -794,6 +800,77 @@ export async function pullRebase(
   }
   // Any other non-zero exit: report, but never fatal.
   return { status: 'error', detail: redactRemoteUrl(firstLine(res.stderr)) || 'pull failed' };
+}
+
+// ---------------------------------------------------------------------------
+// Rebase resolution primitives (Task 2.2) — detect, list, continue, abort.
+// NEVER auto-resolve: the caller injects the human's on-disk resolution.
+// ---------------------------------------------------------------------------
+
+/** One conflicted (unmerged) store file during a rebase resolution (Task 2.2). */
+export interface ConflictedFile {
+  /** Store-relative path (posix separators). */
+  path: string;
+  /** Absolute path on disk — the resolver reads/writes it to record its resolution. */
+  absPath: string;
+}
+
+/**
+ * Is a `git rebase` currently in progress in the store? (i.e. a conflict is being
+ * HELD for resolution — see {@link pullRebase} `holdConflict`). Cheap fs check for
+ * the state dirs git leaves under `.git/` mid-rebase.
+ */
+export async function rebaseInProgress(paths: Paths): Promise<boolean> {
+  const gitDir = join(paths.store, '.git');
+  return (await pathExists(join(gitDir, 'rebase-merge'))) || (await pathExists(join(gitDir, 'rebase-apply')));
+}
+
+/** The store's currently-unmerged files (`git diff --diff-filter=U`), for the walkthrough. */
+export async function listConflictedFiles(
+  paths: Paths,
+  env: NodeJS.ProcessEnv,
+  run?: GitRunner,
+): Promise<ConflictedFile[]> {
+  const ctx = gitContext(paths, env, run);
+  const res = await git(ctx, ['diff', '--name-only', '--diff-filter=U', '-z']);
+  return res.stdout
+    .split('\0')
+    .filter((n) => n !== '')
+    .map((rel) => ({ path: rel, absPath: join(paths.store, ...rel.split('/')) }));
+}
+
+/**
+ * Stage the (human-)resolved working tree and `git rebase --continue` (Task 2.2).
+ * The editor is disabled (`GIT_EDITOR=true`) so the replayed commit keeps its
+ * message non-interactively, and identity/signing are pinned exactly like {@link
+ * commitStore}. If the resolution left the patch empty (the user resolved identical
+ * to upstream), continue would error "no changes" — we `--skip` that commit instead.
+ * NEVER auto-resolves: it only stages what the caller's resolver already wrote.
+ */
+export async function continueRebase(
+  paths: Paths,
+  env: NodeJS.ProcessEnv,
+  run?: GitRunner,
+): Promise<GitRunResult> {
+  const ctx = gitContext(paths, env, run);
+  const identity = await resolveGitIdentity(ctx);
+  await git(ctx, ['add', '-A']); // mark the resolved paths resolved
+  const contEnv: NodeJS.ProcessEnv = { ...env, GIT_EDITOR: 'true', GIT_SEQUENCE_EDITOR: 'true' };
+  const res = await ctx.run([...commitArgs(identity), 'rebase', '--continue'], {
+    cwd: paths.store,
+    env: contEnv,
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+  });
+  if (res.code !== 0 && /no changes|nothing to commit|patch is empty/i.test(`${res.stdout}\n${res.stderr}`)) {
+    return ctx.run(['rebase', '--skip'], { cwd: paths.store, env: contEnv, timeoutMs: DEFAULT_TIMEOUT_MS });
+  }
+  return res;
+}
+
+/** Abort an in-progress rebase (`git rebase --abort`) — restores the pre-rebase local state. */
+export async function abortRebase(paths: Paths, env: NodeJS.ProcessEnv, run?: GitRunner): Promise<GitRunResult> {
+  const ctx = gitContext(paths, env, run);
+  return git(ctx, ['rebase', '--abort']);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,8 +1,20 @@
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
-import { getRemoteUrl, storeIsRepo } from '../git.js';
+import {
+  abortRebase,
+  clearConflictMarker,
+  commitStore,
+  type ConflictedFile,
+  continueRebase,
+  getRemoteUrl,
+  listConflictedFiles,
+  pullRebase,
+  rebaseInProgress,
+  storeIsRepo,
+  writeConflictMarker,
+} from '../git.js';
 import { ensureStore } from '../store.js';
-import { closeStoreSync, openStoreSync } from './store-sync.js';
+import { closeStoreSync, noteBlockedCommit, openStoreSync } from './store-sync.js';
 
 /**
  * `agentenv sync` — a manual store sync (design D9, Task 2.2). It runs the same
@@ -13,8 +25,14 @@ import { closeStoreSync, openStoreSync } from './store-sync.js';
  *   one fail-soft push; reports pulled / pushed / queued / offline.
  * - **rebase conflict** → 2.1 aborts the rebase so the store keeps working from the
  *   working tree; sync reports it is BLOCKED and points at `agentenv sync --resolve`
- *   (exit 1). A conflict halts SYNC only — never local function. Slice 3 adds the
- *   `--resolve` / `--abort` walkthrough; a conflict is NEVER auto-resolved.
+ *   (exit 1). A conflict halts SYNC only — never local function.
+ * - **`--resolve`** → re-enters the held conflict, shows the conflicted store files
+ *   (plain YAML/Markdown), lets the human resolve them on disk (the injected
+ *   {@link CommandContext} `resolveConflicts` seam, else the guided two-step flow),
+ *   then `git rebase --continue`s and completes the sync so BOTH sides land.
+ * - **`--abort`** → cancels the resolution and keeps the local version intact.
+ *
+ * agentenv NEVER auto-resolves, auto-merges, or force-pushes.
  */
 export const syncCommand: Command = {
   name: 'sync',
@@ -33,6 +51,8 @@ export const syncCommand: Command = {
       return fail('sync: --resolve and --abort are mutually exclusive\n');
     }
 
+    if (parsed.booleans.has('abort')) return abortSync(ctx);
+    if (parsed.booleans.has('resolve')) return resolveSync(ctx);
     return plainSync(ctx);
   },
 };
@@ -94,6 +114,173 @@ async function plainSync(ctx: CommandContext): Promise<RunResult> {
   }
 
   return { stdout: `${report.join('\n')}\n`, ...(stderr ? { stderr } : {}), code: 0 };
+}
+
+/**
+ * `agentenv sync --resolve` — the guided walkthrough for a REAL rebase conflict.
+ *
+ * A normal invocation aborts the conflicting rebase (2.1) so nothing local breaks,
+ * which means the conflict is NOT sitting on disk as an in-progress rebase. So the
+ * first `--resolve` re-enters it (`pull --rebase` holding the conflict), then either
+ * the injected resolver drives it to completion in one shot, or — with no resolver —
+ * shows the conflicted files and stops for the user to edit on disk and re-run.
+ * NEVER auto-resolves.
+ */
+async function resolveSync(ctx: CommandContext): Promise<RunResult> {
+  const { paths, env, options } = ctx;
+  await ensureStore(paths);
+  if (!(await storeIsRepo(paths))) {
+    return ok('sync --resolve: the store is not a git repository yet — run `agentenv init` first.\n');
+  }
+
+  const notices: string[] = [];
+  const wasInProgress = await rebaseInProgress(paths);
+
+  // Not already mid-rebase → clean the tree, then re-enter the conflict (held).
+  if (!wasInProgress) {
+    const drift = await commitStore(paths, env, 'agentenv: sync drift', options.gitRun);
+    if (drift.status === 'blocked') {
+      noteBlockedCommit(drift, notices);
+      return fail(`${notices.join('\n')}\nsync --resolve: could not commit local drift; resolve the secret first.\n`);
+    }
+
+    const pull = await pullRebase(paths, env, {
+      holdConflict: true,
+      ...(options.gitRun ? { run: options.gitRun } : {}),
+    });
+    if (pull.status === 'no-remote') return ok('sync --resolve: no remote configured — nothing to resolve.\n');
+    if (pull.status === 'nothing') return ok('sync --resolve: nothing to resolve (no local history yet).\n');
+    if (pull.status === 'offline' || pull.status === 'error') {
+      return fail(`sync --resolve: cannot resolve right now — ${pull.detail ?? 'the remote is unreachable'}. Try again when online.\n`);
+    }
+    if (pull.status === 'ok') {
+      // No conflict after all — a clean pull. Finish the sync and clear any marker.
+      await clearConflictMarker(paths);
+      const push = await closeStoreSync(ctx, notices);
+      const line = push?.status === 'ok' ? ' Pushed local changes.' : '';
+      return withStderr({ stdout: `sync --resolve: no conflict to resolve — pulled cleanly.${line}\n`, code: 0 }, notices);
+    }
+    // pull.status === 'conflict' → the rebase is now in progress (held).
+    await writeConflictMarker(paths, pull.detail ?? 'store history diverged');
+  }
+
+  const files = await listConflictedFiles(paths, env, options.gitRun);
+  const seam = options.resolveConflicts;
+
+  // Manual entry (no resolver, just entered this invocation): show the files and stop
+  // so the user can resolve on disk, then re-run `--resolve` to continue.
+  if (!seam && !wasInProgress) {
+    return manualPending(files, notices);
+  }
+
+  return driveResolution(ctx, notices, seam);
+}
+
+/** Walk the held rebase to completion: resolve (via the seam or on-disk edits) + continue, then push. */
+async function driveResolution(
+  ctx: CommandContext,
+  notices: string[],
+  seam: ((files: readonly ConflictedFile[]) => Promise<boolean>) | undefined,
+): Promise<RunResult> {
+  const { paths, env, options } = ctx;
+  const MAX_STEPS = 50; // guard against a pathological rebase series
+
+  for (let step = 0; step < MAX_STEPS && (await rebaseInProgress(paths)); step++) {
+    const files = await listConflictedFiles(paths, env, options.gitRun);
+    if (files.length > 0 && seam) {
+      const resolved = await seam(files);
+      if (!resolved) {
+        await abortRebase(paths, env, options.gitRun);
+        await clearConflictMarker(paths);
+        return withStderr(
+          { stdout: 'sync --resolve: cancelled — the rebase was aborted; your local store is unchanged.\n', code: 0 },
+          notices,
+        );
+      }
+    }
+
+    // Stage the (human-)resolved tree and continue the rebase.
+    const cont = await continueRebase(paths, env, options.gitRun);
+    if (cont.code !== 0) {
+      // A LATER commit in the series conflicted → surface the new files and stop
+      // (the seam loop would otherwise spin); if it is not a conflict, it is a real error.
+      if (await rebaseInProgress(paths)) {
+        const remaining = await listConflictedFiles(paths, env, options.gitRun);
+        if (remaining.length > 0) {
+          if (seam) continue; // let the resolver handle the next batch
+          return manualPending(remaining, notices);
+        }
+      }
+      const detail = firstLine(cont.stderr) || firstLine(cont.stdout) || 'rebase --continue failed';
+      return fail(`sync --resolve: ${detail}\nThe rebase is left in progress; run \`agentenv sync --abort\` to cancel.\n`);
+    }
+  }
+
+  if (await rebaseInProgress(paths)) {
+    return fail('sync --resolve: the rebase is still in progress — re-run `agentenv sync --resolve`.\n');
+  }
+
+  // Resolved: clear the marker and complete the sync (one push lands both sides).
+  await clearConflictMarker(paths);
+  const push = await closeStoreSync(ctx, notices);
+  const pushLine =
+    push?.status === 'ok'
+      ? ' Pushed the reconciled history.'
+      : push?.status === 'queued'
+        ? ' The push is queued (remote unreachable) and will flush on the next reachable invocation.'
+        : '';
+  return withStderr(
+    { stdout: `sync --resolve: resolved the conflict and completed the sync.${pushLine}\n`, code: 0 },
+    notices,
+  );
+}
+
+/** `agentenv sync --abort` — cancel a resolution and keep the local version intact. */
+async function abortSync(ctx: CommandContext): Promise<RunResult> {
+  const { paths, env, options } = ctx;
+  await ensureStore(paths);
+  if (!(await storeIsRepo(paths))) {
+    return ok('sync --abort: the store is not a git repository — nothing to abort.\n');
+  }
+
+  if (await rebaseInProgress(paths)) {
+    const res = await abortRebase(paths, env, options.gitRun);
+    if (res.code !== 0) {
+      return fail(`sync --abort: git rebase --abort failed — ${firstLine(res.stderr) || 'unknown error'}\n`);
+    }
+  }
+  await clearConflictMarker(paths);
+  return ok('sync --abort: cancelled — the store is unchanged and your local content is intact.\n');
+}
+
+/** Show the conflicted store files with plain-YAML/Markdown guidance and stop (exit 1). */
+function manualPending(files: readonly ConflictedFile[], notices: readonly string[]): RunResult {
+  const list = files.length > 0 ? files.map((f) => `  ${f.path}`).join('\n') : '  (no files reported)';
+  const prefix = notices.length > 0 ? `${notices.join('\n')}\n` : '';
+  return {
+    stdout: '',
+    stderr:
+      `${prefix}sync --resolve: a rebase conflict needs your help. These store files conflict:\n` +
+      `${list}\n` +
+      'The store is plain YAML/Markdown — edit each file to the content you want (remove the\n' +
+      '`<<<<<<<` / `=======` / `>>>>>>>` markers), then run `agentenv sync --resolve` again to\n' +
+      'continue, or `agentenv sync --abort` to cancel and keep your local version.\n',
+    code: 1,
+  };
+}
+
+/** First non-empty trimmed line — compact diagnostics without leaking a multi-line dump. */
+function firstLine(text: string): string {
+  return text
+    .split('\n')
+    .map((l) => l.trim())
+    .find((l) => l !== '') ?? '';
+}
+
+/** Attach accumulated sync notices to a result's stderr (nothing added when empty). */
+function withStderr(result: RunResult, notices: readonly string[]): RunResult {
+  if (notices.length === 0) return result;
+  return { ...result, stderr: `${result.stderr ?? ''}${notices.join('\n')}\n` };
 }
 
 function ok(stdout: string): RunResult {

@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { run } from '../src/cli.js';
-import { isConflictPending } from '../src/git.js';
+import { type ConflictedFile, isConflictPending } from '../src/git.js';
 import { type Paths, resolvePaths } from '../src/paths.js';
 import { makeTempHome, type TempHome } from './helpers.js';
 
@@ -78,7 +78,21 @@ function localCommit(store: string, mutate: (root: string) => void, message: str
 
 const ENV_LOCAL = 'version: "1.0"\ndescription: local-change\nnotes: edited on this machine\n';
 const ENV_REMOTE = 'version: "1.0"\ndescription: remote-change\nnotes: edited on the other machine\n';
+const ENV_MERGED = 'version: "1.0"\ndescription: merged-change\nnotes: reconciled by hand\n';
 const SKILL = (name: string): string => `---\nname: ${name}\ndescription: the ${name} skill\n---\n# ${name}\n`;
+
+/** Commit subjects on the bare remote's main branch (works on a bare repo). */
+function remoteSubjects(remoteUrl: string): string {
+  return execFileSync('git', ['log', '--format=%s', 'main'], { cwd: new URL(remoteUrl).pathname, encoding: 'utf8' });
+}
+
+/** Every tracked path on the bare remote's main branch. */
+function remoteTree(remoteUrl: string): string {
+  return execFileSync('git', ['ls-tree', '-r', '--name-only', 'main'], {
+    cwd: new URL(remoteUrl).pathname,
+    encoding: 'utf8',
+  });
+}
 
 /**
  * Drive two machines into a genuine rebase conflict on `environments/writing/env.yaml`,
@@ -179,9 +193,119 @@ describe('sync: a real rebase conflict halts SYNC only, never local function (D9
     await run(['sync'], { env: th.env });
 
     // The remote still has its own edit and never received the local (non-fast-forward) push.
-    const bareDir = new URL(remote).pathname;
-    const remoteSubjects = execFileSync('git', ['log', '--format=%s', 'main'], { cwd: bareDir, encoding: 'utf8' });
-    expect(remoteSubjects).toContain('agentenv: remote edits writing');
-    expect(remoteSubjects).not.toContain('agentenv: local edits writing');
+    expect(remoteSubjects(remote)).toContain('agentenv: remote edits writing');
+    expect(remoteSubjects(remote)).not.toContain('agentenv: local edits writing');
+  });
+});
+
+describe('sync --resolve: the guided conflict walkthrough (D9, "never auto-resolve")', () => {
+  it('drives the injected resolution, continues the rebase, and lands BOTH sides', async () => {
+    const th = gitHome();
+    const { paths, remote } = await induceConflict(th);
+
+    // The injected "user resolved the files on disk" step: it MUST write the merged
+    // content and return true. agentenv itself never merges.
+    const seen: string[] = [];
+    const resolveConflicts = async (files: readonly ConflictedFile[]): Promise<boolean> => {
+      for (const f of files) {
+        seen.push(f.path);
+        writeFileSync(f.absPath, ENV_MERGED, 'utf8');
+      }
+      return true;
+    };
+
+    const res = await run(['sync', '--resolve'], { env: th.env, resolveConflicts });
+    expect(res.code).toBe(0);
+    expect(res.stdout).toMatch(/resolved the conflict/i);
+    // The seam was handed exactly the conflicted store file.
+    expect(seen).toContain('environments/writing/env.yaml');
+
+    // BOTH sides landed: the merged file + the local-only skill + the remote-only skill.
+    expect(readFileSync(join(paths.environments, 'writing', 'env.yaml'), 'utf8')).toContain('merged-change');
+    expect(existsSync(join(paths.environments, 'writing', 'skills', 'local-skill'))).toBe(true);
+    expect(existsSync(join(paths.environments, 'writing', 'skills', 'remote-skill'))).toBe(true);
+
+    // The conflict marker is cleared and the reconciled history is on the remote.
+    expect(await isConflictPending(paths)).toBe(false);
+    expect(remoteSubjects(remote)).toContain('agentenv: local edits writing');
+    expect(remoteSubjects(remote)).toContain('agentenv: remote edits writing');
+    expect(remoteTree(remote)).toContain('environments/writing/skills/local-skill/SKILL.md');
+
+    // status is no longer blocked.
+    expect((await run(['status'], { env: th.env })).stdout).not.toMatch(/BLOCKED by a rebase conflict/i);
+  });
+
+  it('never auto-resolves — with the resolver returning false it aborts and keeps local', async () => {
+    const th = gitHome();
+    const { paths } = await induceConflict(th);
+
+    // The resolver declines (the human chose to cancel) → abort, keep local.
+    const resolveConflicts = async (): Promise<boolean> => false;
+    const res = await run(['sync', '--resolve'], { env: th.env, resolveConflicts });
+    expect(res.code).toBe(0);
+    expect(res.stdout).toMatch(/cancelled/i);
+
+    // Local content is intact; the remote's diverging change was NOT pulled in.
+    expect(readFileSync(join(paths.environments, 'writing', 'env.yaml'), 'utf8')).toContain('local-change');
+    expect(existsSync(join(paths.environments, 'writing', 'skills', 'local-skill'))).toBe(true);
+    expect(existsSync(join(paths.environments, 'writing', 'skills', 'remote-skill'))).toBe(false);
+    expect(await isConflictPending(paths)).toBe(false);
+  });
+
+  it('with no resolver, the guided two-step (show files → edit on disk → re-run) completes', async () => {
+    const th = gitHome();
+    const { paths } = await induceConflict(th);
+
+    // Step 1: enter the conflict, list the files, and stop (rebase held).
+    const first = await run(['sync', '--resolve'], { env: th.env });
+    expect(first.code).toBe(1);
+    expect(first.stderr ?? '').toContain('environments/writing/env.yaml');
+    expect(await isConflictPending(paths)).toBe(true);
+
+    // The user resolves on disk (plain YAML) — no git commands.
+    writeFileSync(join(paths.environments, 'writing', 'env.yaml'), ENV_MERGED, 'utf8');
+
+    // Step 2: re-run → agentenv stages + continues the rebase to completion.
+    const second = await run(['sync', '--resolve'], { env: th.env });
+    expect(second.code).toBe(0);
+    expect(second.stdout).toMatch(/resolved the conflict/i);
+    expect(readFileSync(join(paths.environments, 'writing', 'env.yaml'), 'utf8')).toContain('merged-change');
+    expect(existsSync(join(paths.environments, 'writing', 'skills', 'remote-skill'))).toBe(true);
+    expect(await isConflictPending(paths)).toBe(false);
+  });
+});
+
+describe('sync --abort: cancel a conflict resolution and keep local (D9)', () => {
+  it('aborts an in-progress (manually-entered) rebase and leaves local content intact', async () => {
+    const th = gitHome();
+    const { paths } = await induceConflict(th);
+
+    // Enter the conflict with no resolver → rebase is held in progress.
+    const entered = await run(['sync', '--resolve'], { env: th.env });
+    expect(entered.code).toBe(1);
+
+    // Abort it.
+    const res = await run(['sync', '--abort'], { env: th.env });
+    expect(res.code).toBe(0);
+    expect(res.stdout).toMatch(/cancelled/i);
+
+    // Local is exactly as it was; the remote change was not merged; status is clear.
+    expect(readFileSync(join(paths.environments, 'writing', 'env.yaml'), 'utf8')).toContain('local-change');
+    expect(existsSync(join(paths.environments, 'writing', 'skills', 'local-skill'))).toBe(true);
+    expect(existsSync(join(paths.environments, 'writing', 'skills', 'remote-skill'))).toBe(false);
+    expect(await isConflictPending(paths)).toBe(false);
+    expect((await run(['status'], { env: th.env })).stdout).not.toMatch(/BLOCKED by a rebase conflict/i);
+  });
+
+  it('clears the blocked marker even when a prior sync already aborted the rebase', async () => {
+    const th = gitHome();
+    const { paths } = await induceConflict(th);
+    await run(['sync'], { env: th.env }); // aborts the rebase, sets the marker
+    expect(await isConflictPending(paths)).toBe(true);
+
+    const res = await run(['sync', '--abort'], { env: th.env });
+    expect(res.code).toBe(0);
+    expect(await isConflictPending(paths)).toBe(false);
+    expect(readFileSync(join(paths.environments, 'writing', 'env.yaml'), 'utf8')).toContain('local-change');
   });
 });
