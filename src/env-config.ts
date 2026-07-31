@@ -1,4 +1,5 @@
 import { parse as parseYaml, stringify as stringifyYaml, YAMLParseError } from 'yaml';
+import { parseVersion } from './schema-version.js';
 
 /**
  * The env.yaml schema version this CLI understands, as {major, minor}.
@@ -44,29 +45,6 @@ export class EnvYamlError extends Error {
     super(message);
     this.name = 'EnvYamlError';
   }
-}
-
-interface ParsedVersion {
-  major: number;
-  minor: number;
-}
-
-function parseVersion(raw: unknown): ParsedVersion | null {
-  if (typeof raw === 'number' && Number.isFinite(raw)) {
-    // A YAML number like `1` or `1.5`: the integer part is the major, the
-    // first fractional digit the minor. Authored files quote the version to
-    // avoid this lossy path; this branch is pure tolerance.
-    const major = Math.trunc(raw);
-    const minor = Math.round((raw - major) * 10);
-    return { major, minor };
-  }
-  if (typeof raw === 'string') {
-    const match = /^(\d+)(?:\.(\d+))?$/.exec(raw.trim());
-    if (match) {
-      return { major: Number(match[1]), minor: match[2] ? Number(match[2]) : 0 };
-    }
-  }
-  return null;
 }
 
 function normaliseVersion(raw: unknown, file: string): string {

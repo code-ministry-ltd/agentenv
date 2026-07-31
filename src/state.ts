@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import type { BackupRef } from './backups.js';
 import { writeFileAtomic } from './fs-atomic.js';
 import type { Paths } from './paths.js';
+import { parseVersion } from './schema-version.js';
 
 /**
  * The state.json schema version this CLI understands, as {major, minor}.
@@ -115,26 +116,6 @@ export interface StateManifest {
   items: ManifestItem[];
   journal: JournalEntry[] | null;
   [key: string]: unknown;
-}
-
-interface ParsedVersion {
-  major: number;
-  minor: number;
-}
-
-function parseVersion(raw: unknown): ParsedVersion | null {
-  if (typeof raw === 'number' && Number.isFinite(raw)) {
-    const major = Math.trunc(raw);
-    const minor = Math.round((raw - major) * 10);
-    return { major, minor };
-  }
-  if (typeof raw === 'string') {
-    const match = /^(\d+)(?:\.(\d+))?$/.exec(raw.trim());
-    if (match) {
-      return { major: Number(match[1]), minor: match[2] ? Number(match[2]) : 0 };
-    }
-  }
-  return null;
 }
 
 function normaliseStateVersion(raw: unknown, file: string): string {
