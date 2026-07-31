@@ -142,4 +142,32 @@ describe('disown: a session-born item prompts keep-ephemeral vs place-global (D1
     expect(existsSync(join(paths.envDir('work'), 'skills', name))).toBe(false);
     expect(res.stdout).toMatch(/global/i);
   });
+
+  it('place-global NEVER clobbers a pre-existing non-agentenv real dir (Finding 1)', async () => {
+    const { th, paths, viewDir, realDir, name } = await adoptSessionBorn();
+
+    // The user ALSO has their OWN real global skill at the same path — never
+    // agentenv-managed (their own SKILL.md + a user-only file).
+    const userReal = join(realDir, name);
+    mkdirSync(userReal, { recursive: true });
+    const userSkill = `---\nname: ${name}\ndescription: MY OWN ${name} skill\n---\n\n# ${name}\nDO NOT TOUCH — user's own file\n`;
+    writeFileSync(join(userReal, 'SKILL.md'), userSkill, 'utf8');
+    writeFileSync(join(userReal, 'user-only.txt'), 'private user data\n', 'utf8');
+
+    // Accept the place-global prompt — it must REFUSE to overwrite the user's files.
+    const res = await run(['disown', name], { env: th.env, confirm: async () => true });
+    expect(res.code).toBe(0);
+
+    // The user's real files are byte-for-byte intact — not clobbered by the session-born skill.
+    expect(readFileSync(join(userReal, 'SKILL.md'), 'utf8')).toBe(userSkill);
+    expect(existsSync(join(userReal, 'user-only.txt'))).toBe(true);
+    expect(await readFile(join(userReal, 'SKILL.md'), 'utf8')).not.toContain('body-of-born');
+
+    // Skip-and-warn: the item was kept session-ephemeral (restored to the view path),
+    // ownership dropped, store copy gone — and the refusal was announced.
+    expect((await lstat(join(viewDir, name))).isDirectory()).toBe(true);
+    expect(existsSync(join(paths.envDir('work'), 'skills', name))).toBe(false);
+    expect((await readState(paths)).items.some((i) => i.path === join(viewDir, name))).toBe(false);
+    expect(res.stdout).toMatch(/ephemeral|not managed by agentenv|refus/i);
+  });
 });

@@ -4,6 +4,7 @@ import {
   findAdoptedByName,
   markBaseline,
   singular,
+  wouldClobberUnownedPath,
   type AdoptedDirMergeItem,
 } from '../adopt.js';
 import { parseArgs } from '../args.js';
@@ -76,8 +77,18 @@ async function disown(ctx: CommandContext, item: AdoptedDirMergeItem, name: stri
           code: 1,
         };
       }
-      dest = item.realPath;
-      outcome = `placed '${name}' into the real global surface (${dest})`;
+      // Finding 1: NEVER clobber a non-owned real path. If the user already has
+      // their OWN file/dir there, refuse to place (skip-and-warn) and keep the
+      // item session-ephemeral rather than silently overwriting their config.
+      if (await wouldClobberUnownedPath(paths, await readState(paths), item.realPath)) {
+        dest = item.originalPath;
+        outcome =
+          `did NOT place '${name}' globally — ${item.realPath} already exists and is not managed by ` +
+          `agentenv (placing there would overwrite your own file); kept it session-ephemeral (${dest}), it dies with the shell`;
+      } else {
+        dest = item.realPath;
+        outcome = `placed '${name}' into the real global surface (${dest})`;
+      }
     } else {
       dest = item.originalPath;
       outcome = `kept '${name}' session-ephemeral (${dest}); it dies with the shell`;

@@ -391,6 +391,36 @@ export async function disownItem(
   });
 }
 
+/**
+ * Finding 1 no-clobber guard: whether writing to `dest` (a real global path a
+ * `disown … place-global` is about to place into) would OVERWRITE a path agentenv
+ * does not own — a user's own real file/dir. True only when `dest` EXISTS and is
+ * neither manifest-owned nor a symlink into our store; ENOENT (nothing there) and
+ * an agentenv-owned path both return false. The caller refuses to place (skip-and-
+ * warn, keeping the item session-ephemeral) rather than silently clobbering it.
+ */
+export async function wouldClobberUnownedPath(
+  paths: Paths,
+  manifest: StateManifest,
+  dest: string,
+): Promise<boolean> {
+  let st;
+  try {
+    st = await lstat(dest);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false; // nothing to clobber
+    throw err;
+  }
+  if (findOwner(manifest, dest)) return false; // agentenv-owned record
+  if (st.isSymbolicLink()) {
+    const target = await readlink(dest);
+    const abs = isAbsolute(target) ? target : resolve(dirname(dest), target);
+    const store = resolve(paths.store);
+    if (abs === store || abs.startsWith(store + sep)) return false; // our own store symlink
+  }
+  return true; // exists and is not ours → placing here would clobber the user's file
+}
+
 /** Find a manifest-owned adopted dir-merge item by its item name (basename). */
 export function findAdoptedByName(manifest: StateManifest, name: string): AdoptedDirMergeItem[] {
   return manifest.items.filter((i): i is AdoptedDirMergeItem => isAdopted(i) && baseName(i.path) === name);
