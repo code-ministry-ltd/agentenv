@@ -650,6 +650,65 @@ async function clearPushQueue(paths: Paths): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Conflict marker (machine-local; NEVER synced — a divergence is THIS machine's)
+// ---------------------------------------------------------------------------
+
+/**
+ * The machine-local rebase-conflict marker (design D9, Task 2.2). A pull that hits a
+ * rebase conflict is `--abort`ed by 2.1 so the working tree stays usable, which
+ * means the conflict state is NOT left on disk as an in-progress rebase — so we
+ * persist this marker instead. It lets `agentenv status` surface "sync blocked" and
+ * tells the user to run `agentenv sync --resolve`. It sits beside the store (never
+ * inside it), so a divergence — which is local to THIS machine — is never synced.
+ */
+export function conflictMarkerPath(paths: Paths): string {
+  return join(paths.base, 'sync-conflict.json');
+}
+
+/** The persisted conflict marker. `pending` true means "a pull is blocked by a rebase conflict". */
+export interface ConflictMarker {
+  pending: boolean;
+  since: number;
+  detail?: string;
+}
+
+/** Read the conflict marker; a missing/corrupt file reads as "no conflict". */
+export async function readConflictMarker(paths: Paths): Promise<ConflictMarker> {
+  try {
+    const text = await readFile(conflictMarkerPath(paths), 'utf8');
+    const raw = JSON.parse(text) as Partial<ConflictMarker>;
+    return {
+      pending: raw.pending === true,
+      since: typeof raw.since === 'number' ? raw.since : 0,
+      ...(typeof raw.detail === 'string' ? { detail: raw.detail } : {}),
+    };
+  } catch {
+    return { pending: false, since: 0 };
+  }
+}
+
+/** Whether a rebase conflict is currently blocking sync on this machine. */
+export async function isConflictPending(paths: Paths): Promise<boolean> {
+  return (await readConflictMarker(paths)).pending;
+}
+
+/** Record that a pull is blocked by a rebase conflict (idempotent; keeps the first `since`). */
+export async function writeConflictMarker(paths: Paths, detail: string, now: number = Date.now()): Promise<void> {
+  const existing = await readConflictMarker(paths);
+  const marker: ConflictMarker = {
+    pending: true,
+    since: existing.pending && existing.since > 0 ? existing.since : now,
+    detail,
+  };
+  await writeFileAtomic(conflictMarkerPath(paths), `${JSON.stringify(marker, null, 2)}\n`);
+}
+
+/** Clear the conflict marker (a clean pull, or a completed `--resolve`/`--abort`). */
+export async function clearConflictMarker(paths: Paths): Promise<void> {
+  await rm(conflictMarkerPath(paths), { force: true });
+}
+
+// ---------------------------------------------------------------------------
 // Push (one fail-soft push per invocation; failure queues for next time)
 // ---------------------------------------------------------------------------
 

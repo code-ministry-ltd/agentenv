@@ -12,6 +12,7 @@ import { shellInitCommand } from './shell-init.js';
 import { shimCommand } from './shim.js';
 import { showCommand } from './show.js';
 import { statusCommand } from './status.js';
+import { syncCommand } from './sync.js';
 import { useCommand } from './use.js';
 
 /**
@@ -31,6 +32,7 @@ export const commands: readonly Command[] = [
   dropCommand,
   statusCommand,
   remoteCommand,
+  syncCommand,
   runCommand,
   shellInitCommand,
   shimCommand,
