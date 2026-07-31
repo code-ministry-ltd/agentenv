@@ -6,6 +6,7 @@ import {
   type ConfigKeysSurface,
   type DirMergeSurface,
   type FileBlockSurface,
+  type SelfCheckResult,
 } from './adapter.js';
 import { backup } from './backups.js';
 import {
@@ -67,9 +68,12 @@ export interface GlobalSkip {
    * `unsupported` (adapter says so), `shadowed` (a later env or a user item won),
    * `user-collision` (a non-owned real item/key won), `compile-error`,
    * `secret-unresolved` (a substitute-rung `${VAR}` resolved to nothing → the server
-   * is skipped, fail-closed per server, D6), or `validation-failed` (the written
+   * is skipped, fail-closed per server, D6), `validation-failed` (the written
    * config-keys file was rejected wholesale by `adapter.validateConfigFile`, so the
-   * whole surface's write was rolled back — fail-closed, F2/M5).
+   * whole surface's write was rolled back — fail-closed, F2/M5), or
+   * `validation-baseline` (the file was ALREADY rejected before this invocation, by a
+   * PRE-EXISTING entry of the user's — nothing was written and the blame is not ours,
+   * F5/7).
    */
   reason:
     | 'unsupported'
@@ -77,7 +81,8 @@ export interface GlobalSkip {
     | 'user-collision'
     | 'compile-error'
     | 'secret-unresolved'
-    | 'validation-failed';
+    | 'validation-failed'
+    | 'validation-baseline';
   detail: string;
 }
 
@@ -383,14 +388,6 @@ async function materialiseConfigKeys(
 ): Promise<number> {
   const { paths, adapters, envs, env } = req;
 
-  interface Planned {
-    adapter: Adapter;
-    adapterId: string;
-    surface: ConfigKeysSurface;
-    file: string;
-    env: string;
-    injection: import('./adapter.js').ConfigKeysInjection;
-  }
   const planned: Planned[] = [];
 
   for (const adapter of adapters) {
@@ -456,11 +453,21 @@ async function materialiseConfigKeys(
   };
 
   return withLock(paths, async () => {
+    // BASELINE validation (F5/7), BEFORE any write. Cursor's validator rejects the file
+    // if ANY entry is malformed — explicitly including a PRE-EXISTING user entry. Without
+    // this check a file that was already broken makes our own (valid) injection look like
+    // the culprit: we write, the whole file is rejected, we roll back, and we blame
+    // ourselves — forever, with nothing pointing at the real offender. So a file that is
+    // already invalid is left completely alone and reported under its own reason.
+    const blocked = await baselineRejectedFiles(planned, skips, onWarn);
+    const writable = blocked.size === 0 ? planned : planned.filter((p) => !blocked.has(p.file));
+    if (writable.length === 0) return 0;
+
     const tx = await beginTransaction(paths);
     const manifest = await readState(paths); // ownership snapshot for idempotency
     let applied = 0;
     try {
-      for (const p of planned) {
+      for (const p of writable) {
         if (p.injection.style === 'keyed') {
           const owner = ownedConfigKey(manifest, p.file, p.injection.keyPath);
           if (owner !== null) continue; // already ours (or a stack env's) — idempotent no-op
@@ -549,20 +556,107 @@ async function materialiseConfigKeys(
   });
 }
 
+/** One config-keys injection, resolved to the real file it targets. */
+interface Planned {
+  adapter: Adapter;
+  adapterId: string;
+  surface: ConfigKeysSurface;
+  file: string;
+  env: string;
+  injection: import('./adapter.js').ConfigKeysInjection;
+}
+
 /** What THIS invocation injected into one config-keys file (for whole-file rollback). */
 interface WrittenConfigFile {
   adapter: Adapter;
   items: { item: ConfigKeysItem; surfaceId: string; env: string }[];
 }
 
-/** Read a file's text, treating a missing file as empty. */
-async function readFileOrEmpty(file: string): Promise<string> {
+/**
+ * Read a file's text for validation. A missing file is empty; ANY other fault (EACCES,
+ * EISDIR, …) is reported rather than thrown — the caller must treat an unreadable config
+ * as a validation FAILURE and fail closed, never let the error escape `withLock` after
+ * the batch has already committed (F5/6).
+ */
+async function readFileForValidation(file: string): Promise<{ text: string } | { error: string }> {
   try {
-    return await readFile(file, 'utf8');
+    return { text: await readFile(file, 'utf8') };
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return '';
-    throw err;
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === 'ENOENT') return { text: '' };
+    return { error: `${file}: unreadable (${e.code ?? e.message})` };
   }
+}
+
+/**
+ * Read + validate one config file, treating EVERY fault as a validation FAILURE (F5/6).
+ * An unreadable file or a validator that throws must fail CLOSED: every other adapter-hook
+ * call site here is defensively wrapped, and this one runs AFTER `tx.commit()` — an
+ * unguarded throw would escape `withLock`, exit with a stack trace, AND leave the
+ * whole-file-rejecting config committed on disk, the exact outcome the check exists to
+ * prevent.
+ */
+async function validateConfigFileSafely(
+  adapter: Adapter,
+  file: string,
+): Promise<SelfCheckResult> {
+  const read = await readFileForValidation(file);
+  if ('error' in read) return { ok: false, detail: read.error };
+  try {
+    return adapter.validateConfigFile!(file, read.text);
+  } catch (err) {
+    return {
+      ok: false,
+      detail: `${file}: ${adapter.id} whole-file validation threw — ${(err as Error).message}`,
+    };
+  }
+}
+
+/**
+ * BASELINE whole-file validation (F5/7), run under the lock BEFORE anything is written.
+ * A file that the harness ALREADY rejects — because of a pre-existing user entry — must
+ * not be written to: our injection would be rolled back and blamed for a breakage it did
+ * not cause, leaving the real offender undiagnosed. Returns the set of files to leave
+ * alone, recording one `validation-baseline` skip per losing (surface, env).
+ */
+async function baselineRejectedFiles(
+  planned: readonly Planned[],
+  skips: GlobalSkip[],
+  onWarn: (m: string) => void,
+): Promise<Set<string>> {
+  const blocked = new Set<string>();
+  const checked = new Map<string, boolean>();
+  const seen = new Set<string>();
+  for (const p of planned) {
+    if (!p.adapter.validateConfigFile) continue;
+    let bad = checked.get(p.file);
+    if (bad === undefined) {
+      const verdict = await validateConfigFileSafely(p.adapter, p.file);
+      bad = !verdict.ok;
+      checked.set(p.file, bad);
+      if (bad) {
+        blocked.add(p.file);
+        onWarn(
+          `agentenv: ${p.file} is ALREADY rejected by ${p.adapter.id} before agentenv ` +
+            `touches it — ${verdict.detail ?? 'whole-file validation failed'}. Fix it, then re-run.`,
+        );
+      }
+    }
+    if (!bad) continue;
+    const k = JSON.stringify([p.surface.id, p.env]);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    skips.push({
+      adapterId: p.adapterId,
+      surfaceId: p.surface.id,
+      reason: 'validation-baseline',
+      detail:
+        `env '${p.env}': ${p.file} was already rejected by ${p.adapter.id} whole-file ` +
+        `validation BEFORE this invocation (a pre-existing entry, not ours) — nothing was ` +
+        `written. Fix the file, then re-run.`,
+    });
+  }
+  return blocked;
 }
 
 /**
@@ -571,9 +665,9 @@ async function readFileOrEmpty(file: string): Promise<string> {
  * and validate it; on `{ok:false}` remove EVERY key/element this invocation added to that
  * file (inject→remove is byte-identical, D3), restoring the user's real config unchanged,
  * and record a `validation-failed` skip per losing surface. Runs under the caller's lock
- * (a fresh transaction per rolled-back file). Returns how many items were rolled back, so
- * the caller can discount them from `applied`. Never throws for a rejection — fail-closed
- * is the whole point; only an fs/tx fault propagates.
+ * (a fresh transaction per rolled-back file). Returns how many items were ACTUALLY rolled
+ * back, so the caller can discount them from `applied`. Never throws for a rejection or a
+ * misbehaving validator — fail-closed is the whole point; only an fs/tx fault propagates.
  */
 async function validateWrittenConfigFiles(
   paths: Paths,
@@ -584,26 +678,40 @@ async function validateWrittenConfigFiles(
   let rolledBack = 0;
   for (const [file, { adapter, items }] of written) {
     if (!adapter.validateConfigFile || items.length === 0) continue;
-    const content = await readFileOrEmpty(file);
-    const verdict = adapter.validateConfigFile(file, content);
+    const verdict = await validateConfigFileSafely(adapter, file);
     if (verdict.ok) continue;
 
     // Fail-closed: undo this invocation's contribution to the rejected file. Each
-    // removeKey matches the value we just wrote (hash agrees) and prunes any parents
-    // the inject created, so the file returns to its pre-injection bytes.
+    // removeKey normally matches the value we just wrote (hash agrees) and prunes any
+    // parents the inject created, so the file returns to its pre-injection bytes.
     const tx = await beginTransaction(paths);
+    let removed = 0;
+    const stuck: string[] = [];
     try {
-      for (const { item } of items) await removeKey(paths, tx, item);
+      for (const { item } of items) {
+        // `removeKey` returns `{removed:false, reason:'absent'|'hash-mismatch'}` WITHOUT
+        // touching the file. Counting the attempt instead of the result would report a
+        // clean rollback while the bad key is still in the harness's config and the
+        // manifest still claims ownership of it (F5/5) — so check every result.
+        const res = await removeKey(paths, tx, item);
+        if (res.removed) removed += 1;
+        else stuck.push(`${item.key ?? item.keyPath.join('.')} (${res.reason ?? 'unknown'})`);
+      }
       await tx.commit();
     } catch (err) {
       await tx.rollback();
       throw err;
     }
-    rolledBack += items.length;
+    rolledBack += removed;
 
-    const detail =
-      verdict.detail ??
-      `${file}: rejected by ${adapter.id} whole-file validation — write rolled back`;
+    const outcome =
+      stuck.length === 0
+        ? 'write rolled back'
+        : `write only PARTIALLY rolled back — agentenv could not remove ${stuck.join(', ')}; ` +
+          `${file} is still rejected by ${adapter.id}, so remove ${stuck.length === 1 ? 'it' : 'them'} by hand`;
+    const detail = verdict.detail
+      ? `${verdict.detail} — ${outcome}`
+      : `${file}: rejected by ${adapter.id} whole-file validation — ${outcome}`;
     onWarn(`agentenv: ${detail}`);
     // One skip per distinct (surface, env) so every env whose server was dropped is named.
     const seen = new Set<string>();

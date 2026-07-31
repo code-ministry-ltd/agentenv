@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { Adapter, SelfCheckResult } from '../src/adapter.js';
 import { cursorAdapter } from '../src/adapters/cursor.js';
 import { run } from '../src/cli.js';
 import type { ConfigKeysItem } from '../src/config-keys.js';
@@ -28,12 +29,16 @@ afterEach(() => {
 });
 
 /** A real ~/.cursor with a pre-existing user mcp.json, plus an env store dir. */
-function scenario(th: TempHome, serversYaml: string) {
+function scenario(
+  th: TempHome,
+  serversYaml: string,
+  userServers: Record<string, unknown> = { userSrv: { command: 'x' } },
+) {
   const paths = resolvePaths(th.env);
   const realHome = join(th.home, 'cursor');
   mkdirSync(realHome, { recursive: true });
-  // The user's real, VALID Cursor MCP config — must survive a bad injection.
-  const userMcp = `${JSON.stringify({ mcpServers: { userSrv: { command: 'x' } } }, null, 2)}\n`;
+  // The user's real Cursor MCP config — must survive a bad injection byte-for-byte.
+  const userMcp = `${JSON.stringify({ mcpServers: userServers }, null, 2)}\n`;
   writeFileSync(join(realHome, 'mcp.json'), userMcp);
 
   const envDir = paths.envDir('writing');
@@ -82,3 +87,92 @@ describe('engine: global config-keys whole-file validation (F2)', () => {
     expect(cfg.mcpServers.good).toEqual({ command: 'y' });
   });
 });
+
+describe('engine: config-keys validation is fail-CLOSED and honest (F5/5,6,7)', () => {
+  it('does not blame our injection when the file was ALREADY invalid (F5/7)', async () => {
+    const th = home();
+    // The user's mcp.json ALREADY holds a malformed entry, so Cursor rejects the whole
+    // file before we touch it. Validating only AFTER the write makes our own (valid)
+    // injection look like the culprit and hides the real offender forever.
+    const { realHome, env, userMcp } = scenario(th, 'good:\n  transport: stdio\n  command: y\n', {
+      userSrv: { command: 'x' },
+      broken: {},
+    });
+
+    const res = await run(['use', 'writing', '--global'], { env, adapters: [cursorAdapter] });
+    expect(res.code).toBe(0);
+
+    const stderr = res.stderr ?? '';
+    // A DISTINCT reason, naming the pre-existing offender — not `validation-failed`
+    // against our own surface.
+    expect(stderr).toContain('validation-baseline');
+    expect(stderr).toContain('broken');
+    expect(stderr).not.toContain('validation-failed');
+
+    // And the already-rejected file is never written to at all.
+    expect(readFileSync(join(realHome, 'mcp.json'), 'utf8')).toBe(userMcp);
+  });
+
+  it('treats a THROWING validator as a failure, never as a pass (F5/6)', async () => {
+    const th = home();
+    // Every other adapter-hook call site in materialiseConfigKeys is defensively wrapped;
+    // an unguarded throw in the POST-WRITE check escapes withLock AFTER the batch commits
+    // — an exit with a stack trace AND the bad config left on disk, the exact fail-OPEN
+    // outcome the validation exists to prevent. The baseline call (1st) passes so the
+    // throw lands squarely in that post-write window.
+    let calls = 0;
+    const boom: Adapter = {
+      ...cursorAdapter,
+      validateConfigFile(): SelfCheckResult {
+        calls += 1;
+        if (calls === 1) return { ok: true };
+        throw new Error('validator exploded');
+      },
+    };
+    const { realHome, env, userMcp } = scenario(th, 'good:\n  transport: stdio\n  command: y\n');
+
+    const res = await run(['use', 'writing', '--global'], { env, adapters: [boom] });
+    expect(res.code).toBe(0);
+    expect(res.stderr ?? '').toContain('validation-failed');
+    expect(res.stderr ?? '').toContain('validator exploded');
+    // Fail-closed: the write is rolled back, so the user's file is byte-identical.
+    expect(readFileSync(join(realHome, 'mcp.json'), 'utf8')).toBe(userMcp);
+  });
+
+  it('never claims a rollback that did not happen (F5/5)', async () => {
+    const th = home();
+    // `removeKey` refuses a drifted value (`hash-mismatch`) WITHOUT touching the file.
+    // Simulate the race deterministically: the POST-WRITE validation is our last read of
+    // the file before the rollback, so editing our injected value from inside that call
+    // (the 2nd; the 1st is the pre-write baseline) lands exactly in the window.
+    let calls = 0;
+    const racy: Adapter = {
+      ...cursorAdapter,
+      validateConfigFile(absPath, content): SelfCheckResult {
+        calls += 1;
+        if (calls === 1) return { ok: true }; // baseline: the user's file is fine
+        const cfg = JSON.parse(content) as { mcpServers: Record<string, JsonLike> };
+        cfg.mcpServers.good = { command: 'edited-by-someone-else' };
+        writeFileSync(absPath, `${JSON.stringify(cfg, null, 2)}\n`);
+        return { ok: false, detail: `${absPath}: rejected by the test validator` };
+      },
+    };
+    const { realHome, env } = scenario(th, 'good:\n  transport: stdio\n  command: y\n');
+
+    const res = await run(['use', 'writing', '--global'], { env, adapters: [racy] });
+    expect(res.code).toBe(0);
+
+    const stderr = res.stderr ?? '';
+    // The truth must be surfaced: the key is STILL in the file, so the user is told
+    // which one and that the rollback was incomplete.
+    expect(stderr).toMatch(/could not (be )?remove/i);
+    expect(stderr).toContain('mcpServers.good');
+
+    // …and it really is still there (which is exactly why we must not claim success).
+    const cfg = JSON.parse(readFileSync(join(realHome, 'mcp.json'), 'utf8'));
+    expect(cfg.mcpServers.good).toEqual({ command: 'edited-by-someone-else' });
+  });
+});
+
+/** A loose stand-in for the JSON shapes this test file pokes at. */
+type JsonLike = Record<string, unknown>;
