@@ -71,7 +71,9 @@ function parseVersion(raw: unknown): ParsedVersion | null {
 
 function normaliseVersion(raw: unknown, file: string): string {
   const v = parseVersion(raw);
-  if (!v) {
+  // major < 1 is nonsensical for a scheme that starts at 1.0 (e.g. an unquoted
+  // `version: -1` parses to major -1); reject it rather than treat it as "older".
+  if (!v || v.major < 1) {
     throw new EnvYamlError(
       `${file}: missing or invalid 'version' field (expected e.g. "1.0")`,
       file,

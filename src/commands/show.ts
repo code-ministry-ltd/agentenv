@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { parseArgs } from '../args.js';
 import type { Command } from '../command.js';
 import { EnvYamlError } from '../env-config.js';
-import { environmentExists, readEnvConfig } from '../store.js';
+import { environmentExists, readEnvConfig, validateEnvName } from '../store.js';
 
 /** Content subdirectories a later task populates; shown as an inventory here. */
 const CONTENT_SUBDIRS = ['skills', 'instructions', 'mcp', 'agents', 'commands', 'files'];
@@ -34,6 +34,11 @@ export const showCommand: Command = {
     const name = parsed.positionals[0];
     if (name === undefined) {
       return { stdout: '', stderr: 'show: missing environment name\nUsage: agentenv show <name>\n', code: 1 };
+    }
+    // Validate before any path join, so `show ../../x` can't read outside the store.
+    const nameError = validateEnvName(name);
+    if (nameError) {
+      return { stdout: '', stderr: `show: ${nameError}\n`, code: 1 };
     }
 
     if (!(await environmentExists(paths, name))) {

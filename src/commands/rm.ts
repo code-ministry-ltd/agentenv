@@ -2,11 +2,11 @@ import { rm as removeDir } from 'node:fs/promises';
 import { parseArgs } from '../args.js';
 import type { Command } from '../command.js';
 import { confirmDefault } from '../prompt.js';
-import { environmentExists } from '../store.js';
+import { environmentExists, validateEnvName } from '../store.js';
 
 export const rmCommand: Command = {
   name: 'rm',
-  usage: '<name> [--yes]',
+  usage: '<name> [--yes|--force]',
   summary: 'Remove an environment',
 
   async run({ args, paths, options }) {
@@ -17,6 +17,12 @@ export const rmCommand: Command = {
     const name = parsed.positionals[0];
     if (name === undefined) {
       return { stdout: '', stderr: 'rm: missing environment name\nUsage: agentenv rm <name> [--yes]\n', code: 1 };
+    }
+    // Validate BEFORE any path construction: path.join collapses `..`, so an
+    // unvalidated name like `..` or `../../x` would let rm -rf escape the store.
+    const nameError = validateEnvName(name);
+    if (nameError) {
+      return { stdout: '', stderr: `rm: ${nameError}\n`, code: 1 };
     }
 
     // NOTE (task 1.7): once activation exists, rm must refuse to remove an

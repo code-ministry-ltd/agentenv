@@ -1,7 +1,7 @@
 import { parseArgs } from '../args.js';
 import type { Command } from '../command.js';
 import { launchEditorDefault } from '../editor.js';
-import { environmentExists } from '../store.js';
+import { environmentExists, validateEnvName } from '../store.js';
 
 function configuredEditor(env: NodeJS.ProcessEnv): string | undefined {
   const visual = env.VISUAL?.trim();
@@ -24,6 +24,11 @@ export const editCommand: Command = {
     const name = parsed.positionals[0];
     if (name === undefined) {
       return { stdout: '', stderr: 'edit: missing environment name\nUsage: agentenv edit <name> [--print-path]\n', code: 1 };
+    }
+    // Validate before any path join, so `edit ../../x` can't open a file outside the store.
+    const nameError = validateEnvName(name);
+    if (nameError) {
+      return { stdout: '', stderr: `edit: ${nameError}\n`, code: 1 };
     }
     if (!(await environmentExists(paths, name))) {
       return { stdout: '', stderr: `edit: environment '${name}' does not exist\n`, code: 1 };
