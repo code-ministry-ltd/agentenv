@@ -102,11 +102,17 @@ export interface ConfigKeysItem extends ManifestItemBase {
   /**
    * keyed JSON/JSONC only: how many ancestor object levels this inject CREATED
    * (were absent before). On removal those parents are pruned back — deepest-first
-   * and only while each is still empty — so an inject→remove cycle is byte-identical
-   * and never leaves an orphaned `{}` in the user's file (D3, fix B1). A parent the
-   * user already had (even an empty `{}`) is never counted, so never pruned. Absent
-   * (treated as 0) when the inject created no parents, or for TOML (whose marked
-   * `[table]` mechanism removes the whole block, orphaning nothing).
+   * and only while each is still empty — so an inject→remove cycle on an EXISTING file
+   * is byte-identical and never leaves an orphaned `{}` in the user's file (D3, fix B1).
+   * A parent the user already had (even an empty `{}`) is never counted, so never
+   * pruned. Absent (treated as 0) when the inject created no parents, or for TOML (whose
+   * marked `[table]` mechanism removes the whole block, orphaning nothing).
+   *
+   * SCOPE (F5/10): this covers ancestor KEYS, not the FILE. When the target file did not
+   * exist, the inject creates it and the removal leaves an empty `{}` behind rather than
+   * un-creating it — the cycle is byte-identical only where there were bytes to begin
+   * with. Inert for every current adapter (their config files already exist), and pinned
+   * by a test in `config-keys.test.ts` so the gap stays visible.
    */
   createdParents?: number;
 }
@@ -285,8 +291,12 @@ function jsonBaseText(text: string): string {
 /**
  * Inject an object key at `keyPath`, format- and comment-preserving. JSON/JSONC
  * uses jsonc-parser surgical `modify` with no reformatting, so a full
- * inject→remove cycle is byte-identical to the original. Records ownership via the
- * transaction (backup-first, write-ahead journal).
+ * inject→remove cycle is byte-identical to the original — verified for JSONC with
+ * comments, trailing commas and tab indentation, including through the created-parent
+ * prune (which re-parses and re-modifies a second time). The one exception is a target
+ * file that did NOT exist: the inject creates it and the removal leaves an empty `{}`
+ * rather than un-creating it (F5/10, see {@link ConfigKeysItem.createdParents}). Records
+ * ownership via the transaction (backup-first, write-ahead journal).
  *
  * Refuses (a {@link ConfigKeysError}) when a NON-owned value already sits at
  * `keyPath` — it will not silently overwrite a user's JSON key (which a later
@@ -411,6 +421,17 @@ function makeKeyedItem(req: InjectKeyedRequest, createdParents: number): ConfigK
  * surgical) rather than editing a single index, because jsonc-parser's
  * position-based array-index edits mishandle the last element of an inline array;
  * a whole-array replacement is always well-formed.
+ *
+ * KNOWN GAP (F5/12): when the value is ALREADY present the file is left untouched but
+ * an ownership item is still recorded, so a later removal deletes the USER's identical
+ * pre-existing element. This is the same value-identity limitation {@link removeArrayElement}
+ * carries (B3) — array-element ownership has no per-entry marker, so our element and an
+ * identical one of the user's are indistinguishable. It also means the blanket "an
+ * inject→remove cycle is byte-identical" justification does NOT hold for this path.
+ * Currently latent: no adapter pairs an array-element surface with a
+ * `validateConfigFile` hook, so the engine's rollback never runs over one.
+ * Documented rather than fixed — a real fix needs per-item identity in the manifest,
+ * which is a frozen-interface change.
  */
 export async function injectArrayElement(
   paths: Paths,

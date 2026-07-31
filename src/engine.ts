@@ -663,8 +663,10 @@ async function baselineRejectedFiles(
  * Post-write whole-file validation for config-keys surfaces (F2/M5). For each written
  * file whose adapter defines {@link Adapter.validateConfigFile}, read the committed file
  * and validate it; on `{ok:false}` remove EVERY key/element this invocation added to that
- * file (inject→remove is byte-identical, D3), restoring the user's real config unchanged,
- * and record a `validation-failed` skip per losing surface. Runs under the caller's lock
+ * file (keyed inject→remove is byte-identical on an existing file, D3 — see
+ * `injectArrayElement`'s F5/12 note for the array-element caveat, which no adapter reaches
+ * today), restoring the user's real config unchanged, and record a `validation-failed`
+ * skip per losing surface. Runs under the caller's lock
  * (a fresh transaction per rolled-back file). Returns how many items were ACTUALLY rolled
  * back, so the caller can discount them from `applied`. Never throws for a rejection or a
  * misbehaving validator — fail-closed is the whole point; only an fs/tx fault propagates.
