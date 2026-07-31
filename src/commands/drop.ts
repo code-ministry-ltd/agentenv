@@ -1,5 +1,7 @@
+import { adapters as realAdapters } from '../adapters/index.js';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
+import { dematerialiseGlobal, selectAdapters } from '../engine.js';
 import {
   findBinding,
   readSessionRegistry,
@@ -8,6 +10,7 @@ import {
   setBinding,
 } from '../session/registry.js';
 import { parseHarnesses } from './activation.js';
+import { renderGlobalSkips } from './global-report.js';
 
 /**
  * `agentenv drop [<env>… | --all] [--harness <h>…] [--global]` — deactivate.
@@ -78,10 +81,32 @@ async function dropGlobal(
   all: boolean,
   harnesses: string[] | undefined,
 ): Promise<RunResult> {
-  // Wired to the transactional engine in a later slice of this task.
-  void ctx;
-  void names;
-  void all;
-  void harnesses;
-  return { stdout: '', stderr: 'drop --global: not yet implemented\n', code: 1 };
+  const { paths, env, options } = ctx;
+  const adapters = selectAdapters(options.adapters ?? realAdapters, harnesses);
+  // `--harness` restricts removal to the matching adapters' real roots; without it,
+  // every owned item of the dropped envs is removed (dematerialise is adapter-free).
+  const restrictToRoots = harnesses ? adapters.map((a) => a.realConfigRoot(env)) : undefined;
+
+  const notices: string[] = [];
+  const result = await dematerialiseGlobal({
+    paths,
+    adapters,
+    envs: names,
+    all,
+    env,
+    ...(restrictToRoots ? { restrictToRoots } : {}),
+    onWarn: (m) => notices.push(m),
+  });
+
+  notices.push(...renderGlobalSkips(result.skips));
+  const stderr = notices.length > 0 ? `${notices.join('\n')}\n` : undefined;
+  const what = all ? 'the whole global stack' : `[${names.join(', ')}]`;
+  return {
+    stdout:
+      `Dematerialised ${what} globally (${result.removed} item(s) removed` +
+      `${result.applied > 0 ? `, ${result.applied} re-materialised` : ''}).\n` +
+      `Global stack: [${result.stack.join(', ')}].\n`,
+    ...(stderr ? { stderr } : {}),
+    code: 0,
+  };
 }

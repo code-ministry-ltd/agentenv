@@ -1,5 +1,5 @@
 import { lstat, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import {
   storeToken,
   type Adapter,
@@ -7,19 +7,30 @@ import {
   type DirMergeSurface,
   type FileBlockSurface,
 } from './adapter.js';
+import { backup } from './backups.js';
 import {
   ConfigKeysError,
   injectArrayElement,
   injectKeyed,
+  removeKey,
   type ConfigKeysItem,
   type KeyPath,
 } from './config-keys.js';
-import { materialise as dmMaterialise, type DirMergeMode } from './dir-merge.js';
-import { materialise as fbMaterialise, type FileBlockSource } from './file-block.js';
+import {
+  dematerialise as dmDematerialise,
+  materialise as dmMaterialise,
+  type DirMergeItem,
+  type DirMergeMode,
+} from './dir-merge.js';
+import {
+  dematerialise as fbDematerialise,
+  materialise as fbMaterialise,
+  type FileBlockSource,
+} from './file-block.js';
 import { beginTransaction, recoverState } from './journal.js';
 import { withLock } from './lock.js';
 import type { Paths } from './paths.js';
-import { readState, writeState, type StateManifest } from './state.js';
+import { readState, writeState, type ManifestItem, type StateManifest } from './state.js';
 
 /**
  * The GLOBAL-mode engine (design D4/D5/D7). `agentenv use … --global` materialises
@@ -417,6 +428,137 @@ async function materialiseConfigKeys(
       throw err;
     }
     return applied;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// dematerialise (drop --global)
+// ---------------------------------------------------------------------------
+
+export interface DematerialiseGlobalRequest {
+  paths: Paths;
+  /** In-scope adapters, used to RE-materialise anything a dropped env shadowed. */
+  adapters: readonly Adapter[];
+  /** Envs to drop; ignored when {@link all} is set. */
+  envs: readonly string[];
+  /** Drop the whole global stack. */
+  all: boolean;
+  env: NodeJS.ProcessEnv;
+  /**
+   * Restrict removal to items under these real config roots (`--harness` scoping).
+   * `undefined` ⇒ remove every owned item of the dropped envs, regardless of adapter.
+   */
+  restrictToRoots?: readonly string[];
+  onWarn?: (message: string) => void;
+}
+
+/**
+ * Dematerialise dropped envs from the harness's real config paths using the
+ * MANIFEST only — never scan-and-guess (D4) — then re-materialise the remaining
+ * stack so anything a dropped (higher) env had shadowed reappears (D5). Removal is
+ * recovery-first and idempotent. `all` clears the whole global stack.
+ */
+export async function dematerialiseGlobal(req: DematerialiseGlobalRequest): Promise<GlobalResult> {
+  const { paths, adapters, env, all } = req;
+  const onWarn = req.onWarn ?? ((m: string) => console.warn(m));
+  const skips: GlobalSkip[] = [];
+
+  await withLock(paths, () => recoverState(paths));
+
+  const manifest = await readState(paths);
+  const currentStack = readGlobalStack(manifest);
+  const toDrop = all ? [...currentStack] : [...req.envs];
+  const inScope = (path: string): boolean => {
+    if (!req.restrictToRoots) return true;
+    return req.restrictToRoots.some((root) => path === root || path.startsWith(root + sep));
+  };
+
+  const owned = manifest.items.filter((i) => toDrop.includes(i.ownerEnv) && inScope(i.path));
+
+  // dir-merge and file-block: each self-locks + self-journals (one atomic op).
+  let removed = 0;
+  const configItems: ConfigKeysItem[] = [];
+  for (const item of owned) {
+    if (item.surface === 'dir-merge') {
+      await dmDematerialise(paths, item as DirMergeItem, onWarn);
+      removed += 1;
+    } else if (item.surface === 'file-block') {
+      await fbDematerialise(paths, { target: item.path, env: item.ownerEnv });
+      removed += 1;
+    } else if (item.surface === 'config-keys') {
+      configItems.push(item as ConfigKeysItem);
+    }
+  }
+
+  // config-keys: batch every removal under ONE transaction.
+  if (configItems.length > 0) {
+    removed += await removeConfigKeys(paths, configItems, onWarn);
+  }
+
+  // Recompute the stack: a dropped env leaves it only when no owned item survives
+  // (with `--harness` an env may retain items under other adapters).
+  const after = await readState(paths);
+  const remaining = currentStack.filter(
+    (e) => !toDrop.includes(e) || after.items.some((i) => i.ownerEnv === e),
+  );
+  await writeGlobalStack(paths, remaining);
+
+  // Re-materialise the survivors: idempotent for still-present items, and it
+  // places anything the dropped env had shadowed (D5).
+  let applied = 0;
+  if (remaining.length > 0) {
+    if (adapters.length === 0) {
+      onWarn('agentenv: no in-scope adapter to re-materialise the remaining stack');
+    } else {
+      const re = await materialiseGlobal({ paths, adapters, envs: remaining, env, onWarn });
+      applied = re.applied;
+      skips.push(...re.skips);
+    }
+  }
+
+  return { applied, removed, skips, stack: remaining, verifyWarnings: [] };
+}
+
+/**
+ * Remove owned config keys under one transaction. A key that already vanished
+ * from the file (`absent`) still has its ownership dropped via a journalled no-op,
+ * so the manifest never keeps a stale record. A DRIFTED key (`hash-mismatch`) is
+ * left owned with a warning — the drift sweep (run before drop) normally brings
+ * the hash back into agreement first.
+ */
+async function removeConfigKeys(
+  paths: Paths,
+  items: readonly ConfigKeysItem[],
+  onWarn: (m: string) => void,
+): Promise<number> {
+  return withLock(paths, async () => {
+    const tx = await beginTransaction(paths);
+    let removed = 0;
+    try {
+      for (const item of items) {
+        const result = await removeKey(paths, tx, item);
+        if (result.removed) {
+          removed += 1;
+        } else if (result.reason === 'absent') {
+          // Drop stale ownership without touching the file (journalled no-op).
+          const backupRef = await backup(paths, item.path);
+          await tx.apply(
+            { op: 'remove', item: item as ManifestItem, undo: { path: item.path, backupRef } },
+            async () => {
+              /* file already lacks the key — only the manifest record is removed */
+            },
+          );
+          removed += 1;
+        } else {
+          onWarn(`agentenv: ${result.note ?? `could not remove config key ${item.key ?? ''}`}`);
+        }
+      }
+      await tx.commit();
+    } catch (err) {
+      await tx.rollback();
+      throw err;
+    }
+    return removed;
   });
 }
 
