@@ -170,4 +170,41 @@ describe('session __shim command', () => {
     expect(res.stdout).toContain('shell-init');
     expect(res.stdout).not.toContain('__shim');
   });
+
+  it('M1: a binding whose only env was deleted drops it and launches unbound with a notice', async () => {
+    const th = home();
+    const { paths, env } = withHarness(th);
+    const projectRoot = await resolveProjectRoot(th.home);
+    await setBinding(paths, { session: 'S1', projectRoot, envs: ['ghost'] });
+    const { exec, calls } = capturingExec();
+
+    const res = await run(['__shim', 'fixture-harness', '--', '--print-config-root'], {
+      env: { ...env, AGENTENV_SESSION: 'S1' },
+      cwd: th.home,
+      adapters: [makeFixtureAdapter()],
+      execHarness: exec,
+    });
+    expect(res.code).toBe(0);
+    expect(calls[0]?.env[FIXTURE_CONFIG_ENV]).toBeUndefined(); // unbound — no override applied
+    expect(res.stderr).toContain("environment 'ghost'");
+    expect(res.stderr?.toLowerCase()).toContain('unbound');
+  });
+
+  it('M1: a partially-valid binding composes the surviving envs and warns about the missing one', async () => {
+    const th = home();
+    const { paths, env } = withHarness(th);
+    const projectRoot = await resolveProjectRoot(th.home);
+    await setBinding(paths, { session: 'S1', projectRoot, envs: ['writing', 'ghost'] });
+    const { exec, calls } = capturingExec();
+
+    const res = await run(['__shim', 'fixture-harness', '--', '--print-config-root'], {
+      env: { ...env, AGENTENV_SESSION: 'S1' },
+      cwd: th.home,
+      adapters: [makeFixtureAdapter()],
+      execHarness: exec,
+    });
+    expect(res.code).toBe(0);
+    expect(calls[0]?.env[FIXTURE_CONFIG_ENV]).toBeTruthy(); // bound — surviving env composed
+    expect(res.stderr).toContain("environment 'ghost'");
+  });
 });

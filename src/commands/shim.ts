@@ -6,6 +6,7 @@ import { defaultExecHarness } from '../session/exec.js';
 import { launchHarness, type LaunchResult } from '../session/launch.js';
 import { resolveProjectRoot, resolveSessionBinding } from '../session/registry.js';
 import { resolveBinaryOnPath, sanitisePath } from '../session/resolve.js';
+import { environmentExists } from '../store.js';
 
 /**
  * `agentenv __shim <harness> -- <args…>` — the Node side of the PATH shim (D15).
@@ -47,7 +48,20 @@ export const shimCommand: Command = {
       if (resolved.note) notices.push(`agentenv: ${resolved.note}`);
       const b = resolved.binding;
       if (resolved.source === 'explicit' && b && !b.global && appliesToHarness(b.harnesses, adapter)) {
-        envs = b.envs;
+        // Validate the bound envs — one may have been `rm`'d since the binding was
+        // written. Drop a missing env with a notice naming it (D16); if none
+        // survive, launch unbound rather than silently composing an empty view.
+        const kept: string[] = [];
+        for (const e of b.envs) {
+          if (await environmentExists(paths, e)) kept.push(e);
+          else notices.push(`agentenv: bound environment '${e}' no longer exists — dropping it from this session`);
+        }
+        if (kept.length > 0) {
+          envs = kept;
+        } else {
+          notices.push(`agentenv: no bound environments remain — launching ${binaryName} unbound`);
+          envs = null;
+        }
       }
     } catch (err) {
       // Unreadable session registry → fail open: launch unbound (D15).
