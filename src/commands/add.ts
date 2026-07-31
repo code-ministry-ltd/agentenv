@@ -21,6 +21,7 @@ import {
   type ParsedSkillSource,
 } from '../skill-source.js';
 import { environmentExists, readEnvConfig, validateEnvName } from '../store.js';
+import { commitMutation, withNotices, withStoreSync } from './store-sync.js';
 
 /** Content kinds `add` understands, in help/usage order. */
 const KINDS = ['skill', 'mcp', 'instructions', 'agent', 'command'] as const;
@@ -328,7 +329,11 @@ function repoPathOf(subpath: string, scanRoot: string, skillDir: string): string
  * place (no provenance); a git source is cloned and each installed skill records
  * its own provenance. Name collisions skip-and-warn unless `--force`.
  */
-async function addSkills(rest: readonly string[], ctx: CommandContext): Promise<RunResult> {
+async function addSkills(
+  rest: readonly string[],
+  ctx: CommandContext,
+  notices: string[],
+): Promise<RunResult> {
   const parsed = parseArgs(rest, { booleans: ['all', 'force'] });
   if (parsed.unknown.length > 0) {
     return fail(`add skills: unknown option '${parsed.unknown[0]}'\n`);
@@ -420,6 +425,13 @@ async function addSkills(rest: readonly string[], ctx: CommandContext): Promise<
         await copySkillDir(ctx, env, name, c.dir);
       }
       installed.push(name);
+      // Commit-per-mutation (D9): each installed skill is its own store commit, so a
+      // batch install of N skills yields N commits + the single end-of-invocation push.
+      await commitMutation(
+        { paths: ctx.paths, env: ctx.env, options: ctx.options },
+        `agentenv: add skill ${name} → ${env}`,
+        notices,
+      );
     }
 
     const lines: string[] = [];
@@ -637,21 +649,59 @@ export const addCommand: Command = {
       return fail(`add: missing kind\n${kindsHelp()}`);
     }
     const rest = ctx.args.slice(1);
-    switch (kind) {
-      case 'skill':
-        return addSkill(rest, ctx);
-      case 'skills':
-        return addSkills(rest, ctx);
-      case 'mcp':
-        return addMcp(rest, ctx);
-      case 'instructions':
-        return addInstructions(rest, ctx);
-      case 'agent':
-        return addMarkdownItem('agent', 'agents', scaffoldAgentMd, rest, ctx);
-      case 'command':
-        return addMarkdownItem('command', 'commands', scaffoldCommandMd, rest, ctx);
-      default:
-        return fail(`add: unknown kind '${kind}'\n${kindsHelp()}`);
+    if (kind !== 'skills' && !KINDS.includes(kind as (typeof KINDS)[number])) {
+      return fail(`add: unknown kind '${kind}'\n${kindsHelp()}`);
     }
+
+    // Every real `add` mutates the store, so it runs inside the git-sync lifecycle:
+    // pull-on-invoke first, then the mutation + its commit, then one push. `add skills`
+    // commits per skill itself (returns null below); every other kind is committed
+    // once by the wrapper with a message derived from the positional args.
+    const notices: string[] = [];
+    let result: RunResult = fail(`add: unknown kind '${kind}'\n${kindsHelp()}`);
+    await withStoreSync({ paths: ctx.paths, env: ctx.env, options: ctx.options }, notices, async () => {
+      result = await dispatchAdd(kind, rest, ctx, notices);
+      if (kind === 'skills' || result.code !== 0) return null; // skills self-commits; errors: no commit
+      return commitMessageFor(kind, rest);
+    });
+    return withNotices(result, notices);
   },
 };
+
+/** Dispatch to the kind's handler (all begin/commit/push wiring lives in {@link addCommand}). */
+function dispatchAdd(
+  kind: string,
+  rest: readonly string[],
+  ctx: CommandContext,
+  notices: string[],
+): Promise<RunResult> {
+  switch (kind) {
+    case 'skill':
+      return addSkill(rest, ctx);
+    case 'skills':
+      return addSkills(rest, ctx, notices);
+    case 'mcp':
+      return addMcp(rest, ctx);
+    case 'instructions':
+      return addInstructions(rest, ctx);
+    case 'agent':
+      return addMarkdownItem('agent', 'agents', scaffoldAgentMd, rest, ctx);
+    case 'command':
+      return addMarkdownItem('command', 'commands', scaffoldCommandMd, rest, ctx);
+    default:
+      return Promise.resolve(fail(`add: unknown kind '${kind}'\n${kindsHelp()}`));
+  }
+}
+
+/**
+ * The per-mutation commit message for a single-item `add` (design D9), derived from
+ * the positional args (`<env> <name>`). `--print-path` runs leave the tree clean, so
+ * the wrapper commit is a no-op there regardless of the message computed here.
+ */
+function commitMessageFor(kind: string, rest: readonly string[]): string {
+  const positionals = rest.filter((a) => !a.startsWith('-'));
+  const env = positionals[0] ?? '?';
+  const name = positionals[1];
+  if (kind === 'instructions') return `agentenv: add instructions → ${env}`;
+  return `agentenv: add ${kind} ${name ?? ''}`.trimEnd() + ` → ${env}`;
+}

@@ -1,15 +1,16 @@
 import { cp, mkdir, writeFile } from 'node:fs/promises';
 import { parseArgs } from '../args.js';
-import type { Command } from '../command.js';
+import type { Command, RunResult } from '../command.js';
 import { scaffoldEnvYaml } from '../env-config.js';
 import { ensureStore, environmentExists, validateEnvName } from '../store.js';
+import { withNotices, withStoreSync } from './store-sync.js';
 
 export const createCommand: Command = {
   name: 'create',
   usage: '<name> [--from <env>]',
   summary: 'Create a new environment',
 
-  async run({ args, paths }) {
+  async run({ args, paths, env, options }): Promise<RunResult> {
     const parsed = parseArgs(args, { values: ['from'] });
 
     if (parsed.unknown.length > 0) {
@@ -39,12 +40,24 @@ export const createCommand: Command = {
       if (!(await environmentExists(paths, from))) {
         return { stdout: '', stderr: `create: --from: environment '${from}' does not exist\n`, code: 1 };
       }
-      await cp(paths.envDir(from), paths.envDir(name), { recursive: true });
-      return { stdout: `Created environment '${name}' (copied from '${from}').\n`, code: 0 };
     }
 
-    await mkdir(paths.envDir(name), { recursive: true });
-    await writeFile(paths.envYaml(name), scaffoldEnvYaml({ description: '' }), 'utf8');
-    return { stdout: `Created environment '${name}'.\n`, code: 0 };
+    // Store mutation inside the git-sync lifecycle (pull → create → commit → push).
+    const notices: string[] = [];
+    await withStoreSync({ paths, env, options }, notices, async () => {
+      if (from !== undefined) {
+        await cp(paths.envDir(from), paths.envDir(name), { recursive: true });
+        return `agentenv: create env ${name} (from ${from})`;
+      }
+      await mkdir(paths.envDir(name), { recursive: true });
+      await writeFile(paths.envYaml(name), scaffoldEnvYaml({ description: '' }), 'utf8');
+      return `agentenv: create env ${name}`;
+    });
+
+    const stdout =
+      from !== undefined
+        ? `Created environment '${name}' (copied from '${from}').\n`
+        : `Created environment '${name}'.\n`;
+    return withNotices({ stdout, code: 0 }, notices);
   },
 };

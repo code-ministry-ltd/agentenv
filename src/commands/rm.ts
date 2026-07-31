@@ -11,6 +11,7 @@ import {
 } from '../session/registry.js';
 import { readState } from '../state.js';
 import { environmentExists, validateEnvName } from '../store.js';
+import { withNotices, withStoreSync } from './store-sync.js';
 
 export const rmCommand: Command = {
   name: 'rm',
@@ -18,7 +19,7 @@ export const rmCommand: Command = {
   summary: 'Remove an environment',
 
   async run(ctx) {
-    const { args, paths } = ctx;
+    const { args, paths, env, options } = ctx;
     const parsed = parseArgs(args, { booleans: ['yes', 'force', 'drop-first'] });
     if (parsed.unknown.length > 0) {
       return { stdout: '', stderr: `rm: unknown option '${parsed.unknown[0]}'\n`, code: 1 };
@@ -75,8 +76,13 @@ export const rmCommand: Command = {
       }
     }
 
-    await removeDir(paths.envDir(name), { recursive: true, force: true });
-    return { stdout: `Removed environment '${name}'.\n`, code: 0 };
+    // Remove inside the git-sync lifecycle (pull → remove → commit → push).
+    const notices: string[] = [];
+    await withStoreSync({ paths, env, options }, notices, async () => {
+      await removeDir(paths.envDir(name), { recursive: true, force: true });
+      return `agentenv: remove env ${name}`;
+    });
+    return withNotices({ stdout: `Removed environment '${name}'.\n`, code: 0 }, notices);
   },
 };
 
