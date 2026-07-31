@@ -162,6 +162,54 @@ describe('config-keys', () => {
       expect(result.note).toMatch(/absent/);
       expect(readFileSync(f, 'utf8')).toBe('{}\n'); // untouched
     });
+
+    // B1 (REQUIRED): injecting into a MISSING parent creates it; removal must prune
+    // that created parent (while still empty) so the cycle is byte-identical — no
+    // orphaned "mcpServers": {} left in the user's file.
+    it('prunes a parent it created on inject so remove is byte-identical', async () => {
+      const p = paths();
+      const f = file('claude.json');
+      const original = '{\n  "theme": "dark"\n}\n'; // no mcpServers parent
+      writeFileSync(f, original);
+
+      const item = await inTx(p, (tx) =>
+        injectKeyed(p, tx, {
+          file: f,
+          format: 'json',
+          keyPath: ['mcpServers', 'linear'],
+          value: { transport: 'http' },
+          ownerEnv: 'writing',
+        }),
+      );
+      // Inject really created the missing parent.
+      expect(JSON.parse(readFileSync(f, 'utf8')).mcpServers.linear).toEqual({ transport: 'http' });
+
+      const removed = await inTx(p, (tx) => removeKey(p, tx, item));
+      expect(removed.removed).toBe(true);
+      // Created-and-now-empty parent pruned → byte-for-byte the user's original.
+      expect(readFileSync(f, 'utf8')).toBe(original);
+    });
+
+    it('does NOT prune a parent the user already owned as an empty {}', async () => {
+      const p = paths();
+      const f = file('claude.json');
+      const original = '{\n  "mcpServers": {},\n  "theme": "dark"\n}\n'; // user's own empty {}
+      writeFileSync(f, original);
+
+      const item = await inTx(p, (tx) =>
+        injectKeyed(p, tx, {
+          file: f,
+          format: 'json',
+          keyPath: ['mcpServers', 'linear'],
+          value: { transport: 'http' },
+          ownerEnv: 'writing',
+        }),
+      );
+      const removed = await inTx(p, (tx) => removeKey(p, tx, item));
+      expect(removed.removed).toBe(true);
+      // The user's pre-existing empty object survives — we only prune what we made.
+      expect(readFileSync(f, 'utf8')).toBe(original);
+    });
   });
 
   describe('config-keys drift + syncBack write-back', () => {

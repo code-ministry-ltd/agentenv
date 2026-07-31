@@ -99,6 +99,16 @@ export interface ConfigKeysItem extends ManifestItemBase {
    * here we only carry the flag + placeholder text.
    */
   secretFields?: Record<string, string>;
+  /**
+   * keyed JSON/JSONC only: how many ancestor object levels this inject CREATED
+   * (were absent before). On removal those parents are pruned back — deepest-first
+   * and only while each is still empty — so an inject→remove cycle is byte-identical
+   * and never leaves an orphaned `{}` in the user's file (D3, fix B1). A parent the
+   * user already had (even an empty `{}`) is never counted, so never pruned. Absent
+   * (treated as 0) when the inject created no parents, or for TOML (whose marked
+   * `[table]` mechanism removes the whole block, orphaning nothing).
+   */
+  createdParents?: number;
 }
 
 // Register the variant so `ManifestItem` narrows on `surface: 'config-keys'`
@@ -276,10 +286,30 @@ export async function injectKeyed(
   req: InjectKeyedRequest,
 ): Promise<ConfigKeysItem> {
   const text = await readText(req.file);
-  const item = makeKeyedItem(req);
+  // Record which ancestor levels we CREATE, so removal can prune exactly them and
+  // no more (fix B1). TOML uses whole marked [table] blocks — nothing to prune.
+  const createdParents =
+    req.format === 'toml'
+      ? 0
+      : countCreatedParents(parseJsonConfig(jsonBaseText(text), req.file), req.keyPath);
+  const item = makeKeyedItem(req, createdParents);
   const next = writeKeyedValueText(text, item, req.value);
   await applyFileMutation(paths, tx, 'add', item, req.file, next);
   return item;
+}
+
+/**
+ * Count the ancestor levels of `keyPath` absent in `root` — the contiguous suffix
+ * of parents an inject would create. Absence is monotonic (a missing parent makes
+ * every deeper parent missing too), so this is exactly the count of levels we own
+ * after the inject and may prune on removal.
+ */
+function countCreatedParents(root: unknown, keyPath: KeyPath): number {
+  let created = 0;
+  for (let depth = 1; depth < keyPath.length; depth++) {
+    if (!getAtPath(root, keyPath.slice(0, depth)).found) created++;
+  }
+  return created;
 }
 
 /**
@@ -295,7 +325,7 @@ function writeKeyedValueText(text: string, item: ConfigKeysItem, value: JsonValu
   return applyEdits(base, modify(base, item.keyPath as JSONPath, value, {}));
 }
 
-function makeKeyedItem(req: InjectKeyedRequest): ConfigKeysItem {
+function makeKeyedItem(req: InjectKeyedRequest, createdParents: number): ConfigKeysItem {
   const item: ConfigKeysItem = {
     action: 'config-key',
     surface: 'config-keys',
@@ -309,6 +339,9 @@ function makeKeyedItem(req: InjectKeyedRequest): ConfigKeysItem {
   };
   if (req.secretFields && Object.keys(req.secretFields).length > 0) {
     item.secretFields = { ...req.secretFields };
+  }
+  if (createdParents > 0) {
+    item.createdParents = createdParents;
   }
   return item;
 }
@@ -471,7 +504,29 @@ function removeKeyedText(text: string, item: ConfigKeysItem): string {
     return removeKeyedTomlText(text, item);
   }
   const base = jsonBaseText(text);
-  return applyEdits(base, modify(base, item.keyPath as JSONPath, undefined, {}));
+  const out = applyEdits(base, modify(base, item.keyPath as JSONPath, undefined, {}));
+  return pruneCreatedParents(out, item);
+}
+
+/**
+ * After the owned leaf is removed, prune the ancestor levels this inject created
+ * ({@link ConfigKeysItem.createdParents}) — deepest-first, and only while each is
+ * still an empty object — so an inject→remove cycle is byte-identical (fix B1). We
+ * stop at the first parent that is non-empty (the user added siblings) or that the
+ * user owned, and never touch the document root.
+ */
+function pruneCreatedParents(text: string, item: ConfigKeysItem): string {
+  let out = text;
+  const created = item.createdParents ?? 0;
+  for (let i = 0; i < created; i++) {
+    const parentPath = item.keyPath.slice(0, item.keyPath.length - 1 - i);
+    if (parentPath.length === 0) break; // never prune the document root
+    const { found, value } = getAtPath(parseJsonConfig(out, item.path), parentPath);
+    if (!found || value === null || typeof value !== 'object' || Array.isArray(value)) break;
+    if (Object.keys(value as Record<string, unknown>).length !== 0) break; // user populated it
+    out = applyEdits(out, modify(out, parentPath as JSONPath, undefined, {}));
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
