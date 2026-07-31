@@ -1,4 +1,4 @@
-import { parse as parseYaml, stringify as stringifyYaml, YAMLParseError } from 'yaml';
+import { parse as parseYaml, parseDocument, stringify as stringifyYaml, YAMLParseError } from 'yaml';
 import { parseVersion } from './schema-version.js';
 
 /**
@@ -18,6 +18,25 @@ export interface EnvCapture {
 }
 
 /**
+ * Provenance for a skill vendored from a git source (design D17): where it came
+ * from and a fingerprint of what was vendored, so any machine sharing the store
+ * can answer "where did this come from, and has it drifted?". Recorded per skill
+ * name under `env.yaml`'s `sources:` map; content stays vendored and offline.
+ */
+export interface SkillSourceRecord {
+  /** Canonical origin: `owner/repo` for GitHub, or a `file://` URL for a local repo. */
+  repo: string;
+  /** Subpath within the repo the skill was vendored from (`''` = repo root). */
+  path: string;
+  /** The requested/resolved ref (branch, tag or sha). */
+  ref: string;
+  /** The resolved HEAD commit sha at fetch time. */
+  commit: string;
+  /** Content hash of the vendored skill directory. */
+  hash: string;
+}
+
+/**
  * A parsed env.yaml manifest. Known fields are typed; unknown fields are
  * preserved via the index signature so a file written by a newer minor is not
  * lossily rejected. Deliberately carries NO harness allowlist (design: every
@@ -28,6 +47,8 @@ export interface EnvConfig {
   description: string;
   notes?: string;
   capture?: EnvCapture;
+  /** Provenance for git-vendored skills, keyed by skill name (design D17). */
+  sources?: Record<string, SkillSourceRecord>;
   [key: string]: unknown;
 }
 
@@ -78,6 +99,31 @@ function parseCapture(raw: unknown): EnvCapture | undefined {
 }
 
 /**
+ * Parse the optional `sources:` provenance map (design D17). Tolerant: a
+ * non-mapping value or malformed entries are dropped rather than rejected, so a
+ * hand-mangled block never blocks reading an otherwise-valid manifest. Fields
+ * are coerced to strings; a missing field becomes ''.
+ */
+function parseSources(raw: unknown): Record<string, SkillSourceRecord> | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const out: Record<string, SkillSourceRecord> = {};
+  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) continue;
+    const v = value as Record<string, unknown>;
+    const s = (x: unknown): string => (typeof x === 'string' ? x : x === undefined ? '' : String(x));
+    out[name] = {
+      repo: s(v.repo),
+      path: s(v.path),
+      ref: s(v.ref),
+      commit: s(v.commit),
+      hash: s(v.hash),
+    };
+  }
+  return out;
+}
+
+/**
  * Parse and validate env.yaml text. `file` is used only for error messages.
  * Throws {@link EnvYamlError} on malformed YAML (with a line number), a
  * non-mapping root, a missing/invalid version, or a store newer than this CLI.
@@ -121,7 +167,31 @@ export function parseEnvConfig(text: string, file: string): EnvConfig {
   } else {
     delete config.capture;
   }
+  const sources = parseSources(obj.sources);
+  if (sources) {
+    config.sources = sources;
+  } else {
+    delete config.sources;
+  }
   return config;
+}
+
+/**
+ * Insert or replace one skill's provenance under `env.yaml`'s `sources:` map,
+ * returning the updated YAML text. Edits through the YAML Document API so the
+ * file's header comments and hand-written fields are preserved. Round-trips
+ * through {@link parseEnvConfig}.
+ */
+export function upsertEnvSource(text: string, name: string, source: SkillSourceRecord): string {
+  const doc = parseDocument(text);
+  doc.setIn(['sources', name], {
+    repo: source.repo,
+    path: source.path,
+    ref: source.ref,
+    commit: source.commit,
+    hash: source.hash,
+  });
+  return doc.toString();
 }
 
 /**
