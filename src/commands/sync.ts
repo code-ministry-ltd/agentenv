@@ -67,6 +67,16 @@ async function plainSync(ctx: CommandContext): Promise<RunResult> {
     return ok('sync: the store is not a git repository yet — run `agentenv init` first.\n');
   }
 
+  // A HELD rebase (a prior `sync --resolve` step 1) must be finished or cancelled
+  // before any other sync runs (D9, Task 2.2). Treat it as BLOCKED — never report a
+  // false success, and never let the lifecycle drift-commit the marker-laden tree.
+  if (await rebaseInProgress(paths)) {
+    return fail(
+      'sync: a conflict resolution is already in progress — finish it with `agentenv sync --resolve`, ' +
+        'or cancel it with `agentenv sync --abort`.\n',
+    );
+  }
+
   const remote = await getRemoteUrl(paths, env, options.gitRun);
   const notices: string[] = [];
   const before = await openStoreSync({ paths, env, options }, notices);

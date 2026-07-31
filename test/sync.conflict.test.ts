@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { run } from '../src/cli.js';
-import { type ConflictedFile, isConflictPending } from '../src/git.js';
+import { commitStore, type ConflictedFile, isConflictPending, rebaseInProgress } from '../src/git.js';
 import { type Paths, resolvePaths } from '../src/paths.js';
 import { makeTempHome, type TempHome } from './helpers.js';
 
@@ -92,6 +92,28 @@ function remoteTree(remoteUrl: string): string {
     cwd: new URL(remoteUrl).pathname,
     encoding: 'utf8',
   });
+}
+
+/** Commit count reachable from HEAD in the local store (works with a detached, mid-rebase HEAD). */
+function storeCommitCount(store: string): number {
+  const out = execFileSync('git', ['rev-list', '--count', 'HEAD'], { cwd: store, env: GIT_ENV, encoding: 'utf8' });
+  return Number.parseInt(out.trim(), 10);
+}
+
+/**
+ * Does ANY commit anywhere in the remote's history carry a git conflict marker? A
+ * `git log --all -p` shows every blob change; if a marker-laden `env.yaml` was ever
+ * committed and pushed, its added lines (`+<<<<<<<` …) appear in the patch output.
+ * The clean reconciled history never contains one.
+ */
+function remoteHistoryHasMarkers(remoteUrl: string): boolean {
+  const out = execFileSync('git', ['log', '--all', '-p'], {
+    cwd: new URL(remoteUrl).pathname,
+    env: GIT_ENV,
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return out.includes('<<<<<<<') || out.includes('>>>>>>>');
 }
 
 /**
@@ -331,5 +353,76 @@ describe('sync --abort: cancel a conflict resolution and keep local (D9)', () =>
     expect(res.code).toBe(0);
     expect(await isConflictPending(paths)).toBe(false);
     expect(readFileSync(join(paths.environments, 'writing', 'env.yaml'), 'utf8')).toContain('local-change');
+  });
+});
+
+describe('sync: a HELD rebase (the resolve two-step window) is never disturbed by other store commands (D9, CRITICAL)', () => {
+  it('sync / add / create in the window commit NO garbage and the remote never receives markers', async () => {
+    const th = gitHome();
+    const { paths, remote } = await induceConflict(th);
+    const store = paths.store;
+    const envFile = join(paths.environments, 'writing', 'env.yaml');
+
+    // Step 1 of the manual resolve: re-enter and HOLD the rebase — markers land on
+    // disk and the rebase stays in progress across invocations (the intended two-step).
+    const step1 = await run(['sync', '--resolve'], { env: th.env });
+    expect(step1.code).toBe(1);
+    expect(await rebaseInProgress(paths)).toBe(true);
+    expect(readFileSync(envFile, 'utf8')).toContain('<<<<<<<');
+
+    // The number of commits reachable BEFORE any other command runs in the window.
+    const commitsBefore = storeCommitCount(store);
+
+    // (a) A plain `sync` in the window must be BLOCKED (never a false success) and must
+    //     commit nothing — the OLD code drift-committed the marker-laden env.yaml here.
+    const sync = await run(['sync'], { env: th.env });
+    expect(sync.code).toBe(1);
+    expect(sync.stderr ?? '').toMatch(/in-progress|--resolve|--abort/);
+    expect(storeCommitCount(store)).toBe(commitsBefore);
+    expect(await rebaseInProgress(paths)).toBe(true);
+
+    // (b) `add skill` still writes its file on disk (local function is preserved) but
+    //     commits NOTHING and surfaces the paused-mid-conflict notice.
+    const add = await run(['add', 'skill', 'writing', 'freshskill'], { env: th.env });
+    expect(existsSync(join(paths.environments, 'writing', 'skills', 'freshskill'))).toBe(true);
+    expect(add.stderr ?? '').toMatch(/paused mid-conflict/i);
+    expect(storeCommitCount(store)).toBe(commitsBefore);
+    expect(await rebaseInProgress(paths)).toBe(true);
+
+    // (c) `create` likewise: the new env dir lands on disk, but no commit is made.
+    const create = await run(['create', 'reporting'], { env: th.env });
+    expect(existsSync(join(paths.environments, 'reporting'))).toBe(true);
+    expect(create.stderr ?? '').toMatch(/paused mid-conflict/i);
+    expect(storeCommitCount(store)).toBe(commitsBefore);
+
+    // Nothing disturbed the held rebase: it is still in progress with markers on disk.
+    expect(await rebaseInProgress(paths)).toBe(true);
+    expect(readFileSync(envFile, 'utf8')).toContain('<<<<<<<');
+
+    // Complete the two-step resolve: the human removes the markers, then re-runs.
+    writeFileSync(envFile, ENV_MERGED, 'utf8');
+    const done = await run(['sync', '--resolve'], { env: th.env });
+    expect(done.code).toBe(0);
+    expect(await isConflictPending(paths)).toBe(false);
+    expect(readFileSync(envFile, 'utf8')).toContain('merged-change');
+
+    // The remote received ONLY the clean reconciled history — ZERO marker-laden blobs.
+    expect(remoteHistoryHasMarkers(remote)).toBe(false);
+  });
+
+  it('commitStore is a belt-and-suspenders no-op during a held rebase (never stages markers)', async () => {
+    const th = gitHome();
+    const { paths } = await induceConflict(th);
+    const store = paths.store;
+
+    // Hold the rebase (resolve step 1) so a real rebase sits on disk with markers.
+    expect((await run(['sync', '--resolve'], { env: th.env })).code).toBe(1);
+    expect(await rebaseInProgress(paths)).toBe(true);
+    const commitsBefore = storeCommitCount(store);
+
+    // The low-level primitive itself refuses to touch the index mid-rebase.
+    const result = await commitStore(paths, th.env, 'agentenv: should never happen');
+    expect(result.status).toBe('rebase-in-progress');
+    expect(storeCommitCount(store)).toBe(commitsBefore);
   });
 });

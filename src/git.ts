@@ -562,7 +562,7 @@ export async function probeRemote(
 
 /** Outcome of a {@link commitStore}. */
 export interface CommitResult {
-  status: 'committed' | 'nothing' | 'blocked' | 'no-repo';
+  status: 'committed' | 'nothing' | 'blocked' | 'no-repo' | 'rebase-in-progress';
   /** Secret findings when `status === 'blocked'`. */
   findings?: SecretFinding[];
 }
@@ -575,6 +575,15 @@ export interface CommitResult {
  * flagged file elsewhere in the tree never blocks an unrelated commit, and a
  * documented example / `agentenv:allow-secret`-marked line is exempt. No-op
  * (`no-repo`) when the store is not a git repo.
+ *
+ * Belt-and-suspenders (D9, Task 2.2, criterion 11 "never auto-resolve"): NEVER
+ * touch the index during a HELD rebase. A `sync --resolve` deliberately leaves a
+ * real `git rebase` in progress across invocations (the manual two-step); the
+ * conflicted `env.yaml` on disk still carries `<<<<<<< / ======= / >>>>>>>`
+ * markers. A `git add -A && git commit` here would stage that marker-laden tree and
+ * commit garbage — which then pushes to the shared remote (permanent history
+ * pollution). So refuse (`rebase-in-progress`) and let ONLY `sync --resolve` /
+ * `--abort` ever advance a held rebase.
  */
 export async function commitStore(
   paths: Paths,
@@ -583,6 +592,7 @@ export async function commitStore(
   run?: GitRunner,
 ): Promise<CommitResult> {
   if (!(await storeIsRepo(paths))) return { status: 'no-repo' };
+  if (await rebaseInProgress(paths)) return { status: 'rebase-in-progress' };
   const ctx = gitContext(paths, env, run);
 
   await git(ctx, ['add', '-A']);
