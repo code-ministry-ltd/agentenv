@@ -116,6 +116,31 @@ export interface MaterialiseOptions {
   sources: FileBlockSource[];
 }
 
+/**
+ * Raised when a target's in-file markers do not match the region the manifest
+ * records this env owns — duplicated, extra, non-contiguous, or relabelled
+ * markers, i.e. text agentenv did not write or that has been mangled/copied.
+ *
+ * The marker text (`>>> managed — do not edit between markers`) forbids editing
+ * *between* markers but cannot stop a user or agent copying, pasting a lookalike,
+ * or relabelling the markers themselves. Rather than trust marker-shaped text and
+ * bound the reclaimed span as first-marker → last-marker (which swallows any user
+ * content caught between hostile markers, and can even collapse to the whole
+ * file), the surface **fails closed**: it refuses to strip, delete, or write back
+ * anything and surfaces this error (doctor philosophy — warn, do not corrupt).
+ */
+export class FileBlockConflictError extends Error {
+  constructor(
+    /** The target instruction file agentenv refused to modify. */
+    readonly file: string,
+    /** Why the in-file markers could not be trusted as agentenv's own region. */
+    readonly detail: string,
+  ) {
+    super(`agentenv: refusing to modify ${file}: ${detail}`);
+    this.name = 'FileBlockConflictError';
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Markers and region rendering
 // ---------------------------------------------------------------------------
@@ -151,92 +176,131 @@ function renderRegion(env: string, subBlocks: FileSubBlock[], bodies: Map<string
     .join('\n\n');
 }
 
-/**
- * A sub-block located in file text: its byte span and its extracted body.
- * `label` is `<env>/<source>`.
- */
-interface FoundBlock {
+/** One marker line located in file text (open or close), with its byte span. */
+interface MarkerHit {
+  kind: 'open' | 'close';
+  /** The full `<env>/<source>` label. */
   label: string;
-  env: string;
-  source: string;
-  body: string;
   start: number;
   end: number;
 }
 
 /**
- * Find every agentenv sub-block in `content`. The close marker is bound to the
- * same label as its open marker (a backreference), so an unrelated label cannot
- * terminate a block early. Bodies are captured exactly, including any trailing
- * newline, so an inline sub-block round-trips its store file byte-for-byte.
+ * Scan `content` for EVERY agentenv marker line — opens and closes independently,
+ * not as paired blocks — returned in document order. Scanning each marker on its
+ * own (rather than a non-greedy open…close regex) is what lets {@link
+ * locateOwnedRegion} detect a marker nested inside another block's body: a
+ * non-greedy pair would silently swallow it, collapsing the span.
  */
-function findBlocks(content: string): FoundBlock[] {
-  const re =
-    /<!-- >>> agentenv:([^\s>]+) >>> managed[^\n]*-->\n([\s\S]*?)\n<!-- <<< agentenv:\1 <<< -->/g;
-  const found: FoundBlock[] = [];
-  for (let m = re.exec(content); m !== null; m = re.exec(content)) {
-    const lbl = m[1] ?? '';
-    const slash = lbl.indexOf('/');
-    found.push({
-      label: lbl,
-      env: slash >= 0 ? lbl.slice(0, slash) : lbl,
-      source: slash >= 0 ? lbl.slice(slash + 1) : '',
-      body: m[2] ?? '',
-      start: m.index,
-      end: m.index + m[0].length,
-    });
+function scanMarkers(content: string): MarkerHit[] {
+  const hits: MarkerHit[] = [];
+  const open = /<!-- >>> agentenv:([^\s>]+) >>> managed[^\n]*-->/g;
+  for (let m = open.exec(content); m !== null; m = open.exec(content)) {
+    hits.push({ kind: 'open', label: m[1] ?? '', start: m.index, end: m.index + m[0].length });
   }
-  return found;
-}
-
-/** Map each of `env`'s sub-blocks (by source id) to its current in-file body. */
-function extractBodies(content: string, env: string): Map<string, string> {
-  const bodies = new Map<string, string>();
-  for (const b of findBlocks(content)) {
-    if (b.env === env) bodies.set(b.source, b.body);
+  const close = /<!-- <<< agentenv:([^\s<]+) <<< -->/g;
+  for (let m = close.exec(content); m !== null; m = close.exec(content)) {
+    hits.push({ kind: 'close', label: m[1] ?? '', start: m.index, end: m.index + m[0].length });
   }
-  return bodies;
-}
-
-/** The contiguous [start, end) span of `env`'s sub-blocks, or null if none. */
-function regionSpan(content: string, env: string): { start: number; end: number } | null {
-  const mine = findBlocks(content).filter((b) => b.env === env);
-  if (mine.length === 0) return null;
-  const first = mine[0];
-  const last = mine[mine.length - 1];
-  if (!first || !last) return null;
-  return { start: first.start, end: last.end };
+  return hits.sort((a, b) => a.start - b.start);
 }
 
 /**
- * Strip `env`'s managed region from `content`, returning the surrounding user
- * content byte-for-byte. The exact inverse of {@link appendRegion}: the region
- * is always joined with exactly one leading `\n` separator and exactly one
+ * The result of anchoring a target's markers to the manifest record:
+ * - `clean` — the file holds EXACTLY this env's recorded sub-blocks, in order,
+ *   as a single contiguous run; `[start, end)` is the safe-to-reclaim span and
+ *   `bodies` maps each source id to its in-file body.
+ * - `absent` — the region is entirely gone (no markers claim this env); there is
+ *   nothing to strip, so callers may re-insert or drop the record without risk.
+ * - `conflict` — markers claim this env but do not match the record (duplicated,
+ *   extra, missing, non-contiguous, or relabelled): mangled or hostile, so the
+ *   caller must refuse rather than guess a span and eat content.
+ */
+type OwnedRegion =
+  | { status: 'clean'; start: number; end: number; bodies: Map<string, string> }
+  | { status: 'absent' }
+  | { status: 'conflict'; detail: string };
+
+/**
+ * Locate the region agentenv may safely reclaim, anchored to the manifest.
+ *
+ * The reclaimable region is a SINGLE CONTIGUOUS run of exactly the env's recorded
+ * `subBlocks` — in order, each an `open(label) … close(label)` pair with the full
+ * label `<env>/<source>` (so an env name containing a slash still attributes
+ * correctly, Finding 2), separated only by the renderer's `\n\n`. Any deviation
+ * — a duplicated or extra pair, a missing/relabelled marker, a nested marker in a
+ * body, or user content wedged between sub-blocks — yields `conflict`, never a
+ * best-effort span. Ownership comes from the manifest, never from trusting
+ * marker-shaped text found in the file.
+ */
+function locateOwnedRegion(content: string, env: string, subBlocks: FileSubBlock[]): OwnedRegion {
+  const prefix = `${env}/`;
+  const mine = scanMarkers(content).filter((h) => h.label.startsWith(prefix));
+  if (mine.length === 0) return { status: 'absent' };
+
+  const expected = subBlocks.length * 2;
+  if (mine.length !== expected) {
+    return {
+      status: 'conflict',
+      detail:
+        `expected ${subBlocks.length} managed sub-block(s) for env "${env}" ` +
+        `(${expected} markers) but found ${mine.length} claiming this env`,
+    };
+  }
+
+  const bodies = new Map<string, string>();
+  for (let i = 0; i < subBlocks.length; i++) {
+    const sb = subBlocks[i];
+    const openHit = mine[i * 2];
+    const closeHit = mine[i * 2 + 1];
+    if (!sb || !openHit || !closeHit) {
+      return { status: 'conflict', detail: `malformed marker run for env "${env}"` };
+    }
+    const want = `${env}/${sb.source}`;
+    if (openHit.kind !== 'open' || openHit.label !== want) {
+      return { status: 'conflict', detail: `sub-block ${i + 1} open marker does not match manifest (${want})` };
+    }
+    if (closeHit.kind !== 'close' || closeHit.label !== want) {
+      return { status: 'conflict', detail: `sub-block ${i + 1} close marker does not match manifest (${want})` };
+    }
+    if (i > 0) {
+      const prevClose = mine[(i - 1) * 2 + 1];
+      if (!prevClose || content.slice(prevClose.end, openHit.start) !== '\n\n') {
+        return { status: 'conflict', detail: `unexpected content between managed sub-blocks of env "${env}"` };
+      }
+    }
+    // Body is exactly what renderSubBlock wrapped: `open\n<body>\nclose`.
+    bodies.set(sb.source, content.slice(openHit.end + 1, closeHit.start - 1));
+  }
+
+  const first = mine[0];
+  const last = mine[mine.length - 1];
+  if (!first || !last) return { status: 'conflict', detail: `malformed marker run for env "${env}"` };
+  return { status: 'clean', start: first.start, end: last.end, bodies };
+}
+
+/**
+ * Strip the byte span `[start, end)` from `content`, returning the surrounding
+ * user content byte-for-byte. The exact inverse of {@link appendRegion}: the
+ * region is always joined with exactly one leading `\n` separator and exactly one
  * trailing `\n`, so one of each is removed here and nothing else. Removing a
  * *fixed* one leading newline (never a heuristic count) is what lets a user
  * safely prepend their own content — e.g. `MY NOTES\n` above the region — and
  * keep it: their newline survives because only agentenv's single separator is
- * reclaimed.
+ * reclaimed. The span itself comes from {@link locateOwnedRegion}, so only a
+ * manifest-confirmed region is ever removed.
  */
-export function stripRegion(content: string, env: string): { user: string; region: string | null } {
-  const span = regionSpan(content, env);
-  if (!span) return { user: content, region: null };
-
-  const before = content.slice(0, span.start);
-  const region = content.slice(span.start, span.end);
-  const after = content.slice(span.end);
-
-  // Reverse appendRegion: content = user + "\n" + region + "\n". Remove the one
-  // separator "\n" from the tail of `before` and the one trailing "\n" from
-  // `after`; everything else is the user's, byte-for-byte.
+function stripSpan(content: string, start: number, end: number): string {
+  const before = content.slice(0, start);
+  const after = content.slice(end);
   const userHead = before.endsWith('\n') ? before.slice(0, -1) : before;
   const userTail = after.startsWith('\n') ? after.slice(1) : after;
-  return { user: userHead + userTail, region };
+  return userHead + userTail;
 }
 
 /**
  * Append a rendered region to user content, byte-reversibly by
- * {@link stripRegion}: exactly one `\n` always separates the (possibly empty)
+ * {@link stripSpan}: exactly one `\n` always separates the (possibly empty)
  * user content from the region — giving a blank line whenever the content
  * already ends in a newline — and exactly one `\n` terminates the file. The
  * separator is inserted unconditionally (even for empty content) so its removal
@@ -303,6 +367,24 @@ export async function materialise(paths: Paths, opts: MaterialiseOptions): Promi
   return withLock(paths, async () => {
     const before = await readFileOrEmpty(target);
 
+    // Preserve the ORIGINAL pre-materialise state across re-materialise so
+    // dematerialise can tell a file we created (delete on drop) from a file we
+    // added a block to (restore user content). The journal undo, by contrast,
+    // captures the immediately-preceding bytes to undo *this* write on a crash.
+    const existing = findRecord(await readState(paths), target, env);
+
+    // Reclaim ONLY a region the manifest confirms this env already owns. On a
+    // first materialise (no record) nothing is stripped — a user's pasted
+    // lookalike markers are left as their content and the region is inserted
+    // cleanly below them, never swallowing what falls between them.
+    let userContent = before;
+    if (existing) {
+      const owned = locateOwnedRegion(before, env, existing.subBlocks);
+      if (owned.status === 'conflict') throw new FileBlockConflictError(target, owned.detail);
+      if (owned.status === 'clean') userContent = stripSpan(before, owned.start, owned.end);
+      // 'absent' → the region was removed out-of-band; re-insert without stripping.
+    }
+
     // Render each sub-block's body and record its drift hash (inline only).
     const bodies = new Map<string, string>();
     const subBlocks: FileSubBlock[] = [];
@@ -317,13 +399,8 @@ export async function materialise(paths: Paths, opts: MaterialiseOptions): Promi
     }
 
     const region = renderRegion(env, subBlocks, bodies);
-    const after = appendRegion(stripRegion(before, env).user, region);
+    const after = appendRegion(userContent, region);
 
-    // Preserve the ORIGINAL pre-materialise state across re-materialise so
-    // dematerialise can tell a file we created (delete on drop) from a file we
-    // added a block to (restore user content). The journal undo, by contrast,
-    // captures the immediately-preceding bytes to undo *this* write on a crash.
-    const existing = findRecord(await readState(paths), target, env);
     const currentBackup = await backup(paths, target);
     const originalBackup = existing?.backupRef ?? currentBackup;
 
@@ -376,39 +453,36 @@ export async function dematerialise(paths: Paths, opts: FileBlockTargetOptions):
   return withLock(paths, async () => {
     const manifest = await readState(paths);
     const record = findRecord(manifest, target, env);
-    const before = await readFileOrEmpty(target);
-    const span = regionSpan(before, env);
-    // Nothing owned here and no region to strip: a safe no-op (idempotent drop).
-    if (!record && !span) return;
+    // Without a manifest record agentenv cannot confirm it owns anything here, so
+    // it touches nothing — a safe no-op (idempotent drop). It never strips a
+    // region on the strength of marker-shaped text alone.
+    if (!record) return;
 
-    const after = stripRegion(before, env).user;
-    // Delete only a file agentenv itself created that is now empty; never a file
-    // that pre-existed (even empty) or that still holds user content.
-    const deleteFile = after === '' && record?.backupRef?.kind === 'absent';
+    const before = await readFileOrEmpty(target);
+    const owned = locateOwnedRegion(before, env, record.subBlocks);
+    // Mangled/hostile markers (duplicated, relabelled, nested, non-contiguous):
+    // refuse rather than reclaim a guessed span — this is what stops a lookalike
+    // open marker collapsing the span and `rm`-ing the whole file.
+    if (owned.status === 'conflict') throw new FileBlockConflictError(target, owned.detail);
+
+    let after = before;
+    let deleteFile = false;
+    if (owned.status === 'clean') {
+      after = stripSpan(before, owned.start, owned.end);
+      // Delete only a file agentenv itself created that is now empty; never a
+      // file that pre-existed (even empty) or that still holds user content.
+      deleteFile = after === '' && record.backupRef?.kind === 'absent';
+    }
+    // 'absent' → the region is already gone; only the manifest record is removed.
 
     const currentBackup = await backup(paths, target);
-    const removalItem: ManifestItem =
-      record ??
-      ({
-        surface: 'file-block',
-        action: 'file-block',
-        path: target,
-        key: env,
-        ownerEnv: env,
-        mode: 'inline',
-        subBlocks: [],
-      } as FileBlockItem);
-
     const tx = await beginTransaction(paths);
     try {
       await tx.apply(
-        { op: 'remove', item: removalItem, undo: { path: target, backupRef: currentBackup } },
+        { op: 'remove', item: record as ManifestItem, undo: { path: target, backupRef: currentBackup } },
         async () => {
-          if (deleteFile) {
-            await rm(target, { force: true });
-          } else {
-            await writeFileAtomic(target, after);
-          }
+          if (deleteFile) await rm(target, { force: true });
+          else if (after !== before) await writeFileAtomic(target, after);
         },
       );
       await tx.commit();
@@ -459,7 +533,15 @@ export async function syncBack(paths: Paths, opts: FileBlockTargetOptions): Prom
     if (!record || record.mode === 'import') return result;
 
     const before = await readFileOrEmpty(target);
-    const inFile = extractBodies(before, env);
+    const owned = locateOwnedRegion(before, env, record.subBlocks);
+    // Mangled/hostile markers: refuse rather than treat lookalike-spanned text as
+    // drift and write it (marker lines + user notes) back into the canonical,
+    // git-synced store file. A relabelled sub-block marker is likewise refused,
+    // never silently self-healed from the store (which would drop an in-block edit).
+    if (owned.status === 'conflict') throw new FileBlockConflictError(target, owned.detail);
+    // 'absent' → the managed region is gone from the file; nothing to reconcile.
+    if (owned.status === 'absent') return result;
+    const inFile = owned.bodies;
 
     const newBodies = new Map<string, string>();
     const updatedSubBlocks: FileSubBlock[] = [];
@@ -467,7 +549,7 @@ export async function syncBack(paths: Paths, opts: FileBlockTargetOptions): Prom
 
     for (const sb of record.subBlocks) {
       const storeBody = await readFileOrEmpty(sb.storePath);
-      // A block missing from the file (markers mangled) self-heals from the store.
+      // After a clean locate every recorded sub-block is present in the file.
       const fileBody = inFile.get(sb.source) ?? storeBody;
       const recorded = sb.hash;
 
@@ -489,7 +571,7 @@ export async function syncBack(paths: Paths, opts: FileBlockTargetOptions): Prom
     }
 
     const region = renderRegion(env, updatedSubBlocks, newBodies);
-    const after = appendRegion(stripRegion(before, env).user, region);
+    const after = appendRegion(stripSpan(before, owned.start, owned.end), region);
     const hashesChanged = updatedSubBlocks.some((sb, i) => sb.hash !== record.subBlocks[i]?.hash);
 
     // Truly nothing to do: no drift, no refresh, no hash change, file unchanged.
