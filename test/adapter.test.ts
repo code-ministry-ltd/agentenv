@@ -59,8 +59,9 @@ describe('session adapter contract', () => {
     expect(validateAdapter(bad)).toContain('unsafe rootRelativePath');
   });
 
-  it('the real adapter registry is empty in Phase 1 (real adapters are 1.8 / 4.x)', () => {
-    expect(realAdapters).toEqual([]);
+  it('registers the Claude Code adapter (Task 1.8); Codex/OpenCode/Pi/Cursor are 4.x', () => {
+    expect(realAdapters.map((a) => a.id)).toEqual(['claude-code']);
+    for (const a of realAdapters) expect(validateAdapter(a)).toBeNull();
   });
 
   it('M5: validateConfigFile is an OPTIONAL whole-file hook adapters need not implement', () => {
