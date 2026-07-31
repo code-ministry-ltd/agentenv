@@ -270,19 +270,23 @@ export async function injectKeyed(
   req: InjectKeyedRequest,
 ): Promise<ConfigKeysItem> {
   const text = await readText(req.file);
-  const next = injectKeyedText(text, req);
   const item = makeKeyedItem(req);
+  const next = writeKeyedValueText(text, item, req.value);
   await applyFileMutation(paths, tx, 'add', item, req.file, next);
   return item;
 }
 
-/** Compute the post-injection file text for a keyed injection, dispatching on format. */
-function injectKeyedText(text: string, req: InjectKeyedRequest): string {
-  if (req.format === 'toml') {
-    throw new ConfigKeysError(`${req.file}: TOML keyed injection not yet implemented`, req.file);
+/**
+ * Compute file text with `value` written at a keyed value's path, dispatching on
+ * format. JSON/JSONC uses surgical `modify` (creates missing parents, preserves
+ * surrounding formatting/comments); TOML follows in a later slice.
+ */
+function writeKeyedValueText(text: string, item: ConfigKeysItem, value: JsonValue): string {
+  if (item.format === 'toml') {
+    throw new ConfigKeysError(`${item.path}: TOML keyed write not yet implemented`, item.path);
   }
   const base = jsonBaseText(text);
-  return applyEdits(base, modify(base, req.keyPath as JSONPath, req.value, {}));
+  return applyEdits(base, modify(base, item.keyPath as JSONPath, value, {}));
 }
 
 function makeKeyedItem(req: InjectKeyedRequest): ConfigKeysItem {
@@ -345,10 +349,7 @@ export async function removeKey(
 
 /** Read an owned keyed value from file text, dispatching on format. */
 function readKeyed(text: string, item: ConfigKeysItem): { found: boolean; value: unknown } {
-  if (item.format === 'toml') {
-    throw new ConfigKeysError(`${item.path}: TOML parsing not yet implemented`, item.path);
-  }
-  return getAtPath(parseJsonConfig(text, item.path), item.keyPath);
+  return getAtPath(parseConfig(text, item), item.keyPath);
 }
 
 /** Produce file text with the owned keyed value removed, dispatching on format. */
@@ -358,6 +359,100 @@ function removeKeyedText(text: string, item: ConfigKeysItem): string {
   }
   const base = jsonBaseText(text);
   return applyEdits(base, modify(base, item.keyPath as JSONPath, undefined, {}));
+}
+
+// ---------------------------------------------------------------------------
+// syncBack — drift detection + write-back (runs every pass, D3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-hash an owned key's current value and, if it drifted, write it back —
+ * secret-flagged fields restored to their `${VAR}` placeholders, never the
+ * current literal (D6). Returns the value the caller should persist to the
+ * canonical store (`canonicalValue`) and the updated record (new hash). This runs
+ * on **every** invocation so mid-session edits to injected config survive, and it
+ * is what lets {@link removeKey} proceed after drift: the record's hash is brought
+ * back into agreement with the file.
+ *
+ * A no-op (no journal mutation) when the value is unchanged or the key has
+ * vanished. **Keyed** mode only carries drift; an **array-element**'s identity is
+ * its exact value, so a changed value simply reads as absent (reported, never
+ * rewritten).
+ */
+export async function syncBack(
+  paths: Paths,
+  tx: Transaction,
+  item: ConfigKeysItem,
+): Promise<SyncBackResult> {
+  const text = await readText(item.path);
+
+  if (item.mode === 'array-element') {
+    const { found, value } = getAtPath(parseConfig(text, item), item.keyPath);
+    const present =
+      found &&
+      Array.isArray(value) &&
+      value.some((v) => stableStringify(v) === stableStringify(item.value));
+    return present
+      ? { drifted: false, item }
+      : { drifted: false, item, note: `array element ${item.key ?? ''} absent — nothing to sync` };
+  }
+
+  const { found, value } = readKeyed(text, item);
+  if (!found) {
+    return {
+      drifted: false,
+      item,
+      note: `config key ${item.key ?? displayPath(item.keyPath)} vanished from ${item.path}`,
+    };
+  }
+
+  const current = value as JsonValue;
+  if (hashValue(current) === item.hash) {
+    return { drifted: false, item };
+  }
+
+  // Drift: restore secret-flagged subfields to placeholders, then write back and
+  // re-hash so the file, the store value we return, and the record all agree.
+  const canonical = restoreSecrets(current, item.secretFields);
+  const updated: ConfigKeysItem = { ...item, hash: hashValue(canonical) };
+  const next = writeKeyedValueText(text, item, canonical);
+  await applyFileMutation(paths, tx, 'add', updated, item.path, next);
+  return { drifted: true, currentValue: current, canonicalValue: canonical, item: updated };
+}
+
+/** Parse an owned item's file, dispatching on format. */
+function parseConfig(text: string, item: ConfigKeysItem): unknown {
+  if (item.format === 'toml') {
+    throw new ConfigKeysError(`${item.path}: TOML parsing not yet implemented`, item.path);
+  }
+  return parseJsonConfig(text, item.path);
+}
+
+/**
+ * Deep-clone `value` and reset each secret-flagged subpath to its placeholder, so
+ * a baked literal is never carried into the store (D6). Best-effort: a subpath
+ * that no longer exists is skipped.
+ */
+function restoreSecrets(value: JsonValue, secretFields?: Record<string, string>): JsonValue {
+  if (!secretFields || Object.keys(secretFields).length === 0) return value;
+  const clone = structuredClone(value);
+  for (const [dotted, placeholder] of Object.entries(secretFields)) {
+    setAtDottedPath(clone, dotted.split('.'), placeholder);
+  }
+  return clone;
+}
+
+/** Set `leaf` at a dotted subpath within an object value; a missing segment is a no-op. */
+function setAtDottedPath(root: JsonValue, path: string[], leaf: string): void {
+  let cur: JsonValue = root;
+  for (let i = 0; i < path.length - 1; i++) {
+    if (cur === null || typeof cur !== 'object' || Array.isArray(cur)) return;
+    const seg = path[i] as string;
+    if (!Object.prototype.hasOwnProperty.call(cur, seg)) return;
+    cur = (cur as { [k: string]: JsonValue })[seg] as JsonValue;
+  }
+  if (cur === null || typeof cur !== 'object' || Array.isArray(cur)) return;
+  (cur as { [k: string]: JsonValue })[path[path.length - 1] as string] = leaf;
 }
 
 // ---------------------------------------------------------------------------

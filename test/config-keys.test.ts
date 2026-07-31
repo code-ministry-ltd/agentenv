@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   injectKeyed,
   removeKey,
+  syncBack,
   type ConfigKeysItem,
 } from '../src/config-keys.js';
 import { beginTransaction } from '../src/journal.js';
@@ -158,6 +159,105 @@ describe('config-keys', () => {
       expect(result.reason).toBe('absent');
       expect(result.note).toMatch(/absent/);
       expect(readFileSync(f, 'utf8')).toBe('{}\n'); // untouched
+    });
+  });
+
+  describe('config-keys drift + syncBack write-back', () => {
+    async function injectLinear(p: ReturnType<typeof paths>, f: string): Promise<ConfigKeysItem> {
+      return inTx(p, (tx) =>
+        injectKeyed(p, tx, {
+          file: f,
+          format: 'json',
+          keyPath: ['mcpServers', 'linear'],
+          value: { transport: 'http' },
+          ownerEnv: 'writing',
+        }),
+      );
+    }
+
+    it('refuses to remove a drifted key until its drift is written back', async () => {
+      const p = paths();
+      const f = file('claude.json');
+      writeFileSync(f, '{\n  "mcpServers": {}\n}\n');
+      const item = await injectLinear(p, f);
+
+      // The harness/user edits the value in place → drift.
+      const doc = JSON.parse(readFileSync(f, 'utf8'));
+      doc.mcpServers.linear = { transport: 'ws' };
+      writeFileSync(f, JSON.stringify(doc, null, 2) + '\n');
+
+      // Removal is refused while the recorded hash no longer matches the file.
+      const refused = await inTx(p, (tx) => removeKey(p, tx, item));
+      expect(refused).toMatchObject({ removed: false, reason: 'hash-mismatch' });
+      expect(JSON.parse(readFileSync(f, 'utf8')).mcpServers.linear).toEqual({ transport: 'ws' });
+
+      // syncBack writes the drift back and updates the recorded hash.
+      const synced = await inTx(p, (tx) => syncBack(p, tx, item));
+      expect(synced.drifted).toBe(true);
+      expect(synced.currentValue).toEqual({ transport: 'ws' });
+      expect(synced.canonicalValue).toEqual({ transport: 'ws' });
+      expect(synced.item.hash).not.toBe(item.hash);
+
+      // With the hash back in agreement, removal now proceeds.
+      const removed = await inTx(p, (tx) => removeKey(p, tx, synced.item));
+      expect(removed.removed).toBe(true);
+      expect(JSON.parse(readFileSync(f, 'utf8')).mcpServers).toEqual({});
+    });
+
+    it('reports no drift when the value is unchanged (a no-op sync)', async () => {
+      const p = paths();
+      const f = file('claude.json');
+      writeFileSync(f, '{\n  "mcpServers": {}\n}\n');
+      const item = await injectLinear(p, f);
+
+      const synced = await inTx(p, (tx) => syncBack(p, tx, item));
+      expect(synced.drifted).toBe(false);
+      expect(synced.item.hash).toBe(item.hash);
+      expect((await readState(p)).items).toHaveLength(1); // no phantom mutation
+    });
+
+    it('restores a secret-flagged field to its placeholder on write-back, never the literal', async () => {
+      const p = paths();
+      const f = file('claude.json');
+      writeFileSync(f, '{\n  "mcpServers": {}\n}\n');
+
+      // Inject with a passthrough placeholder and flag it secret.
+      const item = await inTx(p, (tx) =>
+        injectKeyed(p, tx, {
+          file: f,
+          format: 'json',
+          keyPath: ['mcpServers', 'github'],
+          value: { transport: 'stdio', env: { GITHUB_TOKEN: '${GITHUB_TOKEN}' } },
+          ownerEnv: 'writing',
+          secretFields: { 'env.GITHUB_TOKEN': '${GITHUB_TOKEN}' },
+        }),
+      );
+
+      // The harness bakes a real literal token over the placeholder.
+      const doc = JSON.parse(readFileSync(f, 'utf8'));
+      doc.mcpServers.github.env.GITHUB_TOKEN = 'ghp_REALSECRET123';
+      doc.mcpServers.github.transport = 'http'; // also a non-secret drift
+      writeFileSync(f, JSON.stringify(doc, null, 2) + '\n');
+
+      const synced = await inTx(p, (tx) => syncBack(p, tx, item));
+      expect(synced.drifted).toBe(true);
+      // The value returned FOR THE STORE never contains the literal secret.
+      expect(synced.canonicalValue).toEqual({
+        transport: 'http',
+        env: { GITHUB_TOKEN: '${GITHUB_TOKEN}' },
+      });
+      const canonicalText = JSON.stringify(synced.canonicalValue);
+      expect(canonicalText).not.toContain('ghp_REALSECRET123');
+      expect(canonicalText).toContain('${GITHUB_TOKEN}');
+
+      // The literal is also stripped from the config file itself.
+      const fileNow = readFileSync(f, 'utf8');
+      expect(fileNow).not.toContain('ghp_REALSECRET123');
+      expect(fileNow).toContain('${GITHUB_TOKEN}');
+
+      // A second sync now sees no drift (hash agrees with the placeholder form).
+      const again = await inTx(p, (tx) => syncBack(p, tx, synced.item));
+      expect(again.drifted).toBe(false);
     });
   });
 });
