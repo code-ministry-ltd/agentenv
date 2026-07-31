@@ -41,22 +41,41 @@ export function shimScript(binaryName: string, shimsDir: string): string {
   return `#!/bin/sh
 # agentenv shim for ${binaryName} — generated; do not edit.
 # Delegates the launch decision (bind? compose? exec) to agentenv, which resolves
-# the REAL ${binaryName} from a PATH with shim dirs removed and fails open.
+# the REAL ${binaryName} from a PATH with shim dirs removed and fails open. If
+# agentenv is unavailable, resolve and exec the real binary directly — normalising
+# symlinks/trailing slashes so an uninstalled/broken agentenv never bricks the tool
+# and, crucially, never exec-loops back into this shim (H1).
+bin=${bin}
 if command -v agentenv >/dev/null 2>&1; then
-  exec agentenv __shim ${bin} -- "$@"
+  exec agentenv __shim "$bin" -- "$@"
 fi
-# Fallback: agentenv is unavailable — strip this shim dir from PATH and run the
-# real binary untouched, so an uninstalled/broken agentenv never bricks the tool.
-newpath=""
+# Fallback: agentenv is unavailable. A re-entry SENTINEL guarantees termination:
+# if it is already set we mis-resolved last time, so hard-fail with one line
+# instead of exec-looping forever.
+if [ -n "\${AGENTENV_SHIM:-}" ]; then
+  printf 'agentenv: %s shim loop-guard tripped — real binary not found; aborting\\n' "$bin" >&2
+  exit 127
+fi
+AGENTENV_SHIM=1
+export AGENTENV_SHIM
+# Resolve this shim's own dir to its PHYSICAL path (follows symlinks, collapses
+# trailing/duplicate slashes) so the comparison below is exact regardless of how
+# the shims dir appears on PATH.
+shimreal=$(cd ${dir} 2>/dev/null && pwd -P) || shimreal=${dir}
+real=""
 IFS=:
 for d in $PATH; do
-  [ "$d" = ${dir} ] && continue
-  if [ -z "$newpath" ]; then newpath="$d"; else newpath="$newpath:$d"; fi
+  [ -n "$d" ] || d=.
+  dreal=$(cd "$d" 2>/dev/null && pwd -P) || dreal="$d"
+  [ "$dreal" = "$shimreal" ] && continue
+  candidate="$d/$bin"
+  [ -f "$candidate" ] && [ -x "$candidate" ] && { real="$candidate"; break; }
 done
 unset IFS
-PATH="$newpath"
-export PATH
-exec ${bin} "$@"
+# Exec by ABSOLUTE PATH (never by bare name) so resolution can't re-enter the shim.
+[ -n "$real" ] && exec "$real" "$@"
+printf 'agentenv: real %s not found on PATH (shim dir excluded) — aborting\\n' "$bin" >&2
+exit 127
 `;
 }
 
