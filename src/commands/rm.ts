@@ -42,9 +42,16 @@ export const rmCommand: Command = {
     // is currently active — bound in any session OR present in the global stack —
     // unless --drop-first, which deactivates it first (D5/D11).
     const activity = await envActivity(ctx, name);
-    if (activity.session || activity.global) {
+    if (activity.session || activity.globalStack || activity.materialised) {
       if (!parsed.booleans.has('drop-first')) {
-        const where = [activity.session ? 'a session binding' : null, activity.global ? 'the global stack' : null]
+        // Distinguish stack membership from materialised ownership — an env can own
+        // real items without being in the stack (a crash-orphaned global env), and
+        // the two are deactivated the same way but read differently to the user.
+        const where = [
+          activity.session ? 'a session binding' : null,
+          activity.globalStack ? 'the global stack' : null,
+          activity.materialised ? 'materialised global items' : null,
+        ]
           .filter(Boolean)
           .join(' and ');
         return {
@@ -73,18 +80,27 @@ export const rmCommand: Command = {
   },
 };
 
-/** Whether an env is active: bound in any session, or present in the global stack/manifest. */
+/**
+ * How an env is active, split so the refusal can name each cause precisely:
+ * `session` (bound in any shell), `globalStack` (present in the persisted global
+ * stack), and `materialised` (owns at least one manifest item on real paths — true
+ * for a normally-stacked env AND for a crash-orphaned one whose stack write was lost).
+ */
 async function envActivity(
   ctx: CommandContext,
   name: string,
-): Promise<{ session: boolean; global: boolean }> {
+): Promise<{ session: boolean; globalStack: boolean; materialised: boolean }> {
   const { paths } = ctx;
   const registry = await readSessionRegistry(paths);
+  // NOTE (Finding 4 — record-only, deferred to later/D15): a binding left by a
+  // now-dead shell is never garbage-collected, so it still reads as an active
+  // session here and forces --drop-first. Accepted for 1.7 — dead-shell binding GC
+  // is future work, not part of the engine + core CLI.
   const session = registry.bindings.some((b) => b.envs.includes(name));
   const manifest = await readState(paths);
-  const global =
-    readGlobalStack(manifest).includes(name) || manifest.items.some((i) => i.ownerEnv === name);
-  return { session, global };
+  const globalStack = readGlobalStack(manifest).includes(name);
+  const materialised = manifest.items.some((i) => i.ownerEnv === name);
+  return { session, globalStack, materialised };
 }
 
 /**
@@ -95,10 +111,10 @@ async function envActivity(
 async function deactivateEverywhere(
   ctx: CommandContext,
   name: string,
-  activity: { session: boolean; global: boolean },
+  activity: { session: boolean; globalStack: boolean; materialised: boolean },
 ): Promise<void> {
   const { paths, env, options } = ctx;
-  if (activity.global) {
+  if (activity.globalStack || activity.materialised) {
     const adapters = options.adapters ?? realAdapters;
     await dematerialiseGlobal({ paths, adapters, envs: [name], all: false, env });
   }
