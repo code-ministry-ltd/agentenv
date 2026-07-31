@@ -414,6 +414,44 @@ export async function getRemoteUrl(paths: Paths, env: NodeJS.ProcessEnv, run?: G
   return url !== '' ? url : null;
 }
 
+/** Add `origin` pointing at `url` (no network). */
+export async function addRemote(paths: Paths, env: NodeJS.ProcessEnv, url: string, run?: GitRunner): Promise<void> {
+  const ctx = gitContext(paths, env, run);
+  const res = await git(ctx, ['remote', 'add', 'origin', url]);
+  if (res.code !== 0) throw new Error(`agentenv: could not add remote (${firstLine(res.stderr)})`);
+}
+
+/** Remove `origin` (used to back out of a connect that must not proceed). */
+export async function removeRemote(paths: Paths, env: NodeJS.ProcessEnv, run?: GitRunner): Promise<void> {
+  const ctx = gitContext(paths, env, run);
+  await git(ctx, ['remote', 'remove', 'origin']);
+}
+
+/** What a `git ls-remote` probe of the configured remote found. */
+export interface RemoteProbe {
+  status: 'empty' | 'nonempty' | 'unreachable';
+  detail?: string;
+}
+
+/**
+ * Probe the configured remote with `git ls-remote` (short timeout): does it exist
+ * and does it already have refs? Used by `agentenv remote` to distinguish the
+ * empty-repo first-connect case (this task) from a non-empty remote whose
+ * same/related/unrelated CLASSIFICATION is Task 2.3.
+ */
+export async function probeRemote(
+  paths: Paths,
+  env: NodeJS.ProcessEnv,
+  opts: { run?: GitRunner; timeoutMs?: number } = {},
+): Promise<RemoteProbe> {
+  const ctx = gitContext(paths, env, opts.run);
+  const res = await git(ctx, ['ls-remote', 'origin'], opts.timeoutMs ?? PULL_TIMEOUT_MS);
+  if (res.code !== 0 || res.timedOut) {
+    return { status: 'unreachable', detail: res.timedOut ? 'network timeout' : firstLine(res.stderr) };
+  }
+  return { status: res.stdout.trim() === '' ? 'empty' : 'nonempty' };
+}
+
 // ---------------------------------------------------------------------------
 // Commit (with pre-commit secret scan)
 // ---------------------------------------------------------------------------

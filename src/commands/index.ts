@@ -5,6 +5,7 @@ import { dropCommand } from './drop.js';
 import { editCommand } from './edit.js';
 import { initCommand } from './init.js';
 import { listCommand } from './list.js';
+import { remoteCommand } from './remote.js';
 import { rmCommand } from './rm.js';
 import { runCommand } from './run.js';
 import { shellInitCommand } from './shell-init.js';
@@ -29,6 +30,7 @@ export const commands: readonly Command[] = [
   useCommand,
   dropCommand,
   statusCommand,
+  remoteCommand,
   runCommand,
   shellInitCommand,
   shimCommand,
