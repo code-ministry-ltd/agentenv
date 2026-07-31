@@ -7,9 +7,15 @@
  * symlinked-through or written) — then runs the adapter's real `selfCheck` against
  * a live `claude mcp list`. Proves: the child observes the private view (its
  * injected server is listed), login passes through the copied credentials, and the
- * real ~/.claude is untouched. Skips cleanly where `claude` is absent (CI).
+ * real ~/.claude is untouched.
  *
- * Run just this:  npm test -- -t "adapter.claude — live"
+ * OPT-IN checkpoint test (spec criterion 9): live/login-dependent assertions are
+ * checkpoint assertions, not suite gates — `claude mcp list` connects to account
+ * remote MCP servers over the network, so it is inherently timing-flaky under a
+ * loaded parallel suite. It therefore does NOT run in `npm run ci`; set
+ * AGENTENV_LIVE=1 (and have `claude` + real creds present) to run it on demand.
+ *
+ * Run just this:  AGENTENV_LIVE=1 npm test -- test/adapter.claude.live.test.ts
  */
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -30,7 +36,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import type { SelfCheckContext } from '../src/adapter.js';
 import { claudeAdapter } from '../src/adapters/claude.js';
 import { resolvePaths } from '../src/paths.js';
-import { defaultCapture } from '../src/session/exec.js';
+import { makeCapture } from '../src/session/exec.js';
 import { resolveBinaryOnPath } from '../src/session/resolve.js';
 import { composeView } from '../src/session/composer.js';
 
@@ -38,7 +44,13 @@ const PROBE_TIMEOUT_MS = 60_000;
 const hasClaude = spawnSync('claude', ['--version'], { timeout: 20_000 }).status === 0;
 const realCredsPath = join(homedir(), '.claude', '.credentials.json');
 const realJsonPath = join(homedir(), '.claude.json');
-const canRun = hasClaude && existsSync(realCredsPath) && existsSync(realJsonPath);
+// Opt-in only (spec criterion 9): live/login tests are checkpoint assertions, not
+// suite gates. Skipped unless AGENTENV_LIVE=1 so a network-flaky probe never fails CI.
+const canRun =
+  process.env.AGENTENV_LIVE === '1' &&
+  hasClaude &&
+  existsSync(realCredsPath) &&
+  existsSync(realJsonPath);
 
 const tmpRoots: string[] = [];
 function freshRoot(): string {
@@ -105,7 +117,10 @@ describe.skipIf(!canRun)('adapter.claude — live selfCheck on a copy of real ~/
       // (3) selfCheck: the live child provably observes the view.
       const ctx: SelfCheckContext = {
         resolveBinary: () => resolveBinaryOnPath('claude', process.env, [paths.shims]),
-        capture: defaultCapture,
+        // Generous capture timeout for the on-demand checkpoint run: `claude mcp
+        // list` connects to account remotes over the network (the default 10s
+        // probe budget is for a real launch, not this deliberate live probe).
+        capture: makeCapture(60_000),
         env: { ...process.env, CLAUDE_CONFIG_DIR: undefined } as NodeJS.ProcessEnv,
       };
       const check = await claudeAdapter.selfCheck(viewRoot, ctx);
