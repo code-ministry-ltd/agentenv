@@ -168,10 +168,41 @@ function coerceItems(raw: unknown, file: string): ManifestItem[] {
   return raw as ManifestItem[];
 }
 
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Validate a persisted journal the same way {@link coerceItems} validates items:
+ * every entry must be a well-formed `{op, item, undo}` record. A malformed entry
+ * is rejected here with a clear {@link StateError} naming the file — before it
+ * can reach `rollbackEntries` and throw an uncaught `TypeError`, which would
+ * wedge recovery (a pending journal blocks {@link beginTransaction}).
+ */
 function coerceJournal(raw: unknown, file: string): JournalEntry[] | null {
   if (raw === undefined || raw === null) return null;
   if (!Array.isArray(raw)) {
     throw new StateError(`${file}: 'journal' must be an array`, file);
+  }
+  for (const entry of raw) {
+    if (!isObject(entry)) {
+      throw new StateError(`${file}: every entry in 'journal' must be an object`, file);
+    }
+    if (entry.op !== 'add' && entry.op !== 'remove') {
+      throw new StateError(`${file}: journal entry 'op' must be "add" or "remove"`, file);
+    }
+    if (!isObject(entry.item)) {
+      throw new StateError(`${file}: journal entry 'item' must be an object`, file);
+    }
+    if (!isObject(entry.undo)) {
+      throw new StateError(`${file}: journal entry 'undo' must be an object`, file);
+    }
+    if (typeof entry.undo.path !== 'string') {
+      throw new StateError(`${file}: journal entry 'undo.path' must be a string`, file);
+    }
+    if (!isObject(entry.undo.backupRef)) {
+      throw new StateError(`${file}: journal entry 'undo.backupRef' must be an object`, file);
+    }
   }
   return raw as JournalEntry[];
 }

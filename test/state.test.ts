@@ -155,6 +155,68 @@ describe('state manifest', () => {
     });
   });
 
+  describe('journal validation on read', () => {
+    const goodItem = { action: 'symlink', surface: 'dir-merge', path: '/x', ownerEnv: 'w' };
+    const goodUndo = { path: '/x', backupRef: { kind: 'absent' } };
+
+    it('rejects a malformed journal entry with a StateError naming the file', async () => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({
+          version: STATE_SCHEMA_VERSION_STRING,
+          items: [],
+          journal: [{ op: 'frobnicate', item: goodItem, undo: goodUndo }],
+        }),
+      );
+      let thrown: unknown;
+      try {
+        await readState(p);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(StateError);
+      expect((thrown as StateError).message).toMatch(/journal.*op/i);
+      expect((thrown as StateError).file).toBe(p.state);
+    });
+
+    it('rejects a journal entry whose undo lacks a backupRef', async () => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({
+          version: STATE_SCHEMA_VERSION_STRING,
+          items: [],
+          journal: [{ op: 'add', item: goodItem, undo: { path: '/x' } }],
+        }),
+      );
+      await expect(readState(p)).rejects.toThrow(/undo\.backupRef/i);
+    });
+
+    it('rejects a journal entry that is not an object', async () => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({ version: STATE_SCHEMA_VERSION_STRING, items: [], journal: ['nope'] }),
+      );
+      await expect(readState(p)).rejects.toBeInstanceOf(StateError);
+    });
+
+    it('accepts a well-formed pending journal', async () => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({
+          version: STATE_SCHEMA_VERSION_STRING,
+          items: [],
+          journal: [{ op: 'add', item: goodItem, undo: goodUndo }],
+        }),
+      );
+      const manifest = await readState(p);
+      expect(manifest.journal).toHaveLength(1);
+    });
+  });
+
   describe('query + mutation helpers', () => {
     it('finds who owns a path', () => {
       const manifest = emptyManifest();
