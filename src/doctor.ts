@@ -488,3 +488,54 @@ export async function repair(paths: Paths): Promise<RepairResult> {
   const remaining = await diagnose(paths);
   return { actions, remaining };
 }
+
+// ---------------------------------------------------------------------------
+// --restore <backup>
+// ---------------------------------------------------------------------------
+
+/** Outcome of {@link restoreBackup}. */
+export interface RestoreResult {
+  restored: boolean;
+  /** The manifest-recorded path the backup was restored to (on success). */
+  path?: string;
+  /** Why the restore did not happen (on failure). */
+  error?: string;
+}
+
+/** Find the manifest ref + recorded path a backup id belongs to (item, then journal). */
+function findBackupTarget(
+  manifest: StateManifest,
+  backupId: string,
+): { ref: BackupRef; path: string } | null {
+  for (const item of manifest.items) {
+    const ref = (item as { backupRef?: BackupRef | null }).backupRef;
+    if (ref && backupEntryName(ref) === backupId) return { ref, path: item.path };
+  }
+  for (const entry of manifest.journal ?? []) {
+    const ref = entry.undo?.backupRef;
+    if (ref && backupEntryName(ref) === backupId) return { ref, path: entry.undo.path };
+  }
+  return null;
+}
+
+/**
+ * Restore one content-addressed backup to its manifest-recorded path (design D4).
+ * The backup id is a `backups/` entry name — a content sha256 or a `dir-…` id. The
+ * path is not passed in: it is read from whichever manifest item (or pending
+ * journal undo) references the backup, so a backup is always returned to exactly
+ * where it was captured. Runs under the lock and reuses {@link restore}.
+ */
+export async function restoreBackup(paths: Paths, backupId: string): Promise<RestoreResult> {
+  const id = backupId.trim();
+  if (id === '') return { restored: false, error: 'a backup id is required' };
+  const manifest = await readState(paths);
+  const match = findBackupTarget(manifest, id);
+  if (!match) {
+    return { restored: false, error: `no manifest item references backup '${id}'` };
+  }
+  if (!(await exists(join(paths.backups, id)))) {
+    return { restored: false, error: `backup '${id}' is not present under ${paths.backups}` };
+  }
+  await withLock(paths, () => restore(paths, match.ref, match.path));
+  return { restored: true, path: match.path };
+}

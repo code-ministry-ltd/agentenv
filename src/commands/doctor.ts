@@ -1,6 +1,6 @@
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
-import { diagnose, repair, type DoctorProblem } from '../doctor.js';
+import { diagnose, repair, restoreBackup, type DoctorProblem } from '../doctor.js';
 
 /**
  * `agentenv doctor [--repair] [--restore <backup>]` (design D4, spec criterion 6).
@@ -34,6 +34,7 @@ export const doctorCommand: Command = {
     if (wantRepair && wantRestore) {
       return fail('doctor: --repair and --restore are mutually exclusive\n');
     }
+    if (wantRestore) return runRestore(ctx, parsed.values.get('restore') ?? '');
     if (wantRepair) return runRepair(ctx);
     return runDiagnose(ctx);
   },
@@ -84,4 +85,16 @@ async function runRepair(ctx: CommandContext): Promise<RunResult> {
   lines.push('', `doctor: ${result.remaining.length} problem(s) remain after repair:`, '');
   const body = result.remaining.map(renderProblem).join('\n');
   return { stdout: `${lines.join('\n')}\n${body}`, code: 1 };
+}
+
+/** `doctor --restore <backup>`: restore one content-addressed backup to its path. */
+async function runRestore(ctx: CommandContext, backupId: string): Promise<RunResult> {
+  if (backupId.trim() === '') {
+    return fail('doctor: --restore requires a backup id\n');
+  }
+  const res = await restoreBackup(ctx.paths, backupId);
+  if (!res.restored) {
+    return { stdout: '', stderr: `doctor --restore: ${res.error}\n`, code: 1 };
+  }
+  return { stdout: `doctor --restore: restored backup '${backupId.trim()}' to ${res.path}\n`, code: 0 };
 }
