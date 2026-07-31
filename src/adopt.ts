@@ -363,6 +363,62 @@ export function findAdoptedByName(manifest: StateManifest, name: string): Adopte
   return manifest.items.filter((i): i is AdoptedDirMergeItem => isAdopted(i) && baseName(i.path) === name);
 }
 
+/**
+ * Record `name` into the baseline of every inventory surface at `dir`, so an item
+ * a `disown` just restored to a real/view surface is treated as PRE-EXISTING and
+ * is not immediately re-adopted by the next sweep. Under the lock (RMW). A no-op
+ * when no snapshotted surface covers `dir`.
+ */
+export async function markBaseline(paths: Paths, dir: string, name: string): Promise<void> {
+  await withLock(paths, async () => {
+    const manifest = await readState(paths);
+    const inventory = readInventory(manifest);
+    let changed = false;
+    for (const surface of inventory) {
+      if (surface.dir === dir && !surface.baseline.includes(name)) {
+        surface.baseline.push(name);
+        changed = true;
+      }
+    }
+    if (changed) {
+      (manifest as { inventory?: SnapshotSurface[] }).inventory = inventory;
+      await writeState(paths, manifest);
+    }
+  });
+}
+
+/**
+ * A new, UNOWNED item named `name` found in a snapshotted surface, for a MANUAL
+ * `adopt <name> --into <env>` (design D10). Searches the inventory so the manual
+ * path reuses the same surface metadata (scope, realDir) the sweep would. Returns
+ * every match (0 = not found / already owned, >1 = ambiguous across surfaces).
+ */
+export async function findAdoptableItem(
+  paths: Paths,
+  name: string,
+): Promise<{ surface: SnapshotSurface; surfacePath: string }[]> {
+  const manifest = await readState(paths);
+  const matches: { surface: SnapshotSurface; surfacePath: string }[] = [];
+  for (const surface of readInventory(manifest)) {
+    const surfacePath = join(surface.dir, name);
+    const names = await listNames(surface.dir);
+    if (!names.includes(name)) continue;
+    if (findOwner(manifest, surfacePath)) continue; // already owned
+    matches.push({ surface, surfacePath });
+  }
+  return matches;
+}
+
+/** Whether an item at `surfacePath` is a foreign-manager symlink (guardrail 1). */
+export function isForeignManagerSymlink(surfacePath: string, storeRoot: string): Promise<boolean> {
+  return isForeignSymlink(surfacePath, storeRoot);
+}
+
+/** Whether the item at `surfacePath` matches a secret pattern (guardrail 2). */
+export function itemHasSecret(surfacePath: string): Promise<boolean> {
+  return pathHasSecret(surfacePath);
+}
+
 /** Whether a manifest record is an adoption. */
 export function isAdopted(item: ManifestItem): item is AdoptedDirMergeItem {
   return item.surface === 'dir-merge' && (item as { adopted?: unknown }).adopted === true;
