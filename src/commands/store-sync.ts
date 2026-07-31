@@ -73,10 +73,11 @@ export async function openStoreSync(
   });
 }
 
-/** END the sync lifecycle: the single fail-soft push (design D9). */
-export async function closeStoreSync(ctx: SyncCtx, notices: string[]): Promise<void> {
+/** END the sync lifecycle: the single fail-soft push (design D9). Returns the push
+ *  outcome so a reporting caller (`agentenv sync`) can say what happened. */
+export async function closeStoreSync(ctx: SyncCtx, notices: string[]): ReturnType<typeof endStoreSync> {
   const { paths, env, options } = ctx;
-  await endStoreSync({
+  return endStoreSync({
     paths,
     env,
     onNotice: (n) => notices.push(n),

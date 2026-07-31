@@ -1,6 +1,7 @@
 import { adapters as realAdapters } from '../adapters/index.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
 import { describeGlobal, type AdapterStatus } from '../engine.js';
+import { readConflictMarker } from '../git.js';
 import { findBinding, readSessionRegistry, resolveProjectRoot } from '../session/registry.js';
 
 /**
@@ -15,12 +16,29 @@ export const statusCommand: Command = {
 
   async run(ctx): Promise<RunResult> {
     const lines: string[] = ['agentenv status', ''];
+    lines.push(...(await syncSection(ctx)));
     lines.push(...(await sessionSection(ctx)));
     lines.push('');
     lines.push(...(await globalSection(ctx)));
     return { stdout: `${lines.join('\n')}\n`, code: 0 };
   },
 };
+
+/**
+ * Surface a rebase conflict that is BLOCKING sync (design D9, Task 2.2). Read-only —
+ * `status` never itself pulls or aborts; it reports the machine-local marker a prior
+ * sync/mutating command left. The store still works from the working tree; the line
+ * points the user at the guided walkthrough.
+ */
+async function syncSection(ctx: CommandContext): Promise<string[]> {
+  const marker = await readConflictMarker(ctx.paths);
+  if (!marker.pending) return [];
+  return [
+    'Sync:       BLOCKED by a rebase conflict — run `agentenv sync --resolve` to finish syncing',
+    '            (or `agentenv sync --abort` to cancel and keep local). The store still works locally.',
+    '',
+  ];
+}
 
 async function sessionSection(ctx: CommandContext): Promise<string[]> {
   const { paths, env, cwd } = ctx;

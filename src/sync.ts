@@ -2,14 +2,18 @@ import type { Adapter } from './adapter.js';
 import { driftSweep } from './drift.js';
 import { effectiveGlobalEnvs } from './engine.js';
 import {
+  clearConflictMarker,
   commitStore,
   describeFindings,
   type GitRunner,
+  type PushResult,
   pullRebase,
   pushStore,
+  rebaseInProgress,
   reconcileManifest,
   storeIsRepo,
   validatePulledStore,
+  writeConflictMarker,
 } from './git.js';
 import type { Paths } from './paths.js';
 import { readSessionRegistry } from './session/registry.js';
@@ -43,6 +47,21 @@ export interface SyncBeforeResult {
    * materialise it onto real surfaces; it stays quarantined in the working tree.
    */
   quarantined: boolean;
+  /**
+   * The pull hit a rebase conflict (D9, Task 2.2): 2.1 already `--abort`ed it so the
+   * working tree stays usable, and a machine-local conflict marker is now set so
+   * `agentenv status` surfaces "sync blocked" and `agentenv sync --resolve` can walk
+   * the user through it. The local command still completes from the working tree.
+   */
+  conflicted: boolean;
+  /**
+   * A `sync --resolve` two-step is HELD in progress (a real `git rebase` sits on
+   * disk across invocations) — so this invocation did NOT drift-commit / pull / push,
+   * to keep the mid-rebase index untouched (D9, Task 2.2). The caller's OWN local
+   * mutation still lands on disk; only the git index/commit/pull/push is skipped.
+   * Only `sync --resolve` / `--abort` may ever advance a held rebase.
+   */
+  paused: boolean;
 }
 
 export interface SyncBeforeRequest {
@@ -71,7 +90,23 @@ export interface SyncBeforeRequest {
 export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBeforeResult> {
   const { paths, env, adapters, onNotice, gitRun } = req;
   if (!(await storeIsRepo(paths))) {
-    return { synced: false, pulled: false, quarantined: false };
+    return { synced: false, pulled: false, quarantined: false, conflicted: false, paused: false };
+  }
+
+  // A HELD rebase (a `sync --resolve` two-step in progress) must never be disturbed by
+  // another store-touching command (D9, Task 2.2, criterion 11). Do NOT drift-commit /
+  // pull / push: `commitStore`'s `git add -A` would stage the conflict-marker-laden
+  // working tree and commit garbage that then pushes to the shared remote. Keep the
+  // conflict marker set, flag the result `paused`, and let the caller's OWN local
+  // mutation still land on disk — only the git index/commit/pull/push is skipped. Only
+  // `sync --resolve` / `--abort` may ever advance a held rebase.
+  if (await rebaseInProgress(paths)) {
+    onNotice(
+      'agentenv: sync paused mid-conflict — a `agentenv sync --resolve` is in progress. ' +
+        'Finish it with `agentenv sync --resolve`, or cancel with `agentenv sync --abort`. ' +
+        'Your change is saved locally in the store working tree.',
+    );
+    return { synced: true, pulled: false, quarantined: false, conflicted: true, paused: true };
   }
 
   try {
@@ -99,8 +134,19 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
       ...(gitRun ? { run: gitRun } : {}),
       ...(req.pullTimeoutMs !== undefined ? { timeoutMs: req.pullTimeoutMs } : {}),
     });
-    if (pull.status === 'conflict') {
-      onNotice(`agentenv: sync halted — ${pull.detail}. Your store still works locally from the working tree.`);
+    const conflicted = pull.status === 'conflict';
+    if (conflicted) {
+      // 2.1 already aborted the rebase so the tree stays usable; persist a
+      // machine-local marker so `status` surfaces the blocked state and the local
+      // command still completes (Task 2.2). NEVER auto-resolve.
+      await writeConflictMarker(paths, pull.detail ?? 'store history diverged');
+      onNotice(
+        `agentenv: sync blocked by a conflict — ${pull.detail}. ` +
+          'Your store still works locally from the working tree; run `agentenv sync --resolve` to finish syncing.',
+      );
+    } else if (pull.status === 'ok') {
+      // A clean pull integrated remote history: any earlier conflict is now moot.
+      await clearConflictMarker(paths);
     } else if (pull.status === 'error') {
       onNotice(`agentenv: pull skipped (${pull.detail ?? 'error'}); working offline from the local store.`);
     }
@@ -131,11 +177,11 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
       for (const w of reconcile.warnings) onNotice(w);
     }
 
-    return { synced: true, pulled, quarantined };
+    return { synced: true, pulled, quarantined, conflicted, paused: false };
   } catch (err) {
     // Fail-soft: sync is best-effort; the local command must still complete.
     onNotice(`agentenv: sync (pull phase) skipped — ${(err as Error).message}`);
-    return { synced: true, pulled: false, quarantined: false };
+    return { synced: true, pulled: false, quarantined: false, conflicted: false, paused: false };
   }
 }
 
@@ -151,11 +197,18 @@ export interface SyncAfterRequest {
  * END of a store-touching invocation (design D9): ONE push, after all commits.
  * `git push` sends every unpushed commit, so this also flushes a queue a prior
  * failed invocation left. Failure only queues a retry — never fatal. No-op without
- * a repo/remote.
+ * a repo/remote. Returns the {@link PushResult} (or `undefined` on no-repo / a
+ * fail-soft error) so a reporting caller like `agentenv sync` can say what happened.
  */
-export async function endStoreSync(req: SyncAfterRequest): Promise<void> {
+export async function endStoreSync(req: SyncAfterRequest): Promise<PushResult | undefined> {
   const { paths, env, onNotice, gitRun, now } = req;
-  if (!(await storeIsRepo(paths))) return;
+  if (!(await storeIsRepo(paths))) return undefined;
+  // Symmetric to {@link beginStoreSync}'s held-rebase guard (D9, Task 2.2): never
+  // push while a `sync --resolve` two-step is HELD in progress. No garbage commit can
+  // exist (commitStore refuses mid-rebase), and the completing `sync --resolve` runs
+  // its own push AFTER the rebase finishes — so this skip only suppresses a pointless
+  // non-fast-forward attempt, never the legitimate post-resolve push.
+  if (await rebaseInProgress(paths)) return undefined;
   try {
     const push = await pushStore(paths, env, {
       ...(gitRun ? { run: gitRun } : {}),
@@ -166,8 +219,10 @@ export async function endStoreSync(req: SyncAfterRequest): Promise<void> {
         `agentenv: push deferred (${push.detail ?? 'offline'}) — queued for the next invocation that reaches the remote.`,
       );
     }
+    return push;
   } catch (err) {
     onNotice(`agentenv: push skipped — ${(err as Error).message}`);
+    return undefined;
   }
 }
 
