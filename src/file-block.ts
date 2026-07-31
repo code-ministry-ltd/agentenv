@@ -189,6 +189,15 @@ function findBlocks(content: string): FoundBlock[] {
   return found;
 }
 
+/** Map each of `env`'s sub-blocks (by source id) to its current in-file body. */
+function extractBodies(content: string, env: string): Map<string, string> {
+  const bodies = new Map<string, string>();
+  for (const b of findBlocks(content)) {
+    if (b.env === env) bodies.set(b.source, b.body);
+  }
+  return bodies;
+}
+
 /** The contiguous [start, end) span of `env`'s sub-blocks, or null if none. */
 function regionSpan(content: string, env: string): { start: number; end: number } | null {
   const mine = findBlocks(content).filter((b) => b.env === env);
@@ -407,5 +416,107 @@ export async function dematerialise(paths: Paths, opts: FileBlockTargetOptions):
       await tx.rollback();
       throw err;
     }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// syncBack (inline drift)
+// ---------------------------------------------------------------------------
+
+/** What {@link syncBack} reconciled, by store-file source id. */
+export interface SyncBackResult {
+  /** Sources whose in-file edit was written back to their store file (drift). */
+  drifted: string[];
+  /** Sources whose block was refreshed from a store file changed elsewhere. */
+  refreshed: string[];
+}
+
+/**
+ * Reconcile an env's inline sub-blocks with their store files (design D2's drift
+ * pass). For each sub-block:
+ *
+ * - **drift** — the block was edited in-session (its body no longer hashes to
+ *   the recorded value): the edit is written back to **that sub-block's own**
+ *   store file (a `codex.md` sub-block edit lands in `codex.md`, never in the
+ *   shared `base.md`); block edits win over concurrent store edits (D11
+ *   last-write-wins).
+ * - **refresh** — the block is unchanged but its store file changed elsewhere
+ *   (another machine): the block is re-inlined from the store; nothing is
+ *   written back.
+ *
+ * Either way the recorded hash is updated to the reconciled content. Import mode
+ * has no drift (the block holds an include line, content lives in the store), so
+ * this is a no-op there. Transactional and under {@link withLock}: the target
+ * and each written store file are backed up first.
+ */
+export async function syncBack(paths: Paths, opts: FileBlockTargetOptions): Promise<SyncBackResult> {
+  const { target, env } = opts;
+  return withLock(paths, async () => {
+    const result: SyncBackResult = { drifted: [], refreshed: [] };
+    const manifest = await readState(paths);
+    const record = findRecord(manifest, target, env);
+    // Import mode (or nothing owned) never drifts — the content lives in the store.
+    if (!record || record.mode === 'import') return result;
+
+    const before = await readFileOrEmpty(target);
+    const inFile = extractBodies(before, env);
+
+    const newBodies = new Map<string, string>();
+    const updatedSubBlocks: FileSubBlock[] = [];
+    const storeWrites: { storePath: string; body: string }[] = [];
+
+    for (const sb of record.subBlocks) {
+      const storeBody = await readFileOrEmpty(sb.storePath);
+      // A block missing from the file (markers mangled) self-heals from the store.
+      const fileBody = inFile.get(sb.source) ?? storeBody;
+      const recorded = sb.hash;
+
+      let newBody: string;
+      if (hashBody(fileBody) !== recorded) {
+        // In-session edit → write drift back to THIS source's store file.
+        newBody = fileBody;
+        storeWrites.push({ storePath: sb.storePath, body: newBody });
+        result.drifted.push(sb.source);
+      } else if (hashBody(storeBody) !== recorded) {
+        // Store changed elsewhere, block untouched → refresh block from store.
+        newBody = storeBody;
+        result.refreshed.push(sb.source);
+      } else {
+        newBody = fileBody; // identical everywhere — no change
+      }
+      newBodies.set(sb.source, newBody);
+      updatedSubBlocks.push({ ...sb, hash: hashBody(newBody) });
+    }
+
+    const region = renderRegion(env, updatedSubBlocks, newBodies);
+    const after = appendRegion(stripRegion(before, env).user, region);
+    const hashesChanged = updatedSubBlocks.some((sb, i) => sb.hash !== record.subBlocks[i]?.hash);
+
+    // Truly nothing to do: no drift, no refresh, no hash change, file unchanged.
+    if (storeWrites.length === 0 && after === before && !hashesChanged) return result;
+
+    const updatedItem: FileBlockItem = { ...record, subBlocks: updatedSubBlocks };
+    const currentBackup = await backup(paths, target);
+    for (const w of storeWrites) await backup(paths, w.storePath);
+
+    const tx = await beginTransaction(paths);
+    try {
+      await tx.apply(
+        {
+          op: 'add',
+          item: updatedItem as ManifestItem,
+          undo: { path: target, backupRef: currentBackup },
+        },
+        async () => {
+          for (const w of storeWrites) await writeFileAtomic(w.storePath, w.body);
+          if (after !== before) await writeFileAtomic(target, after);
+        },
+      );
+      await tx.commit();
+    } catch (err) {
+      await tx.rollback();
+      throw err;
+    }
+    return result;
   });
 }
