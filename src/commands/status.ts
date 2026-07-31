@@ -51,6 +51,12 @@ async function globalSection(ctx: CommandContext): Promise<string[]> {
   const status = await describeGlobal({ paths, adapters, env });
 
   const lines = [`Global stack: ${status.stack.length > 0 ? `[${status.stack.join(', ')}]` : '(empty)'}`, ''];
+  if (status.orphanedEnvs.length > 0) {
+    // Owned-but-unstacked envs: a crash committed their items but lost the stack
+    // write (Finding 1). Surface them so they are neither invisible nor undroppable
+    // (`drop --global --all` clears them).
+    lines.push(`Recovered (owned but not in the stack): [${status.orphanedEnvs.join(', ')}]`, '');
+  }
   lines.push('Harnesses (global surfaces):');
   if (status.adapters.length === 0) {
     lines.push('  (no adapters registered — global mode needs a harness adapter, Task 1.8/4.x)');

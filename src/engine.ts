@@ -119,6 +119,27 @@ export function mergeStack(current: readonly string[], added: readonly string[])
   return [...current.filter((e) => !added.includes(e)), ...added];
 }
 
+/**
+ * The EFFECTIVE active set for global mode: the persisted {@link readGlobalStack
+ * global stack} UNION every env that still owns a manifest item. A crash between an
+ * item commit and {@link writeGlobalStack} (D4) leaves manifest-owned items on disk
+ * with an empty stack and NO pending journal, so {@link recoverState} is a no-op;
+ * without this union those orphaned items are undroppable by `drop --all` and
+ * invisible to `status`/`describeGlobal` (Finding 1). Mirrors rm's `envActivity`,
+ * which already treats an env as active on stack-membership OR materialised
+ * ownership. Stack entries keep their precedence order; extra owners append.
+ */
+export function effectiveGlobalEnvs(manifest: StateManifest): string[] {
+  const stack = readGlobalStack(manifest);
+  const extra: string[] = [];
+  for (const item of manifest.items) {
+    if (!stack.includes(item.ownerEnv) && !extra.includes(item.ownerEnv)) {
+      extra.push(item.ownerEnv);
+    }
+  }
+  return [...stack, ...extra];
+}
+
 /** Select adapters a `--harness a,b` scope applies to (by id or binaryName). Empty scope ⇒ all. */
 export function selectAdapters(
   adapters: readonly Adapter[],
@@ -412,14 +433,33 @@ async function materialiseConfigKeys(
             throw err;
           }
         } else {
-          await injectArrayElement(paths, tx, {
-            file: p.file,
-            format: p.surface.format,
-            arrayPath: p.injection.arrayPath,
-            value: p.injection.value,
-            ownerEnv: p.env,
-          });
-          applied += 1;
+          try {
+            await injectArrayElement(paths, tx, {
+              file: p.file,
+              format: p.surface.format,
+              arrayPath: p.injection.arrayPath,
+              value: p.injection.value,
+              ownerEnv: p.env,
+            });
+            applied += 1;
+          } catch (err) {
+            // Same skip-and-warn boundary as the keyed branch above (D7): a user's
+            // non-array value at the target path is a conflict to skip, NOT a reason
+            // to abort the whole invocation — an unguarded throw here rolls back the
+            // config-keys batch and orphans every already-committed dir-merge /
+            // file-block item with an empty global stack (Finding 1/2).
+            if (err instanceof ConfigKeysError) {
+              onWarn(`agentenv: ${err.message}`);
+              skips.push({
+                adapterId: p.adapterId,
+                surfaceId: p.surface.id,
+                reason: 'user-collision',
+                detail: err.message,
+              });
+              continue;
+            }
+            throw err;
+          }
         }
       }
       await tx.commit();
@@ -456,6 +496,12 @@ export interface AdapterStatus {
 /** The read-only global picture `status` renders. */
 export interface GlobalStatus {
   stack: string[];
+  /**
+   * Envs that own manifest items but are NOT in the persisted stack — surfaced by a
+   * crash between an item commit and the stack write (Finding 1). `status` flags
+   * them as recovered so they are neither invisible nor undroppable.
+   */
+  orphanedEnvs: string[];
   adapters: AdapterStatus[];
 }
 
@@ -472,6 +518,10 @@ export async function describeGlobal(req: {
   const { paths, adapters, env } = req;
   const manifest = await readState(paths);
   const stack = readGlobalStack(manifest);
+  // Count/expose owned items against the EFFECTIVE active set (stack ∪ owners) so a
+  // crash-orphaned env's items are visible, not hidden by an empty stack (Finding 1).
+  const active = effectiveGlobalEnvs(manifest);
+  const orphanedEnvs = active.filter((e) => !stack.includes(e));
 
   const out: AdapterStatus[] = [];
   for (const adapter of adapters) {
@@ -484,7 +534,7 @@ export async function describeGlobal(req: {
         mechanism: surface.mechanism,
         supported: surface.supported,
         ...(surface.unsupportedReason ? { unsupportedReason: surface.unsupportedReason } : {}),
-        ownedItems: countOwned(manifest, surface, realRoot, stack),
+        ownedItems: countOwned(manifest, surface, realRoot, active),
       });
       if (!surface.supported) {
         skips.push({
@@ -501,19 +551,23 @@ export async function describeGlobal(req: {
     }
     out.push({ adapterId: adapter.id, surfaces, skips });
   }
-  return { stack, adapters: out };
+  return { stack, orphanedEnvs, adapters: out };
 }
 
-/** Count manifest items owned by the stack that live under one surface's target. */
+/**
+ * Count manifest items owned by the effective active set that live under one
+ * surface's target. `active` is stack ∪ owners (see {@link effectiveGlobalEnvs}),
+ * so an orphaned env's items are counted rather than hidden by an empty stack.
+ */
 function countOwned(
   manifest: StateManifest,
   surface: DirMergeSurface | FileBlockSurface | ConfigKeysSurface,
   realRoot: string,
-  stack: readonly string[],
+  active: readonly string[],
 ): number {
   const target = join(realRoot, surface.rootRelativePath);
   return manifest.items.filter((i) => {
-    if (!stack.includes(i.ownerEnv)) return false;
+    if (!active.includes(i.ownerEnv)) return false;
     if (surface.mechanism === 'dir-merge') return i.path.startsWith(target + sep);
     return i.path === target;
   }).length;
@@ -595,7 +649,9 @@ export async function dematerialiseGlobal(req: DematerialiseGlobalRequest): Prom
 
   const manifest = await readState(paths);
   const currentStack = readGlobalStack(manifest);
-  const toDrop = all ? [...currentStack] : [...req.envs];
+  // `--all` drops the EFFECTIVE active set (stack ∪ every manifest owner), so a
+  // crash-orphaned env whose stack write was lost is still fully removed (Finding 1).
+  const toDrop = all ? effectiveGlobalEnvs(manifest) : [...req.envs];
   const inScope = (path: string): boolean => {
     if (!req.restrictToRoots) return true;
     return req.restrictToRoots.some((root) => path === root || path.startsWith(root + sep));
@@ -700,6 +756,10 @@ async function verifyOwned(paths: Paths, envs: readonly string[]): Promise<strin
   const warnings: string[] = [];
   for (const item of manifest.items) {
     if (!envs.includes(item.ownerEnv)) continue;
+    // NOTE (Finding 5b — record-only, not fixed in 1.7): verify only checks that
+    // dir-merge paths still exist; file-block and config-keys presence is not
+    // re-asserted here. Accepted as a deliberately-soft verify (doctor territory,
+    // Task 3.3) — the transaction already committed, so this is advisory only.
     if (item.surface === 'dir-merge' && !(await lexists(item.path))) {
       warnings.push(`agentenv: verify — owned path missing after apply: ${item.path}`);
     }
