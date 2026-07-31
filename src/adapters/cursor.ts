@@ -1,0 +1,405 @@
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { parse as parseJsonc, type ParseError } from 'jsonc-parser';
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import type {
+  Adapter,
+  ConfigKeysContext,
+  ConfigKeysDrift,
+  ConfigKeysInjection,
+  ConfigKeysStoreMutation,
+  ConfigKeysSurface,
+  EntryBucket,
+  SelfCheckResult,
+  SurfaceDeclaration,
+} from '../adapter.js';
+import type { JsonValue } from '../config-keys.js';
+import { resolveBinaryOnPath } from '../session/resolve.js';
+
+/**
+ * The Cursor adapter — the GLOBAL-ONLY / session-unsupported harness (Task 4.4).
+ * Every declaration below is re-verified LIVE against `cursor-agent`
+ * **2026.07.23-e383d2b** (see `docs/harness-cursor.md`); the reference machine's
+ * `~/.cursor` was only ever READ (probes ran against temp copies / HOME overrides).
+ *
+ * Cursor is the reason the frozen {@link Adapter} contract carries
+ * {@link Adapter.sessionSupported}`:false` and the optional
+ * {@link Adapter.validateConfigFile} hook:
+ *
+ * - **Session mode UNSUPPORTED.** `CURSOR_CONFIG_DIR` is declared for interface
+ *   consistency, but the live binary IGNORES it for `mcp.json` resolution — the CLI
+ *   reads `~/.cursor/mcp.json` (home-derived) and the project `.cursor/mcp.json`
+ *   only, so a config-root override cannot isolate a private view (live-verified:
+ *   an `mcp.json` under `$CURSOR_CONFIG_DIR` listed "No MCP servers configured").
+ *   An IDE also inherits no shell env (D11/D15). So the shim launches Cursor with NO
+ *   overrides plus a one-line `--global` notice (handled by the launch path).
+ * - **`mcp.json` whole-file rejection.** The CLI drops EVERY server if a single
+ *   entry is malformed (live-verified: one non-object entry, or one object missing
+ *   both `command` and `url`, made `mcp list` report "No MCP servers configured" —
+ *   including the valid siblings). So {@link validateConfigFile} whole-file-validates
+ *   `mcp.json` after each injection: a bad entry rolls the write back rather than
+ *   nuking the user's whole MCP set.
+ *
+ * Global surfaces (used in `--global` mode): skills → `~/.cursor/skills` (dir-merge),
+ * MCP → `~/.cursor/mcp.json` `mcpServers` (config-keys, keyed). Global INSTRUCTIONS
+ * are unsupported (User Rules are an app+cloud settings DB, not a file surface —
+ * skills are the substitute); project `.cursor/rules` + `AGENTS.md` are read-only
+ * inputs per D8, never composed.
+ */
+
+/** The config-root env var (declared for consistency; the CLI ignores it for mcp.json). */
+const CONFIG_ROOT_ENV = 'CURSOR_CONFIG_DIR';
+
+/** How long to wait for `cursor-agent --version` in {@link detect} before giving up (ms). */
+const DETECT_TIMEOUT_MS = 5000;
+
+/**
+ * The real-config-root entries Cursor composes privately (bucket-2, D15). Each is a
+ * surface target below; anything NOT here classifies `state` (pass-through) — the
+ * contract's safe default (credentials/auth, `cli-config.json`, hooks, sessions,
+ * caches, and any file a future Cursor update introduces). `rules` is the nominal
+ * (unsupported) global-instructions target — declared managed to satisfy the
+ * surface-target invariant, never actually materialised.
+ */
+const MANAGED_ENTRIES = new Set(['skills', 'mcp.json', 'rules']);
+
+/**
+ * Cursor's managed surfaces.
+ * - `skills` → per-item dir-merge into `~/.cursor/skills` (Cursor reads it; global
+ *   skills are also covered by the shared `agents-standard` pseudo-surface when that
+ *   lands — see the note in `docs/harness-cursor.md`).
+ * - `instructions` → UNSUPPORTED: Cursor has no clean global-instructions surface
+ *   (User Rules live in a cloud-synced settings DB, `state.vscdb` — writing it is out
+ *   of scope); skills are the substitute. Declared so `status` reports the gap.
+ * - `mcp` → config-keys into `~/.cursor/mcp.json`'s top-level `mcpServers` object,
+ *   keyed. Cursor interpolates `${env:VAR}` natively → PASSTHROUGH
+ *   (`substitutePlaceholders: false`); no secret literal ever reaches the file.
+ */
+const SURFACES: readonly SurfaceDeclaration[] = [
+  {
+    id: 'skills',
+    storeKind: 'skills',
+    supported: true,
+    mechanism: 'dir-merge',
+    rootRelativePath: 'skills',
+    mode: 'symlink',
+  },
+  {
+    id: 'instructions',
+    storeKind: 'instructions',
+    supported: false,
+    unsupportedReason:
+      'Cursor has no global-instructions surface — User Rules are app+cloud only ' +
+      '(settings DB, not a file); use skills as the substitute. Project .cursor/rules ' +
+      '+ AGENTS.md are read-only inputs (D8), never composed.',
+    mechanism: 'dir-merge',
+    rootRelativePath: 'rules',
+    mode: 'symlink',
+  },
+  {
+    id: 'mcp',
+    storeKind: 'mcp',
+    supported: true,
+    mechanism: 'config-keys',
+    rootRelativePath: 'mcp.json',
+    format: 'json',
+    style: 'keyed',
+    keyPath: ['mcpServers'],
+    // Cursor interpolates ${env:VAR} itself (rung-1 passthrough, D6): the compiled
+    // ${env:VAR} is written verbatim and Cursor resolves it — no secret leaves the env.
+    substitutePlaceholders: false,
+  },
+];
+
+/** Is `v` a plain (non-array) object? */
+function isObject(v: unknown): v is Record<string, JsonValue> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/** Cursor-native placeholders that are NOT env vars — left untouched by the rewrite. */
+const CURSOR_NATIVE_PLACEHOLDERS = new Set(['userHome', 'workspaceFolder']);
+
+/**
+ * Rewrite canonical `${VAR}` placeholders (D6) into Cursor's `${env:VAR}` syntax,
+ * recursively. IDEMPOTENT: `${env:VAR}` already carries a colon so it never re-matches
+ * (`${env:X}` → the name capture stops at `:`), and the Cursor-native `${userHome}` /
+ * `${workspaceFolder}` tokens are excluded. So re-compiling an already-Cursor-shaped
+ * entry (from {@link syncBackConfigKeys}'s verbatim write-back) reproduces it exactly.
+ */
+function toCursorEnvPlaceholders(value: JsonValue): JsonValue {
+  if (typeof value === 'string') {
+    return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (match, name: string) =>
+      CURSOR_NATIVE_PLACEHOLDERS.has(name) ? match : `\${env:${name}}`,
+    );
+  }
+  if (Array.isArray(value)) return value.map(toCursorEnvPlaceholders);
+  if (isObject(value)) {
+    const out: Record<string, JsonValue> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = toCursorEnvPlaceholders(v);
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Record every string subfield shaped like `${...}` as a placeholder to preserve on
+ * write-back, keyed by its dot-joined subpath WITHIN the injected value (e.g.
+ * `env.GITHUB_TOKEN`, `headers.Authorization`). Mirrors Claude: Cursor interpolates
+ * `${env:VAR}` natively (rung-1 passthrough, D6), so the placeholder is kept and
+ * flagged, and drift write-back restores the (Cursor-syntax) placeholder rather than a
+ * baked literal — keeping the REAL `mcp.json` interpolatable even after a drift event.
+ */
+function collectPlaceholders(value: unknown, prefix: string, out: Record<string, string>): void {
+  if (typeof value === 'string') {
+    if (prefix !== '' && /\$\{[^}]+\}/.test(value)) out[prefix] = value;
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((v, i) => {
+      collectPlaceholders(v, prefix === '' ? String(i) : `${prefix}.${i}`, out);
+    });
+    return;
+  }
+  if (isObject(value)) {
+    for (const [k, v] of Object.entries(value)) {
+      const seg = k.replace(/\\/g, '\\\\').replace(/\./g, '\\.');
+      collectPlaceholders(v, prefix === '' ? seg : `${prefix}.${seg}`, out);
+    }
+  }
+}
+
+/**
+ * Shape one canonical `mcp/servers.yaml` server (D6) into Cursor's `mcp.json`
+ * `mcpServers.<name>` object, still carrying canonical `${VAR}` placeholders (the
+ * caller runs {@link toCursorEnvPlaceholders} afterwards). IDEMPOTENT on an
+ * already-Cursor-shaped entry (no `transport`; `type` present for http/sse, or a bare
+ * `command` for stdio), which is what makes {@link syncBackConfigKeys}'s verbatim
+ * write-back round-trip stably (`compile(syncBack(v)) === v`), proving spec criterion 4.
+ *
+ * Mappings:
+ *   stdio → `{ command, args?, env? }`  (Cursor infers stdio from `command`; no `type`)
+ *   http/sse → `{ type, url, headers? }`, with `auth.bearer_env: VAR` folded into an
+ *   `Authorization: Bearer ${VAR}` header. A bespoke/unknown transport passes through
+ *   unchanged (fail-soft — never corrupt the user's authored entry).
+ */
+function shapeCursorServer(def: unknown): JsonValue {
+  if (!isObject(def)) return def as JsonValue;
+
+  const transport =
+    typeof def.transport === 'string'
+      ? def.transport
+      : def.command !== undefined
+        ? 'stdio'
+        : def.url !== undefined
+          ? typeof def.type === 'string'
+            ? def.type
+            : 'http'
+          : undefined;
+
+  if (transport === 'stdio') {
+    const out: Record<string, JsonValue> = {};
+    if (def.command !== undefined) out.command = def.command;
+    if (def.args !== undefined) out.args = def.args;
+    if (def.env !== undefined) out.env = def.env;
+    return out;
+  }
+
+  if (transport === 'http' || transport === 'sse') {
+    const out: Record<string, JsonValue> = { type: transport };
+    if (def.url !== undefined) out.url = def.url;
+    const headers: Record<string, JsonValue> = isObject(def.headers) ? { ...def.headers } : {};
+    const auth = def.auth;
+    if (
+      isObject(auth) &&
+      typeof auth.bearer_env === 'string' &&
+      headers.Authorization === undefined
+    ) {
+      headers.Authorization = `Bearer \${${auth.bearer_env}}`;
+    }
+    if (Object.keys(headers).length > 0) out.headers = headers;
+    return out;
+  }
+
+  // Unknown transport: pass the user's authored def through untouched.
+  return def;
+}
+
+/** Run `cursor-agent --version`, resolving `true` only on a clean exit 0. Never throws. */
+function versionExitsZero(binaryPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (ok: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(ok);
+    };
+    const child = spawn(binaryPath, ['--version'], { stdio: 'ignore' });
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+      done(false);
+    }, DETECT_TIMEOUT_MS);
+    timer.unref?.();
+    child.on('exit', (code) => done(code === 0));
+    child.on('error', () => done(false));
+  });
+}
+
+/** Point Cursor at a private root (declared for consistency; the CLI ignores it — see above). */
+function overrideEnv(root: string): Record<string, string> {
+  return { [CONFIG_ROOT_ENV]: root };
+}
+
+/**
+ * Whether one `mcp.json` server entry is well-formed enough that Cursor will load it.
+ * Live-verified: a valid entry is a non-null object with a `command` (stdio) OR a `url`
+ * (http/sse); an empty object, a non-object, or one missing both makes Cursor reject the
+ * WHOLE file.
+ */
+function isValidCursorServer(entry: unknown): boolean {
+  if (!isObject(entry)) return false;
+  return typeof entry.command === 'string' || typeof entry.url === 'string';
+}
+
+/**
+ * The Cursor adapter instance registered in {@link import('./index.js')}.
+ */
+export const cursorAdapter: Adapter = {
+  id: 'cursor',
+  binaryName: 'cursor-agent',
+
+  // GUI/IDE + a CLI whose config-root override does not isolate mcp.json → no session
+  // path (D11/D15). The shim launches untouched with a --global notice (launch path).
+  sessionSupported: false,
+  sessionUnsupportedReason:
+    'CURSOR_CONFIG_DIR does not isolate the CLI (live-verified 2026.07.23) and an IDE ' +
+    'inherits no shell env — activate globally with `agentenv use … --global`',
+
+  async detect(env) {
+    const bin = await resolveBinaryOnPath('cursor-agent', env);
+    if (!bin) return false;
+    return versionExitsZero(bin);
+  },
+
+  configRootEnv: CONFIG_ROOT_ENV,
+  overrideEnv,
+  realConfigRoot(env) {
+    const configured = env[CONFIG_ROOT_ENV];
+    if (configured && configured.trim() !== '') return configured;
+    return join(homedir(), '.cursor');
+  },
+
+  surfaces: SURFACES,
+
+  classifyEntry(name): EntryBucket {
+    // Bucket-2 surface targets are managed; EVERYTHING else — credentials/auth,
+    // cli-config.json, hooks.json, commands, sessions, worktrees, statsig caches, and
+    // any file a future Cursor update introduces — defaults to bucket-1 pass-through.
+    return MANAGED_ENTRIES.has(name) ? 'managed' : 'state';
+  },
+
+  async compileConfigKeys(
+    surface: ConfigKeysSurface,
+    ctx: ConfigKeysContext,
+  ): Promise<ConfigKeysInjection[]> {
+    if (surface.id !== 'mcp') return [];
+    const serversFile = join(ctx.envContentDir, 'mcp', 'servers.yaml');
+    if (!existsSync(serversFile)) return [];
+    const parsed = parseYaml(await readFile(serversFile, 'utf8')) as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
+    // One keyed injection per server, owned independently under mcpServers (D3/D6).
+    return Object.entries(parsed).map(([name, def]) => {
+      const value = toCursorEnvPlaceholders(shapeCursorServer(def));
+      const secretFields: Record<string, string> = {};
+      collectPlaceholders(value, '', secretFields);
+      return {
+        style: 'keyed' as const,
+        keyPath: ['mcpServers', name],
+        value,
+        ...(Object.keys(secretFields).length > 0 ? { secretFields } : {}),
+      };
+    });
+  },
+
+  async syncBackConfigKeys(
+    surface: ConfigKeysSurface,
+    drift: ConfigKeysDrift,
+    ctx: ConfigKeysContext,
+  ): Promise<ConfigKeysStoreMutation[]> {
+    // Inverse of compileConfigKeys (spec criterion 4), consistent with Claude: fold the
+    // one drifted server (keyPath ['mcpServers', <name>]) back into servers.yaml,
+    // siblings untouched. `canonicalValue` already has secret ${env:VAR} placeholders
+    // restored (D6). It is written in Cursor's normalised shape; because shapeCursorServer
+    // + the ${env:VAR} rewrite are idempotent on that shape, a subsequent compile
+    // reproduces it exactly — round-trip stable.
+    if (surface.id !== 'mcp' || drift.style !== 'keyed') return [];
+    if (drift.keyPath.length < 2) return [];
+    const name = drift.keyPath[drift.keyPath.length - 1];
+    if (typeof name !== 'string') return [];
+    const serversFile = join(ctx.envContentDir, 'mcp', 'servers.yaml');
+    const existing = existsSync(serversFile)
+      ? ((parseYaml(await readFile(serversFile, 'utf8')) as Record<string, unknown> | null) ?? {})
+      : {};
+    existing[name] = drift.canonicalValue;
+    return [{ storeRelativePath: join('mcp', 'servers.yaml'), content: stringifyYaml(existing) }];
+  },
+
+  validateConfigFile(absPath: string, content: string): SelfCheckResult {
+    // Cursor rejects the ENTIRE mcp.json if any single server entry is malformed
+    // (live-verified). Applied in global mode after each injection: a bad entry — a
+    // pre-existing user entry OR a composed one — rolls the write back rather than
+    // silently dropping the user's whole MCP set. Parse leniently (Cursor tolerates
+    // trailing commas / JSONC), then whole-file-validate every entry.
+    if (content.trim() === '') return { ok: true };
+    const errors: ParseError[] = [];
+    const parsed = parseJsonc(content, errors, { allowTrailingComma: true });
+    if (errors.length > 0) {
+      return { ok: false, detail: `${absPath}: not parseable as JSON/JSONC — Cursor would reject it` };
+    }
+    if (!isObject(parsed)) {
+      return { ok: false, detail: `${absPath}: top level is not an object — Cursor would reject it` };
+    }
+    const servers = parsed.mcpServers;
+    if (servers === undefined) return { ok: true }; // no MCP block — nothing Cursor loads
+    if (!isObject(servers)) {
+      return { ok: false, detail: `${absPath}: mcpServers is not an object — Cursor rejects the whole file` };
+    }
+    const bad = Object.entries(servers)
+      .filter(([, entry]) => !isValidCursorServer(entry))
+      .map(([n]) => n);
+    if (bad.length > 0) {
+      return {
+        ok: false,
+        detail:
+          `${absPath}: malformed mcpServers ${bad.map((n) => `'${n}'`).join(', ')} ` +
+          `(each needs a 'command' or 'url') — Cursor rejects the WHOLE file, dropping every server`,
+      };
+    }
+    return { ok: true };
+  },
+
+  async selfCheck(viewRoot: string): Promise<SelfCheckResult> {
+    // Session mode never composes Cursor (the launch path short-circuits on
+    // sessionSupported:false before selfCheck). This is a safe, offline fail-closed
+    // assertion of that invariant: CURSOR_CONFIG_DIR cannot isolate the CLI, so a
+    // session view can never be proven — global mode is the only supported path.
+    // The SelfCheckContext (binary resolver / capture) is intentionally unused — the
+    // probe stays offline and never touches the CLI.
+    return {
+      ok: false,
+      detail:
+        `cursor-agent does not isolate its config root via CURSOR_CONFIG_DIR ` +
+        `(live-verified) — session mode is unsupported; use --global (view ${viewRoot} not composed)`,
+    };
+  },
+};
