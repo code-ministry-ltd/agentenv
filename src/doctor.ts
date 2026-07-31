@@ -4,6 +4,11 @@ import { basename, dirname, join } from 'node:path';
 import type { BackupRef } from './backups.js';
 import { restore } from './backups.js';
 import {
+  inspectOwnedKey,
+  syncBack as cfgSyncBack,
+  type ConfigKeysItem,
+} from './config-keys.js';
+import {
   dematerialise as dmDematerialise,
   materialise as dmMaterialise,
   type DirMergeItem,
@@ -13,7 +18,7 @@ import {
   materialise as fbMaterialise,
   type FileBlockItem,
 } from './file-block.js';
-import { recoverState } from './journal.js';
+import { beginTransaction, recoverState } from './journal.js';
 import { withLock } from './lock.js';
 import type { Paths } from './paths.js';
 import { readState, type StateManifest } from './state.js';
@@ -253,6 +258,42 @@ async function detectMangledMarkers(
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// config-keys: an owned key whose file a harness reserialised (hash mismatch)
+// ---------------------------------------------------------------------------
+
+/** The config-keys records in the manifest. */
+function configKeysItems(manifest: StateManifest): ConfigKeysItem[] {
+  return manifest.items.filter((i): i is ConfigKeysItem => i.surface === 'config-keys');
+}
+
+/** Owned config keys whose value drifted — a harness reserialised the file (D4). */
+async function detectReserialisedConfig(manifest: StateManifest): Promise<DoctorProblem[]> {
+  const out: DoctorProblem[] = [];
+  for (const item of configKeysItems(manifest)) {
+    let status;
+    try {
+      status = await inspectOwnedKey(item);
+    } catch (err) {
+      out.push({
+        kind: 'reserialised-config',
+        where: `${item.path} (${item.key ?? ''})`,
+        what: `could not parse ${item.path} to check owned key '${item.key ?? ''}': ${(err as Error).message}`,
+        repair: 'reconcile by parse once the file parses again',
+      });
+      continue;
+    }
+    if (status !== 'drifted') continue;
+    out.push({
+      kind: 'reserialised-config',
+      where: `${item.path} (${item.key ?? ''})`,
+      what: `owned config key '${item.key ?? ''}' in ${item.path} drifted — the file was reserialised/rewritten`,
+      repair: 'reconcile the record to the parsed value (restoring secret placeholders)',
+    });
+  }
+  return out;
+}
+
 /** Orphaned content/directory backups under `~/.agentenv/backups/` (design D4). */
 async function detectOrphanedBackups(
   paths: Paths,
@@ -282,6 +323,7 @@ export async function diagnose(paths: Paths): Promise<DoctorProblem[]> {
   problems.push(...(await detectDanglingSymlinks(manifest)));
   problems.push(...(await detectStoreDrift(manifest)));
   problems.push(...(await detectMangledMarkers(paths, manifest)));
+  problems.push(...(await detectReserialisedConfig(manifest)));
   problems.push(...(await detectOrphanedBackups(paths, manifest)));
   return problems;
 }
@@ -375,6 +417,37 @@ async function repairMangledMarkers(
 }
 
 /**
+ * Reconcile every drifted config key with the file a harness reserialised, under
+ * ONE lock + transaction (the config-keys contract). `config-keys.syncBack` re-hashes
+ * the owned value and, on drift, writes it back with secret-flagged fields restored
+ * to their `${VAR}` placeholders (never the literal, D6) and the record's hash
+ * brought into agreement — so the file, the record, and the store all match again.
+ */
+async function repairReserialisedConfig(
+  paths: Paths,
+  manifest: StateManifest,
+  actions: string[],
+): Promise<void> {
+  const items = configKeysItems(manifest);
+  if (items.length === 0) return;
+  await withLock(paths, async () => {
+    const tx = await beginTransaction(paths);
+    try {
+      for (const item of items) {
+        const sync = await cfgSyncBack(paths, tx, item);
+        if (sync.drifted) {
+          actions.push(`reconciled reserialised config key '${item.key ?? ''}' in ${item.path}`);
+        }
+      }
+      await tx.commit();
+    } catch (err) {
+      await tx.rollback();
+      throw err;
+    }
+  });
+}
+
+/**
  * Return every owned surface to a consistent state, then re-scan. Order matters:
  *
  * 1. `recoverState` first — roll back any pending journal so the manifest is
@@ -403,6 +476,7 @@ export async function repair(paths: Paths): Promise<RepairResult> {
   await repairStoreDrift(paths, await readState(paths), actions);
   await repairDanglingSymlinks(paths, await readState(paths), actions);
   await repairMangledMarkers(paths, await readState(paths), actions);
+  await repairReserialisedConfig(paths, await readState(paths), actions);
 
   // 3. Orphaned backups: GC against the final manifest.
   const manifest = await readState(paths);
