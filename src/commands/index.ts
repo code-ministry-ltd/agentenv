@@ -3,6 +3,7 @@ import { addCommand } from './add.js';
 import { adoptCommand } from './adopt.js';
 import { captureCommand } from './capture.js';
 import { createCommand } from './create.js';
+import { defaultCommand } from './default.js';
 import { disownCommand } from './disown.js';
 import { dropCommand } from './drop.js';
 import { editCommand } from './edit.js';
@@ -34,6 +35,7 @@ export const commands: readonly Command[] = [
   addCommand,
   useCommand,
   dropCommand,
+  defaultCommand,
   captureCommand,
   adoptCommand,
   disownCommand,
