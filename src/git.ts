@@ -556,6 +556,180 @@ export async function probeRemote(
   return { status: res.stdout.trim() === '' ? 'empty' : 'nonempty' };
 }
 
+/**
+ * Probe an ARBITRARY url (design D14, Task 2.3) — a candidate that is NOT yet a
+ * configured remote — with `git ls-remote <url>`. Unlike {@link probeRemote} (which
+ * probes the configured `origin`), this never touches `origin`, so the old remote's
+ * URL stays configured throughout classification (the flip is the LAST step). No
+ * refs ⇒ `empty`; refs present ⇒ `nonempty`; a transport failure ⇒ `unreachable`
+ * with a credential-redacted detail.
+ */
+export async function probeRemoteUrl(
+  paths: Paths,
+  env: NodeJS.ProcessEnv,
+  url: string,
+  opts: { run?: GitRunner; timeoutMs?: number } = {},
+): Promise<RemoteProbe> {
+  const ctx = gitContext(paths, env, opts.run);
+  const res = await git(ctx, ['ls-remote', url], opts.timeoutMs ?? PULL_TIMEOUT_MS);
+  if (res.code !== 0 || res.timedOut) {
+    return { status: 'unreachable', detail: res.timedOut ? 'network timeout' : redactRemoteUrl(firstLine(res.stderr)) };
+  }
+  return { status: res.stdout.trim() === '' ? 'empty' : 'nonempty' };
+}
+
+// ---------------------------------------------------------------------------
+// Safe remote replacement classification (design D14, Task 2.3)
+// ---------------------------------------------------------------------------
+
+/**
+ * The private, machine-local ref namespace a candidate remote's heads are fetched
+ * into during classification. It is NEVER `origin` (which stays pointed at the OLD
+ * remote until the final flip) and never a branch, so it cannot pollute `git log`
+ * of `HEAD` or the store's own branches. {@link cleanupCandidateRefs} deletes it.
+ */
+const CANDIDATE_REF_NS = 'refs/agentenv-candidate';
+
+/** How a candidate remote's history relates to the local store (design D14). */
+export type RemoteHistoryClass = 'empty' | 'related' | 'unrelated' | 'unreachable';
+
+export interface RemoteClassification {
+  status: RemoteHistoryClass;
+  /**
+   * For `related`/`unrelated`: the local temp ref the candidate's integrate/adopt
+   * branch was fetched to (offline after this point — no second network round-trip).
+   */
+  candidateRef?: string;
+  detail?: string;
+}
+
+/** List the private candidate refs currently on disk. */
+async function listCandidateRefs(ctx: GitContext): Promise<string[]> {
+  const res = await git(ctx, ['for-each-ref', '--format=%(refname)', CANDIDATE_REF_NS]);
+  return res.stdout.split('\n').map((s) => s.trim()).filter((s) => s !== '');
+}
+
+/**
+ * Delete every private candidate ref (design D14, Task 2.3). Called in a `finally`
+ * by the command so classification never leaves temp refs behind — win, lose, or
+ * throw. Safe to call when none exist.
+ */
+export async function cleanupCandidateRefs(paths: Paths, env: NodeJS.ProcessEnv, run?: GitRunner): Promise<void> {
+  const ctx = gitContext(paths, env, run);
+  for (const ref of await listCandidateRefs(ctx)) {
+    await git(ctx, ['update-ref', '-d', ref]);
+  }
+}
+
+/**
+ * Classify a candidate remote's history relative to the local store (design D14):
+ *
+ * 1. `git ls-remote <url>` — a transport failure ⇒ `unreachable` (change nothing);
+ *    no refs ⇒ `empty`.
+ * 2. Otherwise `git fetch <url>` the candidate's heads into the private {@link
+ *    CANDIDATE_REF_NS} namespace (NOT `origin`), then `git merge-base HEAD <ref>`
+ *    against each: a shared commit ⇒ `related` (integrable); none ⇒ `unrelated`.
+ *
+ * Everything runs against the explicit `url`, so `origin` — the OLD remote — is never
+ * touched here; the flip is the final step after the chosen action succeeds. The
+ * fetched candidate ref is returned so a `related` integrate / `unrelated` adopt can
+ * work offline from it. The caller MUST {@link cleanupCandidateRefs} afterwards.
+ */
+export async function classifyRemoteHistory(
+  paths: Paths,
+  env: NodeJS.ProcessEnv,
+  url: string,
+  opts: { run?: GitRunner; timeoutMs?: number } = {},
+): Promise<RemoteClassification> {
+  const ctx = gitContext(paths, env, opts.run);
+  const timeoutMs = opts.timeoutMs ?? PULL_TIMEOUT_MS;
+
+  const probe = await probeRemoteUrl(paths, env, url, { ...(opts.run ? { run: opts.run } : {}), timeoutMs });
+  if (probe.status === 'unreachable') return { status: 'unreachable', ...(probe.detail ? { detail: probe.detail } : {}) };
+  if (probe.status === 'empty') return { status: 'empty' };
+
+  // Non-empty: fetch the candidate's heads into the private namespace. `+…` force-
+  // updates only these LOCAL tracking refs (never a force-PUSH). --no-tags keeps it
+  // to branches, which is all a store history classification cares about.
+  await cleanupCandidateRefs(paths, env, opts.run); // clear any stale temp refs first
+  const fetch = await git(ctx, ['fetch', '--no-tags', url, `+refs/heads/*:${CANDIDATE_REF_NS}/*`], timeoutMs);
+  if (fetch.code !== 0 || fetch.timedOut) {
+    await cleanupCandidateRefs(paths, env, opts.run);
+    return { status: 'unreachable', detail: fetch.timedOut ? 'network timeout' : redactRemoteUrl(firstLine(fetch.stderr)) };
+  }
+
+  const refs = await listCandidateRefs(ctx);
+  if (refs.length === 0) {
+    // Non-empty by ls-remote yet no heads fetched (a tags-only remote): nothing to
+    // integrate/adopt. Treat as unrelated with no candidate ref — the command refuses.
+    return { status: 'unrelated' };
+  }
+  const branch = await currentBranch(ctx);
+  const preferred = `${CANDIDATE_REF_NS}/${branch}`;
+  const candidateRef = refs.includes(preferred) ? preferred : refs[0]!;
+
+  let related = false;
+  for (const ref of refs) {
+    const mb = await git(ctx, ['merge-base', 'HEAD', ref]);
+    if (mb.code === 0 && mb.stdout.trim() !== '') {
+      related = true;
+      break;
+    }
+  }
+  return { status: related ? 'related' : 'unrelated', candidateRef };
+}
+
+/** Outcome of a {@link pushUrl}. NEVER force: a `rejected` is surfaced, never forced. */
+export interface PushUrlResult {
+  status: 'ok' | 'rejected' | 'unreachable' | 'nothing';
+  detail?: string;
+}
+
+/**
+ * Push the local branch to an explicit `url` with a NORMAL, non-force push (design
+ * D14): `git push <url> <branch>:<branch>` — no `--force`, no `+refspec`, so a
+ * concurrent first push that would need a force LOSES the race safely (`rejected`)
+ * rather than clobbering the remote. Pushes to the url directly, never via `origin`,
+ * so the OLD remote stays configured until the caller flips it after this succeeds.
+ */
+export async function pushUrl(
+  paths: Paths,
+  env: NodeJS.ProcessEnv,
+  url: string,
+  opts: { run?: GitRunner; timeoutMs?: number } = {},
+): Promise<PushUrlResult> {
+  const ctx = gitContext(paths, env, opts.run);
+  if (!(await hasCommits(ctx))) return { status: 'nothing' };
+  const branch = await currentBranch(ctx);
+  const res = await git(ctx, ['push', url, `${branch}:${branch}`], opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  if (res.code === 0) return { status: 'ok' };
+  const blob = `${res.stdout}\n${res.stderr}`;
+  if (res.timedOut) return { status: 'unreachable', detail: 'network timeout' };
+  if (/\[rejected\]|non-fast-forward|fetch first|Updates were rejected/i.test(blob)) {
+    return { status: 'rejected', detail: redactRemoteUrl(firstLine(res.stderr)) || 'push rejected (non-fast-forward)' };
+  }
+  if (/could not read|unable to access|Could not resolve host|Connection|repository .* not found|does not appear to be a git repository|No such file/i.test(blob)) {
+    return { status: 'unreachable', detail: redactRemoteUrl(firstLine(res.stderr)) };
+  }
+  return { status: 'rejected', detail: redactRemoteUrl(firstLine(res.stderr)) || 'push failed' };
+}
+
+/**
+ * Flip the configured `origin` to `url` (design D14) — the FINAL step of a safe
+ * replacement, run only after the chosen action (push / integrate / archive+adopt)
+ * has succeeded. `set-url` when `origin` exists; `add` on a first connect. A local
+ * git-config write; it does not touch the network or the remote repository.
+ */
+export async function setRemoteUrl(paths: Paths, env: NodeJS.ProcessEnv, url: string, run?: GitRunner): Promise<void> {
+  const ctx = gitContext(paths, env, run);
+  const res = await git(ctx, ['remote', 'set-url', 'origin', url]);
+  if (res.code === 0) return;
+  const add = await git(ctx, ['remote', 'add', 'origin', url]);
+  if (add.code !== 0) {
+    throw new Error(`agentenv: could not set remote url (${firstLine(res.stderr || add.stderr)})`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Commit (with pre-commit secret scan)
 // ---------------------------------------------------------------------------
