@@ -5,7 +5,16 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { run } from '../src/cli.js';
-import { defaultGitRunner, type GitRunner, isPushQueued } from '../src/git.js';
+import {
+  addRemote,
+  defaultGitRunner,
+  type GitRunner,
+  isPushQueued,
+  pullRebase,
+  pushStore,
+  readPushQueue,
+  redactRemoteUrl,
+} from '../src/git.js';
 import { resolvePaths } from '../src/paths.js';
 import { makeFixtureRepo, makeTempHome, type FixtureRepo, type TempHome } from './helpers.js';
 
@@ -160,6 +169,63 @@ describe('sync: push failure queues + flushes on the next reachable invocation (
     const remoteSubjects = subjects(remote.dir);
     expect(remoteSubjects).toContain('agentenv: create env writing');
     expect(remoteSubjects).toContain('agentenv: create env other');
+  });
+});
+
+describe('sync: git stderr shown to the user is credential-redacted (F5)', () => {
+  it('redactRemoteUrl redacts a credentialed URL embedded in a git error line', () => {
+    const line = "fatal: unable to access 'https://user:s3kr3t@host.invalid/store.git/': error 403";
+    const redacted = redactRemoteUrl(line);
+    expect(redacted).not.toContain('s3kr3t');
+    expect(redacted).toContain('user:***@');
+  });
+
+  it('a push failure detail (and the queued lastError) never carries a credential', async () => {
+    const th = gitHome();
+    const paths = resolvePaths(th.env);
+    await run(['init'], { env: th.env });
+    await addRemote(paths, th.env, 'https://user:s3kr3t@host.invalid/store.git');
+
+    // git today strips creds, but be defensive: a runner whose push stderr leaks a
+    // credentialed URL must still be redacted before it reaches a notice or the queue.
+    const leakyPush: GitRunner = (args, opts) =>
+      args[0] === 'push'
+        ? Promise.resolve({
+            code: 1,
+            stdout: '',
+            stderr: "fatal: unable to access 'https://user:s3kr3t@host.invalid/store.git/': error 403",
+            timedOut: false,
+          })
+        : defaultGitRunner(args, opts);
+
+    const res = await pushStore(paths, th.env, { run: leakyPush });
+    expect(res.status).toBe('queued');
+    expect(res.detail ?? '').not.toContain('s3kr3t');
+    expect(res.detail ?? '').toContain('***');
+    // The persisted retry queue must not leak it either.
+    const queue = await readPushQueue(paths);
+    expect(queue.lastError ?? '').not.toContain('s3kr3t');
+  });
+
+  it('a pull error detail never carries a credential', async () => {
+    const th = gitHome();
+    const paths = resolvePaths(th.env);
+    await run(['init'], { env: th.env });
+    await run(['create', 'writing'], { env: th.env }); // gives HEAD so pull is attempted
+    await addRemote(paths, th.env, 'https://user:s3kr3t@host.invalid/store.git');
+
+    const leakyPull: GitRunner = (args, opts) =>
+      args[0] === 'pull'
+        ? Promise.resolve({
+            code: 1,
+            stdout: '',
+            stderr: "fatal: unable to access 'https://user:s3kr3t@host.invalid/store.git/': error 403",
+            timedOut: false,
+          })
+        : defaultGitRunner(args, opts);
+
+    const res = await pullRebase(paths, th.env, { run: leakyPull });
+    expect(res.detail ?? '').not.toContain('s3kr3t');
   });
 });
 

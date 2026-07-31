@@ -243,12 +243,17 @@ export function normaliseRemoteUrl(url: string): string {
 }
 
 /**
- * Redact any credential in a URL before logging it (spec assumption 7): a
+ * Redact any credential before logging it (spec assumption 7): every
  * `scheme://user:secret@host/…` becomes `scheme://user:***@host/…`. scp-style
  * (`git@host:owner/repo`) and `file://` URLs carry no password and pass through.
+ *
+ * Unanchored + global so it also redacts a credentialed URL EMBEDDED in arbitrary
+ * text — e.g. a `git` stderr line like `fatal: unable to access
+ * 'https://user:tok@host/…'` shown to the user (F5). git strips creds itself today,
+ * but this makes any git stderr we surface defensively credential-safe.
  */
 export function redactRemoteUrl(url: string): string {
-  return url.replace(/^([a-z][a-z0-9+.-]*:\/\/)([^/@]*:)[^/@]*@/i, (_m, scheme, userColon) => {
+  return url.replace(/([a-z][a-z0-9+.-]*:\/\/)([^/@\s]*:)[^/@\s]*@/gi, (_m, scheme, userColon) => {
     return `${scheme}${userColon}***@`;
   });
 }
@@ -546,7 +551,7 @@ export async function probeRemote(
   const ctx = gitContext(paths, env, opts.run);
   const res = await git(ctx, ['ls-remote', 'origin'], opts.timeoutMs ?? PULL_TIMEOUT_MS);
   if (res.code !== 0 || res.timedOut) {
-    return { status: 'unreachable', detail: res.timedOut ? 'network timeout' : firstLine(res.stderr) };
+    return { status: 'unreachable', detail: res.timedOut ? 'network timeout' : redactRemoteUrl(firstLine(res.stderr)) };
   }
   return { status: res.stdout.trim() === '' ? 'empty' : 'nonempty' };
 }
@@ -678,7 +683,7 @@ export async function pushStore(
     await clearPushQueue(paths);
     return { status: 'ok' };
   }
-  const detail = res.timedOut ? 'network timeout' : firstLine(res.stderr) || 'push failed';
+  const detail = res.timedOut ? 'network timeout' : redactRemoteUrl(firstLine(res.stderr)) || 'push failed';
   await enqueuePush(paths, detail, (opts.now ?? Date.now)());
   return { status: 'queued', detail };
 }
@@ -726,10 +731,10 @@ export async function pullRebase(
   }
   // Could-not-connect / unknown host / repository-not-found → treat as offline.
   if (/could not read|unable to access|Could not resolve host|Connection|repository .* not found|does not appear to be a git repository|No such file/i.test(stderr)) {
-    return { status: 'offline', detail: firstLine(res.stderr) };
+    return { status: 'offline', detail: redactRemoteUrl(firstLine(res.stderr)) };
   }
   // Any other non-zero exit: report, but never fatal.
-  return { status: 'error', detail: firstLine(res.stderr) || 'pull failed' };
+  return { status: 'error', detail: redactRemoteUrl(firstLine(res.stderr)) || 'pull failed' };
 }
 
 // ---------------------------------------------------------------------------
