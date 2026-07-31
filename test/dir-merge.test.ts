@@ -16,6 +16,7 @@ import {
   syncBack,
   type MaterialiseResult,
 } from '../src/dir-merge.js';
+import { recoverState } from '../src/journal.js';
 import { resolvePaths } from '../src/paths.js';
 import { findOwner, readState } from '../src/state.js';
 import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot } from './helpers.js';
@@ -327,6 +328,65 @@ describe('dir-merge surface', () => {
       await dematerialise(p, item);
       expect(existsSync(at)).toBe(false);
       expect(readFileSync(source, 'utf8')).toBe('edited agent\n'); // store survives
+    });
+  });
+
+  describe('transactional: a failed materialise rolls back (D4)', () => {
+    it('restores a force-taken-over user item and records nothing when the effect fails', async () => {
+      const p = paths();
+      const targetDir = join(temp.home, 'claude', 'skills');
+      const userDir = makeUserItem(targetDir, 'sharpen', 'the users own sharpen\n');
+      writeFileSync(join(userDir, 'extra.txt'), 'second file\n');
+      const at = join(targetDir, 'sharpen');
+      const missingSource = join(temp.home, 'store-src', 'does-not-exist');
+
+      // copy mode reads the source, so a missing source faults mid-effect —
+      // AFTER the user's item was backed up and removed for takeover.
+      await expect(
+        materialise(p, {
+          ownerEnv: 'writing',
+          sourcePath: missingSource,
+          targetDir,
+          itemName: 'sharpen',
+          mode: 'copy',
+          force: true,
+        }),
+      ).rejects.toThrow();
+
+      // The user's directory is restored byte-identically — the takeover left
+      // no trace.
+      expect(lstatSync(at).isDirectory()).toBe(true);
+      expect(lstatSync(at).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(at, 'SKILL.md'), 'utf8')).toBe('the users own sharpen\n');
+      expect(readFileSync(join(at, 'extra.txt'), 'utf8')).toBe('second file\n');
+
+      // No ownership recorded, and no journal left pending (recovery is a no-op).
+      const manifest = await readState(p);
+      expect(findOwner(manifest, at)).toBeUndefined();
+      expect(manifest.journal).toBeNull();
+      expect(await recoverState(p)).toEqual({ recovered: false, rolledBack: 0 });
+    });
+
+    it('leaves a free name free (no orphan link, no record) when a create fails', async () => {
+      const p = paths();
+      const targetDir = join(temp.home, 'claude', 'skills');
+      const at = join(targetDir, 'sharpen');
+      const missingSource = join(temp.home, 'store-src', 'does-not-exist');
+
+      await expect(
+        materialise(p, {
+          ownerEnv: 'writing',
+          sourcePath: missingSource,
+          targetDir,
+          itemName: 'sharpen',
+          mode: 'copy',
+        }),
+      ).rejects.toThrow();
+
+      expect(existsSync(at)).toBe(false);
+      const manifest = await readState(p);
+      expect(findOwner(manifest, at)).toBeUndefined();
+      expect(manifest.journal).toBeNull();
     });
   });
 });
