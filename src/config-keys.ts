@@ -610,15 +610,40 @@ function wrapPath(keyPath: (string | number)[], value: JsonValue): { [k: string]
 
 /**
  * Append the owned key as a whole marked `[table]` (format-preserving: the user's
- * existing TOML is untouched). Idempotent — any prior marked block for this key is
- * stripped first, so re-injection replaces rather than duplicates.
+ * existing TOML is untouched). Idempotent — any prior owned table for this key is
+ * removed first, so re-injection/write-back replaces rather than duplicates.
+ *
+ * Parse-aware, mirroring {@link removeKeyedTomlText}: a marked block is stripped
+ * textually, but after a harness reserialised the file our table survives
+ * **unmarked** at `keyPath`. We own that path, so it too is removed (from the
+ * parsed tree) before appending. Without this, a drift write-back would emit a
+ * SECOND `[table]` beside the survivor — invalid TOML ("redefine an already
+ * defined table") — and any baked secret literal in the survivor would never be
+ * scrubbed (fix A1).
  */
 function tomlInjectText(text: string, item: ConfigKeysItem, value: JsonValue): string {
   const key = item.key ?? displayPath(item.keyPath);
   const stripped = tomlStripMarkedBlock(text, key).text;
+  const base = removeOwnedTomlTableIfPresent(stripped, item);
   const body = stringifyToml(wrapPath(item.keyPath, value));
-  const prefix = stripped === '' || stripped.endsWith('\n') ? stripped : `${stripped}\n`;
+  const prefix = base === '' || base.endsWith('\n') ? base : `${base}\n`;
   return `${prefix}${tomlBeginMarker(key)}\n${body}${tomlEndMarker(key)}\n`;
+}
+
+/**
+ * If `keyPath` still resolves in `text` after marked blocks were stripped — an
+ * unmarked table that a harness reserialisation left behind for a path we own —
+ * delete it from the parsed tree and re-stringify, so the caller can append a
+ * fresh marked block without redefining the table. A no-op (text returned
+ * unchanged) when nothing resolves there, preserving the surgical marker path for
+ * the common case. Sibling tables the user owns are carried through the parse.
+ */
+function removeOwnedTomlTableIfPresent(text: string, item: ConfigKeysItem): string {
+  if (text.trim() === '') return text;
+  const data = parseTomlConfig(text, item.path) as { [k: string]: unknown };
+  if (!getAtPath(data, item.keyPath).found) return text;
+  deleteAtPath(data, item.keyPath);
+  return stringifyToml(data);
 }
 
 /**

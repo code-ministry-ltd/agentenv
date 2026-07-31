@@ -328,6 +328,72 @@ transport = "stdio"
       expect(after.mcp_servers?.linear).toBeUndefined(); // our key gone
       expect(after.mcp_servers?.github).toEqual({ transport: 'stdio' }); // user's survives
     });
+
+    // A1 (CRITICAL): after a harness reserialised the TOML (markers stripped, our
+    // table now UNMARKED beside the user's), a drift write-back must not append a
+    // SECOND [mcp_servers.linear] table — that is invalid TOML ("redefine an
+    // already defined table") — and must scrub any baked secret literal.
+    it('syncBack write-back after a reserialised TOML stays valid (no duplicate table)', async () => {
+      const p = paths();
+      const f = file('config.toml');
+      writeFileSync(f, originalToml);
+      const item = await injectLinearToml(p, f);
+
+      // Harness reserialises: parse → stringify drops our markers, leaving an
+      // UNMARKED [mcp_servers.linear] beside the user's github table.
+      const reserialised = stringifyToml(parseToml(readFileSync(f, 'utf8')));
+      writeFileSync(f, reserialised);
+      expect(reserialised).not.toContain('agentenv:config-key');
+
+      // The value drifts (user/harness edits it in place).
+      const doc = parseToml(readFileSync(f, 'utf8')) as { mcp_servers: Record<string, unknown> };
+      doc.mcp_servers.linear = { transport: 'ws' };
+      writeFileSync(f, stringifyToml(doc));
+
+      const synced = await inTx(p, (tx) => syncBack(p, tx, item));
+      expect(synced.drifted).toBe(true);
+
+      const after = readFileSync(f, 'utf8');
+      // Valid TOML: parsing threw "redefine an already defined table" before the fix.
+      const parsed = parseToml(after) as { mcp_servers: Record<string, unknown> };
+      expect(parsed.mcp_servers.linear).toEqual({ transport: 'ws' });
+      expect(parsed.mcp_servers.github).toEqual({ transport: 'stdio' }); // sibling untouched
+      // Exactly one linear table header — the drifted table was replaced, not doubled.
+      expect(after.match(/\[mcp_servers\.linear\]/g)).toHaveLength(1);
+    });
+
+    it('syncBack scrubs a baked secret from a reserialised TOML, restoring the placeholder', async () => {
+      const p = paths();
+      const f = file('config.toml');
+      writeFileSync(f, originalToml);
+      const item = await inTx(p, (tx) =>
+        injectKeyed(p, tx, {
+          file: f,
+          format: 'toml',
+          keyPath: ['mcp_servers', 'ghsecret'],
+          value: { transport: 'stdio', env: { GITHUB_TOKEN: '${GITHUB_TOKEN}' } },
+          ownerEnv: 'writing',
+          secretFields: { 'env.GITHUB_TOKEN': '${GITHUB_TOKEN}' },
+        }),
+      );
+
+      // Harness reserialises (markers gone), then bakes a real token over the placeholder.
+      writeFileSync(f, stringifyToml(parseToml(readFileSync(f, 'utf8'))));
+      const doc = parseToml(readFileSync(f, 'utf8')) as {
+        mcp_servers: { ghsecret: { transport: string; env: Record<string, string> } };
+      };
+      doc.mcp_servers.ghsecret.env.GITHUB_TOKEN = 'ghp_REALSECRET123';
+      writeFileSync(f, stringifyToml(doc));
+
+      const synced = await inTx(p, (tx) => syncBack(p, tx, item));
+      expect(synced.drifted).toBe(true);
+
+      const after = readFileSync(f, 'utf8');
+      expect(() => parseToml(after)).not.toThrow(); // valid TOML
+      expect(after).not.toContain('ghp_REALSECRET123'); // literal scrubbed from the FILE
+      expect(after).toContain('${GITHUB_TOKEN}'); // placeholder restored
+      expect(JSON.stringify(synced.canonicalValue)).not.toContain('ghp_REALSECRET123');
+    });
   });
 
   describe('config-keys array-element inject + remove-by-value', () => {
