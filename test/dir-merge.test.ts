@@ -8,10 +8,18 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { materialise, dematerialise } from '../src/dir-merge.js';
+import { materialise, dematerialise, type MaterialiseResult } from '../src/dir-merge.js';
 import { resolvePaths } from '../src/paths.js';
 import { findOwner, readState } from '../src/state.js';
 import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot } from './helpers.js';
+
+/** Narrow a result to the materialised case, failing the test otherwise. */
+function materialised(result: MaterialiseResult) {
+  if (result.status !== 'materialised') {
+    throw new Error(`expected materialised, got ${result.status}`);
+  }
+  return result.item;
+}
 
 describe('dir-merge surface', () => {
   let temp: ReturnType<typeof makeTempHome>;
@@ -92,13 +100,15 @@ describe('dir-merge surface', () => {
       makeUserItem(targetDir, 'research');
       const source = makeStoreItem('sharpen');
 
-      const { item } = await materialise(p, {
-        ownerEnv: 'writing',
-        sourcePath: source,
-        targetDir,
-        itemName: 'sharpen',
-        mode: 'symlink',
-      });
+      const item = materialised(
+        await materialise(p, {
+          ownerEnv: 'writing',
+          sourcePath: source,
+          targetDir,
+          itemName: 'sharpen',
+          mode: 'symlink',
+        }),
+      );
 
       await dematerialise(p, item);
 
@@ -110,6 +120,40 @@ describe('dir-merge surface', () => {
       expect(readFileSync(join(source, 'SKILL.md'), 'utf8')).toBe('# sharpen\n');
       // ...and the ownership record is dropped.
       expect(findOwner(await readState(p), join(targetDir, 'sharpen'))).toBeUndefined();
+    });
+  });
+
+  describe('conflict: a non-owned same-named item wins (D1/D7)', () => {
+    it('skips and warns without clobbering an existing user item; records nothing', async () => {
+      const p = paths();
+      const targetDir = join(temp.home, 'claude', 'skills');
+      // The user already has a skill named exactly like the env's item.
+      makeUserItem(targetDir, 'sharpen', 'the users own sharpen\n');
+      const source = makeStoreItem('sharpen', '# env sharpen\n');
+
+      const warnings: string[] = [];
+      const result = await materialise(p, {
+        ownerEnv: 'writing',
+        sourcePath: source,
+        targetDir,
+        itemName: 'sharpen',
+        mode: 'symlink',
+        onWarn: (m) => warnings.push(m),
+      });
+
+      // Skipped, not materialised (D7: a non-owned item always wins).
+      expect(result.status).toBe('skipped');
+      expect(result).toMatchObject({ reason: 'conflict', itemName: 'sharpen' });
+      expect(warnings.some((w) => w.includes('sharpen'))).toBe(true);
+
+      // The user's item is untouched — still a real dir with their content,
+      // NOT replaced by a symlink to the store.
+      const at = join(targetDir, 'sharpen');
+      expect(lstatSync(at).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(at, 'SKILL.md'), 'utf8')).toBe('the users own sharpen\n');
+
+      // Nothing was recorded as owned — so a later drop can't touch it.
+      expect(findOwner(await readState(p), at)).toBeUndefined();
     });
   });
 });

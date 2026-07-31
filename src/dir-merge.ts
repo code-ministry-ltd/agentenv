@@ -1,10 +1,10 @@
-import { mkdir, symlink } from 'node:fs/promises';
+import { lstat, mkdir, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { backup, restore, type BackupRef } from './backups.js';
 import { beginTransaction } from './journal.js';
 import { withLock } from './lock.js';
 import type { Paths } from './paths.js';
-import type { ManifestItemBase } from './state.js';
+import { findOwner, readState, type ManifestItemBase } from './state.js';
 
 /**
  * The dir-merge surface: skills, agents and commands, whose harness home is a
@@ -56,10 +56,29 @@ export interface MaterialiseOptions {
   itemName: string;
   /** Placement mechanism; defaults to `symlink`. */
   mode?: DirMergeMode;
+  /** Where skip-and-warn notices go. Defaults to {@link console.warn}. */
+  onWarn?: (message: string) => void;
 }
 
-/** The outcome of {@link materialise}. */
-export type MaterialiseResult = { status: 'materialised'; item: DirMergeItem };
+/**
+ * The outcome of {@link materialise}: the item was placed and recorded, or it
+ * was skipped because a non-owned item already holds the name (D1/D7 — a
+ * non-owned item always wins; agentenv never clobbers the user).
+ */
+export type MaterialiseResult =
+  | { status: 'materialised'; item: DirMergeItem }
+  | { status: 'skipped'; reason: 'conflict'; path: string; itemName: string };
+
+/** Whether a path exists as a link/file/dir WITHOUT following symlinks. */
+async function lexists(p: string): Promise<boolean> {
+  try {
+    await lstat(p);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw err;
+  }
+}
 
 /** Place the store item at `targetPath` using `mode`. */
 async function placeItem(mode: DirMergeMode, sourcePath: string, targetPath: string): Promise<void> {
@@ -79,11 +98,33 @@ export async function materialise(
   paths: Paths,
   options: MaterialiseOptions,
 ): Promise<MaterialiseResult> {
-  const { ownerEnv, sourcePath, targetDir, itemName, mode = 'symlink' } = options;
+  const {
+    ownerEnv,
+    sourcePath,
+    targetDir,
+    itemName,
+    mode = 'symlink',
+    onWarn = (m: string) => console.warn(m),
+  } = options;
   const targetPath = join(targetDir, itemName);
 
   return withLock(paths, async () => {
     await mkdir(targetDir, { recursive: true });
+
+    const owned = findOwner(await readState(paths), targetPath);
+    if (await lexists(targetPath)) {
+      // Something already holds the name. If we own it, this is an idempotent
+      // re-activation — return the existing record untouched. If we do NOT own
+      // it, a non-owned item always wins (D1/D7): skip and warn, never clobber.
+      if (owned) {
+        return { status: 'materialised', item: owned as DirMergeItem };
+      }
+      onWarn(
+        `agentenv: skipping '${itemName}' for env '${ownerEnv}' — a non-agentenv item ` +
+          `already exists at ${targetPath}`,
+      );
+      return { status: 'skipped', reason: 'conflict', path: targetPath, itemName };
+    }
 
     const backupRef: BackupRef = { kind: 'absent' };
     const item: DirMergeItem = {
