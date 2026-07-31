@@ -12,7 +12,7 @@ import {
 import { environmentExists, validateEnvName } from '../store.js';
 
 /** Content kinds `add` understands, in help/usage order. */
-const KINDS = ['skill', 'mcp'] as const;
+const KINDS = ['skill', 'mcp', 'instructions'] as const;
 
 function ok(stdout: string): RunResult {
   return { stdout, code: 0 };
@@ -226,6 +226,56 @@ async function addMcp(rest: readonly string[], ctx: CommandContext): Promise<Run
   return ok(`Added MCP server '${name}' (${transport}) to environment '${env}'.\n`);
 }
 
+/**
+ * `add instructions <env> [--harness <h>]`.
+ *
+ * Creates `instructions/base.md` (or `instructions/<h>.md` with `--harness`).
+ * `--print-path` prints the target path without writing (the testable "open");
+ * an existing file is refused unless `--force`.
+ */
+async function addInstructions(rest: readonly string[], ctx: CommandContext): Promise<RunResult> {
+  const parsed = parseArgs(rest, { booleans: ['force', 'print-path'], values: ['harness'] });
+  if (parsed.unknown.length > 0) {
+    return fail(`add instructions: unknown option '${parsed.unknown[0]}'\n`);
+  }
+  const resolved = await resolveEnv('instructions', parsed.positionals[0], ctx.paths);
+  if ('error' in resolved) return resolved.error;
+  const env = resolved.env;
+
+  if (parsed.positionals[1] !== undefined) {
+    return fail(
+      `add instructions: unexpected argument '${parsed.positionals[1]}' ` +
+        '(instructions takes no <name>; use --harness <h> for a per-harness file)\n',
+    );
+  }
+
+  const harness = parsed.values.get('harness');
+  if (harness !== undefined) {
+    const harnessError = validateItemName('harness', harness);
+    if (harnessError) return fail(`add instructions: ${harnessError}\n`);
+  }
+  const label = harness ?? 'base';
+  const file = join(ctx.paths.envDir(env), 'instructions', `${label}.md`);
+  if (parsed.booleans.has('print-path')) return ok(`${file}\n`);
+
+  if ((await pathExists(file)) && !parsed.booleans.has('force')) {
+    return fail(
+      `add instructions: '${label}.md' already exists in '${env}' (${file}); ` +
+        'pass --force to overwrite, or --print-path to print its path\n',
+    );
+  }
+
+  const scope = harness ? `${harness} harness` : 'every harness';
+  const body =
+    `# ${env} — ${label} instructions\n` +
+    '\n' +
+    `TODO: write instructions ${label === 'base' ? 'that' : 'the'} ${scope} ` +
+    `${label === 'base' ? 'should load' : 'should additionally load'} for this environment.\n`;
+  await mkdir(join(ctx.paths.envDir(env), 'instructions'), { recursive: true });
+  await writeFile(file, body, 'utf8');
+  return ok(`Added ${label} instructions to environment '${env}'.\n`);
+}
+
 export const addCommand: Command = {
   name: 'add',
   usage: '<kind> <env> …',
@@ -242,6 +292,8 @@ export const addCommand: Command = {
         return addSkill(rest, ctx);
       case 'mcp':
         return addMcp(rest, ctx);
+      case 'instructions':
+        return addInstructions(rest, ctx);
       default:
         return fail(`add: unknown kind '${kind}'\n${kindsHelp()}`);
     }
