@@ -1,8 +1,11 @@
+import { adapters as realAdapters } from '../adapters/index.js';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
+import { materialiseGlobal, selectAdapters } from '../engine.js';
 import { setBinding } from '../session/registry.js';
 import { resolveProjectRoot } from '../session/registry.js';
 import { parseHarnesses, validateEnvs } from './activation.js';
+import { renderGlobalSkips } from './global-report.js';
 
 /**
  * `agentenv use <env>… [--harness <h>…] [--global]` — activate an env stack.
@@ -85,9 +88,38 @@ async function useGlobal(
   names: readonly string[],
   harnesses: string[] | undefined,
 ): Promise<RunResult> {
-  // Wired to the transactional engine in a later slice of this task.
-  void ctx;
-  void names;
-  void harnesses;
-  return { stdout: '', stderr: 'use --global: not yet implemented\n', code: 1 };
+  const { paths, env, options } = ctx;
+  const adapters = selectAdapters(options.adapters ?? realAdapters, harnesses);
+  if (adapters.length === 0) {
+    const detail = harnesses ? ` matching --harness ${harnesses.join(',')}` : '';
+    return {
+      stdout: '',
+      stderr: `use --global: no registered adapter${detail} — global mode needs a harness adapter (Task 1.8/4.x)\n`,
+      code: 1,
+    };
+  }
+
+  const { kept, warnings } = await validateEnvs(paths, names);
+  const notices = [...warnings];
+  if (kept.length === 0) {
+    return { stdout: '', stderr: `${notices.join('\n')}\nuse --global: no valid environments to activate\n`, code: 1 };
+  }
+
+  const result = await materialiseGlobal({
+    paths,
+    adapters,
+    envs: kept,
+    env,
+    onWarn: (m) => notices.push(m),
+  });
+
+  notices.push(...renderGlobalSkips(result.skips));
+  const stderr = notices.length > 0 ? `${notices.join('\n')}\n` : undefined;
+  return {
+    stdout:
+      `Materialised [${kept.join(', ')}] globally (${result.applied} item(s)).\n` +
+      `Global stack: [${result.stack.join(', ')}].\n`,
+    ...(stderr ? { stderr } : {}),
+    code: 0,
+  };
 }
