@@ -137,6 +137,10 @@ export async function composeView(req: ComposeRequest): Promise<ComposeResult> {
   const skipped: SurfaceSkip[] = [];
   try {
     await composeBucketOne(req, buildDir);
+    // config-keys surfaces are GROUPED by target file so a file shared by several
+    // surfaces is seeded once and written once — composing them per-surface would
+    // re-seed and re-write, clobbering earlier surfaces' injections (H4).
+    const configKeysByFile = new Map<string, ConfigKeysSurfaceDecl[]>();
     for (const surface of adapter.surfaces) {
       if (!surface.supported) {
         skipped.push({
@@ -146,7 +150,16 @@ export async function composeView(req: ComposeRequest): Promise<ComposeResult> {
         });
         continue;
       }
+      if (surface.mechanism === 'config-keys') {
+        const group = configKeysByFile.get(surface.rootRelativePath);
+        if (group) group.push(surface);
+        else configKeysByFile.set(surface.rootRelativePath, [surface]);
+        continue;
+      }
       await composeSurface(req, buildDir, surface, skipped, onWarn);
+    }
+    for (const group of configKeysByFile.values()) {
+      await composeConfigKeysFile(req, buildDir, group, skipped, onWarn);
     }
     await publishAtomically(sessionDir, adapter.id, buildDir, viewRoot);
   } catch (err) {
@@ -202,10 +215,13 @@ function topLevelSegment(rel: string): string {
 // Bucket 2 — the three surface mechanisms, composed into the view
 // ---------------------------------------------------------------------------
 
+/** A config-keys surface, narrowed from the discriminated union. */
+type ConfigKeysSurfaceDecl = Extract<SurfaceDeclaration, { mechanism: 'config-keys' }>;
+
 async function composeSurface(
   req: ComposeRequest,
   buildDir: string,
-  surface: SurfaceDeclaration,
+  surface: Extract<SurfaceDeclaration, { mechanism: 'dir-merge' | 'file-block' }>,
   skipped: SurfaceSkip[],
   onWarn: (m: string) => void,
 ): Promise<void> {
@@ -214,8 +230,6 @@ async function composeSurface(
       return composeDirMerge(req, buildDir, surface, skipped, onWarn);
     case 'file-block':
       return composeFileBlock(req, buildDir, surface);
-    case 'config-keys':
-      return composeConfigKeys(req, buildDir, surface, skipped, onWarn);
   }
 }
 
@@ -308,67 +322,76 @@ async function instructionSources(
   return out;
 }
 
+const TOML_SKIP = 'TOML config-keys view seeding lands with the Codex adapter (Task 4.x)';
+
 /**
- * config-keys: seed the view's config file from the real one (a discardable copy
- * — mixed-file drift is dropped at session end, D15) and inject the env's
- * compiled keys. A pre-existing user value wins a collision (D7); later envs win
- * earlier ones (D5). JSON/JSONC only in Phase 1; TOML seeding lands with the
- * Codex adapter (Task 4.x) and is recorded as a skip until then.
+ * config-keys: seed the view's config file ONCE from the real one (a discardable
+ * copy — mixed-file drift is dropped at session end, D15), then apply the compiled
+ * keys of EVERY surface that targets this file, then write ONCE (H4). A shared
+ * file (Pi's two-array `settings.json`) is otherwise clobbered by re-seeding per
+ * surface. A pre-existing user value wins a collision (D7); later envs win earlier
+ * ones (D5). JSON/JSONC only in Phase 1; TOML seeding lands with the Codex adapter
+ * (Task 4.x) and is recorded as a skip until then.
  */
-async function composeConfigKeys(
+async function composeConfigKeysFile(
   req: ComposeRequest,
   buildDir: string,
-  surface: Extract<SurfaceDeclaration, { mechanism: 'config-keys' }>,
+  surfaces: readonly ConfigKeysSurfaceDecl[],
   skipped: SurfaceSkip[],
   onWarn: (m: string) => void,
 ): Promise<void> {
   const { paths, adapter, envs, realConfigRoot } = req;
-  if (surface.format === 'toml') {
-    skipped.push({
-      surfaceId: surface.id,
-      reason: 'format',
-      detail: 'TOML config-keys view seeding lands with the Codex adapter (Task 4.x)',
-    });
+  const file = surfaces[0]!.rootRelativePath;
+
+  // Whole-file TOML seeding is unimplemented in Phase 1: record every surface.
+  if (surfaces.every((s) => s.format === 'toml')) {
+    for (const s of surfaces) skipped.push({ surfaceId: s.id, reason: 'format', detail: TOML_SKIP });
     return;
   }
 
-  const seedText = await readFileOrEmpty(join(realConfigRoot, surface.rootRelativePath));
+  const seedText = await readFileOrEmpty(join(realConfigRoot, file));
   const seed = (seedText.trim() === '' ? {} : parseJsonc(seedText)) as Record<string, unknown>;
   const userSnapshot = structuredClone(seed);
 
-  for (const env of envs) {
-    let injections: ConfigKeysInjection[];
-    try {
-      injections = await adapter.compileConfigKeys(surface, {
-        envContentDir: paths.envDir(env),
-        projectRoot: req.projectRoot ?? null,
-      });
-    } catch (err) {
-      onWarn(`agentenv: env '${env}' ${surface.id} compile failed: ${(err as Error).message}`);
+  for (const surface of surfaces) {
+    if (surface.format === 'toml') {
+      skipped.push({ surfaceId: surface.id, reason: 'format', detail: TOML_SKIP });
       continue;
     }
-    for (const inj of injections) {
-      if (inj.style === 'keyed') {
-        // A value the USER already had at this path wins (D7); an earlier env's is
-        // overwritten by this (later) env (D5).
-        if (getAtPath(userSnapshot, inj.keyPath).found) {
-          const detail = `${surface.id} key '${inj.keyPath.join('.')}' — user value wins`;
-          onWarn(`agentenv: skipping ${detail} (env '${env}')`);
-          skipped.push({ surfaceId: surface.id, reason: 'collision', detail });
-          continue;
+    for (const env of envs) {
+      let injections: ConfigKeysInjection[];
+      try {
+        injections = await adapter.compileConfigKeys(surface, {
+          envContentDir: paths.envDir(env),
+          projectRoot: req.projectRoot ?? null,
+        });
+      } catch (err) {
+        onWarn(`agentenv: env '${env}' ${surface.id} compile failed: ${(err as Error).message}`);
+        continue;
+      }
+      // COUPLING (Task 2.4): compiled `secretFields` placeholders must be resolved
+      // to their machine-local values HERE too — this divergent merge path currently
+      // ignores them (safe now: secrets are not yet materialised, a gap when 2.4 lands).
+      for (const inj of injections) {
+        if (inj.style === 'keyed') {
+          // A value the USER already had at this path wins (D7); an earlier env's is
+          // overwritten by this (later) env (D5).
+          if (getAtPath(userSnapshot, inj.keyPath).found) {
+            const detail = `${surface.id} key '${inj.keyPath.join('.')}' — user value wins`;
+            onWarn(`agentenv: skipping ${detail} (env '${env}')`);
+            skipped.push({ surfaceId: surface.id, reason: 'collision', detail });
+            continue;
+          }
+          setAtPath(seed, inj.keyPath, inj.value);
+        } else {
+          const arr = ensureArray(seed, inj.arrayPath);
+          if (!arr.some((v) => stableEqual(v, inj.value))) arr.push(inj.value);
         }
-        setAtPath(seed, inj.keyPath, inj.value);
-      } else {
-        const arr = ensureArray(seed, inj.arrayPath);
-        if (!arr.some((v) => stableEqual(v, inj.value))) arr.push(inj.value);
       }
     }
   }
 
-  await writeFileAtomic(
-    join(buildDir, surface.rootRelativePath),
-    `${JSON.stringify(seed, null, 2)}\n`,
-  );
+  await writeFileAtomic(join(buildDir, file), `${JSON.stringify(seed, null, 2)}\n`);
 }
 
 // ---------------------------------------------------------------------------
