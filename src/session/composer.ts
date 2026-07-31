@@ -466,11 +466,16 @@ async function fingerprintInputs(req: ComposeRequest): Promise<string> {
     }
     const storeSigs: string[] = [];
     for (const env of envs) {
-      if (surface.mechanism === 'file-block') {
-        storeSigs.push(await treeSignature(join(paths.envDir(env), 'instructions')));
-      } else {
-        storeSigs.push(await treeSignature(join(paths.envDir(env), surface.storeKind)));
-      }
+      // Cheap immediate-children signature (name/kind/size/mtime), matching what
+      // real dir-merge targets already use — NOT a full recursive content hash of
+      // the store tree on every launch (M4, a startup-perf footgun). This catches
+      // the cases that matter: file-block reads flat instruction files, config-keys
+      // reads flat store files, and symlink dir-merge references the store live.
+      const storeDir =
+        surface.mechanism === 'file-block'
+          ? join(paths.envDir(env), 'instructions')
+          : join(paths.envDir(env), surface.storeKind);
+      storeSigs.push(await dirSignature(storeDir));
     }
     let realSig: string;
     if (surface.mechanism === 'dir-merge') {
@@ -515,36 +520,6 @@ async function fileSignature(file: string): Promise<string> {
   } catch {
     return 'absent';
   }
-}
-
-/** Recursive content signature of a store dir tree (ours, small — hash contents). */
-async function treeSignature(dir: string): Promise<string> {
-  const h = createHash('sha256');
-  async function walk(d: string, rel: string): Promise<void> {
-    let entries;
-    try {
-      entries = await readdir(d, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-      const abs = join(d, e.name);
-      const r = rel === '' ? e.name : `${rel}/${e.name}`;
-      if (e.isDirectory()) {
-        h.update(`D:${r}\n`);
-        await walk(abs, r);
-      } else if (e.isSymbolicLink()) {
-        h.update(`L:${r}:${await readlink(abs).catch(() => '')}\n`);
-      } else {
-        h.update(`F:${r}:`);
-        h.update(await readFile(abs).catch(() => Buffer.alloc(0)));
-        h.update('\n');
-      }
-    }
-  }
-  await walk(dir, '');
-  const out = h.digest('hex');
-  return (await pathExists(dir)) ? out : 'absent';
 }
 
 // ---------------------------------------------------------------------------
