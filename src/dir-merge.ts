@@ -9,7 +9,7 @@ import {
   symlink,
   writeFile,
 } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { backup, restore, type BackupRef } from './backups.js';
 import { beginTransaction } from './journal.js';
 import { withLock } from './lock.js';
@@ -86,6 +86,23 @@ export type MaterialiseResult =
   | { status: 'materialised'; item: DirMergeItem }
   | { status: 'skipped'; reason: 'conflict'; path: string; itemName: string };
 
+/**
+ * Whether `name` is a single path segment safe to place inside a surface dir.
+ * Rejects `..`/`.`, path separators, and anything `basename` would rewrite —
+ * without this, `join(targetDir, '../x')` escapes the surface entirely (and in
+ * `force` mode would back up and clobber an arbitrary out-of-surface path).
+ */
+function isSingleSegment(name: string): boolean {
+  return (
+    name.length > 0 &&
+    name !== '.' &&
+    name !== '..' &&
+    !name.includes('/') &&
+    !name.includes('\\') &&
+    basename(name) === name
+  );
+}
+
 /** Whether a path exists as a link/file/dir WITHOUT following symlinks. */
 async function lexists(p: string): Promise<boolean> {
   try {
@@ -95,6 +112,26 @@ async function lexists(p: string): Promise<boolean> {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
     throw err;
   }
+}
+
+/**
+ * Whether the item on disk is still the link/copy agentenv placed. Guards a
+ * destructive `absent`-backup undo: if the user replaced our symlink with their
+ * own content out-of-band, we must not delete it. A missing path counts as
+ * still-ours (deleting it would be a harmless no-op anyway).
+ */
+async function isStillOurs(item: DirMergeItem): Promise<boolean> {
+  let st;
+  try {
+    st = await lstat(item.path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw err;
+  }
+  if (item.action === 'symlink') {
+    return st.isSymbolicLink() && (await readlink(item.path)) === item.target;
+  }
+  return true; // a copy is our own managed content; deleting it on drop is correct
 }
 
 /** Recursively copy a directory, preserving nested files and symlinks. */
@@ -224,6 +261,12 @@ export async function materialise(
     force = false,
     onWarn = (m: string) => console.warn(m),
   } = options;
+  if (!isSingleSegment(itemName)) {
+    throw new Error(
+      `dir-merge: invalid item name '${itemName}' — must be a single path segment ` +
+        `(no '/', '\\', '.' or '..')`,
+    );
+  }
   const targetPath = join(targetDir, itemName);
 
   return withLock(paths, async () => {
@@ -282,16 +325,35 @@ export async function materialise(
  * same-named user item is left untouched. The pre-effect state is journalled so
  * a crash mid-drop rolls back to the still-owned item.
  */
-export async function dematerialise(paths: Paths, item: DirMergeItem): Promise<void> {
+export async function dematerialise(
+  paths: Paths,
+  item: DirMergeItem,
+  onWarn: (message: string) => void = (m: string) => console.warn(m),
+): Promise<void> {
   await withLock(paths, async () => {
     const restoreRef: BackupRef = item.backupRef ?? { kind: 'absent' };
+    // Defensive: an `absent` backup means "we created this from nothing, so undo
+    // = delete item.path". Only delete if it is still the item we placed; if the
+    // user replaced it out-of-band, restoring `absent` would rm THEIR data — so
+    // leave their content in place and drop only our ownership.
+    let effect = (): Promise<void> => restore(paths, restoreRef, item.path);
+    if (restoreRef.kind === 'absent' && !(await isStillOurs(item))) {
+      onWarn(
+        `agentenv: '${item.path}' is no longer the item agentenv placed — leaving it ` +
+          `in place and dropping ownership only`,
+      );
+      effect = async (): Promise<void> => {
+        /* leave the user's replacement in place — drop ownership only */
+      };
+    }
     const tx = await beginTransaction(paths);
     try {
       // Snapshot our current link/copy so a crash mid-drop restores it (the
       // manifest still owns it until commit).
       const undoRef = await backup(paths, item.path);
-      await tx.apply({ op: 'remove', item, undo: { path: item.path, backupRef: undoRef } }, () =>
-        restore(paths, restoreRef, item.path),
+      await tx.apply(
+        { op: 'remove', item, undo: { path: item.path, backupRef: undoRef } },
+        effect,
       );
       await tx.commit();
     } catch (err) {
