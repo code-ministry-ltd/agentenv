@@ -185,4 +185,25 @@ describe('write-ahead journal / transaction', () => {
     const p = paths();
     expect(await recoverState(p)).toEqual({ recovered: false, rolledBack: 0 });
   });
+
+  it('apply() after commit() throws instead of starting a phantom journal', async () => {
+    const p = paths();
+    const target = join(temp.home, 'x.txt');
+    const backupRef = await backup(p, target);
+    const tx = await beginTransaction(p);
+    await tx.apply(
+      { op: 'add', item: item(target), undo: { path: target, backupRef } },
+      async () => writeFileSync(target, 'v1'),
+    );
+    await tx.commit();
+
+    await expect(
+      tx.apply(
+        { op: 'add', item: item(target), undo: { path: target, backupRef } },
+        async () => writeFileSync(target, 'v2'),
+      ),
+    ).rejects.toThrow(/committed/i);
+    // No phantom pending journal was started by the rejected apply().
+    expect((await readState(p)).journal).toBeNull();
+  });
 });

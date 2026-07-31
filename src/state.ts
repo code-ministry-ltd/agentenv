@@ -197,6 +197,10 @@ export function emptyManifest(): StateManifest {
  * Read and validate state.json. A missing file is not an error — it yields a
  * fresh empty manifest. Throws {@link StateError} on corrupt JSON, a non-object
  * root, a missing/invalid version, or a state file from a newer MAJOR.
+ *
+ * Read-modify-write: `readState`/`writeState`/`recoverState` are not internally
+ * serialised — callers MUST run them under {@link import('./lock.js').withLock}
+ * (design D11) so two processes never interleave a read and a write.
  */
 export async function readState(paths: Paths): Promise<StateManifest> {
   const file = paths.state;
@@ -229,6 +233,9 @@ export async function readState(paths: Paths): Promise<StateManifest> {
  * Write state.json atomically (temp + rename). The current CLI's schema version
  * is stamped (this CLI is now the writer); unknown top-level fields loaded from
  * a newer minor are preserved. An empty/absent journal is omitted from disk.
+ *
+ * Read-modify-write: run under {@link import('./lock.js').withLock} (design D11);
+ * see {@link readState}.
  */
 export async function writeState(paths: Paths, manifest: StateManifest): Promise<void> {
   const out: Record<string, unknown> = {

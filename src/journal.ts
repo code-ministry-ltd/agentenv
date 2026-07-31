@@ -72,9 +72,15 @@ export async function beginTransaction(paths: Paths): Promise<Transaction> {
     );
   }
   manifest.journal = [];
+  let committed = false;
 
   return {
     async apply(mutation, effect) {
+      // A committed transaction is finished: applying again would push onto a
+      // freshly-recreated journal (a phantom), so refuse rather than corrupt.
+      if (committed) {
+        throw new Error('agentenv: transaction already committed — cannot apply further mutations');
+      }
       // Write-ahead: journal (with undo info) is durable before the effect runs.
       manifest.journal ??= [];
       manifest.journal.push(mutation);
@@ -91,6 +97,7 @@ export async function beginTransaction(paths: Paths): Promise<Transaction> {
       }
       manifest.journal = null;
       await writeState(paths, manifest);
+      committed = true;
     },
     async rollback() {
       await rollbackEntries(paths, manifest.journal ?? []);
@@ -106,6 +113,9 @@ export async function beginTransaction(paths: Paths): Promise<Transaction> {
  * the manifest in the consistent pre-transaction state. Reads everything from
  * disk, so it works in a fresh process with no in-memory transaction. A no-op
  * when no journal is pending.
+ *
+ * Read-modify-write: callers MUST run this under {@link import('./lock.js').withLock}
+ * (design D11); it is not internally serialised against concurrent state writers.
  */
 export async function recoverState(paths: Paths): Promise<RecoveryResult> {
   const manifest = await readState(paths);
