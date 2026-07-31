@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { resolveAdapter } from '../adapter.js';
 import { adapters as realAdapters } from '../adapters/index.js';
 import type { Command } from '../command.js';
@@ -12,9 +12,10 @@ import { toRunResult } from './shim.js';
  * shell hook or shims installed (D15). This is the scripts/CI entrypoint: it
  * resolves the adapter from the registry and the real binary from PATH directly.
  *
- * No persistent binding is written — the view is keyed by a hash of the env
- * stack under `live/`, so repeated runs of the same stack reuse it (lazy
- * generation) without a session id.
+ * No persistent binding is written — the view is keyed under `live/` by the env
+ * stack hash PLUS this process's pid and a random suffix, so two parallel `run`s
+ * of the same stack (e.g. in CI) get isolated view dirs and never clobber each
+ * other's build (L6). Each invocation composes fresh.
  */
 export const runCommand: Command = {
   name: 'run',
@@ -52,8 +53,11 @@ export const runCommand: Command = {
       };
     }
 
-    // A stable, binding-free view key per env stack (independent of any shell id).
-    const session = `run-${createHash('sha256').update(envs.join(' ')).digest('hex').slice(0, 16)}`;
+    // A binding-free, per-INVOCATION view key: the env-stack hash plus this
+    // process's pid and randomness, so two parallel `run`s of the same stack in
+    // CI get isolated view dirs instead of clobbering each other's build (L6).
+    const stackHash = createHash('sha256').update(envs.join(' ')).digest('hex').slice(0, 12);
+    const session = `run-${stackHash}-${process.pid}-${randomBytes(4).toString('hex')}`;
 
     const result = await launchHarness({
       paths,

@@ -89,6 +89,28 @@ describe('session run command', () => {
     expect(lastStdout().trim()).toBe(viewRoot);
   });
 
+  it('L6: two runs of the SAME env stack get isolated view dirs (no shared-build clobber)', async () => {
+    const th = home();
+    const { env } = withHarness(th);
+    const first = capturingExec();
+    const second = capturingExec();
+    const opts = (exec: ExecHarness): RunOptions => ({
+      env,
+      cwd: th.home,
+      adapters: [makeFixtureAdapter()],
+      execHarness: exec,
+    });
+
+    await run(['run', 'writing', '--', 'fixture-harness', '--print-config-root'], opts(first.exec));
+    await run(['run', 'writing', '--', 'fixture-harness', '--print-config-root'], opts(second.exec));
+
+    const v1 = first.calls[0]?.env[FIXTURE_CONFIG_ENV];
+    const v2 = second.calls[0]?.env[FIXTURE_CONFIG_ENV];
+    expect(v1).toBeTruthy();
+    expect(v2).toBeTruthy();
+    expect(v1).not.toBe(v2); // per-invocation key → distinct view dirs
+  });
+
   it('errors clearly on missing --, missing/unknown env, and unknown harness', async () => {
     const th = home();
     const { env } = withHarness(th);
