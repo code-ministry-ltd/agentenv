@@ -2,6 +2,7 @@ import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
 import {
   addRemote,
+  archiveStore,
   classifyRemoteHistory,
   cleanupCandidateRefs,
   commitStore,
@@ -17,6 +18,7 @@ import {
   resetHardTo,
   setRemoteUrl,
 } from '../git.js';
+import { confirmDefault } from '../prompt.js';
 import { ensureStore } from '../store.js';
 import { closeStoreSync, openStoreSync } from './store-sync.js';
 
@@ -60,6 +62,9 @@ export const remoteCommand: Command = {
     if (parsed.positionals.length > 1) {
       return fail(`remote: unexpected argument '${parsed.positionals[1]}'\nUsage: agentenv remote <url>\n`);
     }
+    // `--offline` implies non-interactive here: classifying + adopting an unrelated
+    // remote needs an explicit confirmation we must not fabricate without a prompt.
+    const nonInteractive = parsed.booleans.has('non-interactive') || parsed.booleans.has('offline');
 
     const { paths, env, options } = ctx;
     await ensureStore(paths);
@@ -106,11 +111,7 @@ export const remoteCommand: Command = {
         case 'related':
           return await integrateRelated(ctx, url, classification.candidateRef, existing);
         case 'unrelated':
-          // Refuse / archive-and-adopt an unrelated history — implemented in a later slice.
-          return fail(
-            `remote: ${redactRemoteUrl(url)} has an unrelated history (no shared commit with the local store). ` +
-              'Adopting an unrelated remote is not yet available; nothing was changed.\n',
-          );
+          return await adoptUnrelated(ctx, url, classification.candidateRef, existing, nonInteractive);
         default:
           return fail('remote: could not classify the candidate remote; nothing was changed.\n');
       }
@@ -215,6 +216,79 @@ async function integrateRelated(
 }
 
 /**
+ * UNRELATED candidate (design D14, spec criterion 8): a non-empty history with NO
+ * shared commit. It is NEVER merged or overwritten automatically.
+ *
+ * - `--non-interactive` / `--offline` → REFUSE (exit non-zero, nothing changed).
+ * - Interactive → DEFAULT to cancel; the ONLY alternative is archive-local-and-adopt,
+ *   which ARCHIVES the entire local store to a recoverable copy under `~/.agentenv/`
+ *   FIRST, then adopts the remote wholesale (`git reset --hard` to the fetched
+ *   candidate ref — a LOCAL operation, never a force-push, never a merge), and flips
+ *   the URL LAST. An archive failure aborts BEFORE touching local content.
+ */
+async function adoptUnrelated(
+  ctx: CommandContext,
+  url: string,
+  candidateRef: string | undefined,
+  existing: string | null,
+  nonInteractive: boolean,
+): Promise<RunResult> {
+  const { paths, env, options } = ctx;
+  const redacted = redactRemoteUrl(url);
+  const target = existing ? 'the old remote is' : 'the store is';
+
+  if (!candidateRef) {
+    return fail(`remote: ${redacted} has no branch to adopt; nothing was changed.\n`);
+  }
+
+  // Non-interactive / offline: refuse. Adopting an unrelated history discards local
+  // history (archived, but still) — it must never happen without an explicit choice.
+  if (nonInteractive) {
+    return fail(
+      `remote: ${redacted} has an UNRELATED history (no shared commit with the local store). ` +
+        'Refusing to adopt it non-interactively — nothing was changed. Re-run interactively to choose ' +
+        'between cancelling and archiving-the-local-store-and-adopting.\n',
+    );
+  }
+
+  // Interactive: DEFAULT to cancel; archive-and-adopt is the explicit alternative.
+  const confirm = options.confirm ?? confirmDefault;
+  const proceed = await confirm(
+    `remote: ${redacted} has an UNRELATED history. Archive the local store (a recoverable copy is kept ` +
+      'under ~/.agentenv/archives/) and adopt the remote? This replaces local history. [y/N] ',
+  );
+  if (!proceed) {
+    return ok(`Cancelled; ${target} unchanged and your local store is intact. (nothing was adopted)\n`);
+  }
+
+  // ARCHIVE FIRST — a recoverable copy of the whole store before anything is discarded.
+  const archive = await archiveStore(paths, options.now ? { now: options.now } : {});
+  if (archive.status !== 'ok') {
+    return fail(
+      `remote: could not archive the local store (${archive.detail ?? 'archive failed'}) — refusing to adopt an ` +
+        `unrelated remote without a recoverable copy. Nothing was changed; ${target} intact.\n`,
+    );
+  }
+
+  // Adopt the remote wholesale: reset the local branch to the fetched candidate ref.
+  // A LOCAL reset — never a force-push, never a merge of unrelated histories.
+  const reset = await resetHardTo(paths, env, candidateRef, options.gitRun);
+  if (reset.code !== 0) {
+    return fail(
+      `remote: adopting ${redacted} failed (${firstLine(reset.stderr) || 'reset failed'}). Your local store is ` +
+        `preserved in the archive at ${archive.path}. ${cap(target)} unchanged.\n`,
+    );
+  }
+
+  // Reset succeeded — flip the configured URL as the final step (design D14).
+  await setRemoteUrl(paths, env, url, options.gitRun);
+  return ok(
+    `Archived the local store to ${archive.path} and adopted the unrelated remote ${redacted}. ` +
+      'Your previous store is fully recoverable from that archive.\n',
+  );
+}
+
+/**
  * The candidate is UNREACHABLE (design D14). On a REPLACEMENT, change nothing — the
  * old remote must survive a candidate that is down (and the old remote is never
  * required to be reachable). On a FIRST connect there is nothing to lose, so connect
@@ -255,4 +329,14 @@ function ok(stdout: string): RunResult {
 }
 function fail(stderr: string): RunResult {
   return { stdout: '', stderr, code: 1 };
+}
+
+/** First non-empty, trimmed line — compact diagnostics without a multi-line dump. */
+function firstLine(text: string): string {
+  return text.split('\n').map((l) => l.trim()).find((l) => l !== '') ?? '';
+}
+
+/** Capitalise the first character (for a sentence-leading fragment). */
+function cap(text: string): string {
+  return text.length > 0 ? text[0]!.toUpperCase() + text.slice(1) : text;
 }

@@ -1,11 +1,11 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { run } from '../src/cli.js';
-import { defaultGitRunner, type GitRunner } from '../src/git.js';
+import { archivesDir, defaultGitRunner, type GitRunner } from '../src/git.js';
 import { resolvePaths } from '../src/paths.js';
 import { makeTempHome, type TempHome } from './helpers.js';
 
@@ -71,6 +71,22 @@ function relatedBare(storeDir: string, divergentFile = 'REMOTE.md', divergentBod
   writeFileSync(join(wc, divergentFile), divergentBody, 'utf8');
   g(wc, 'add', '-A');
   g(wc, 'commit', '-m', 'remote-divergent');
+  g(wc, 'push', bare, 'main');
+  return { dir: bare, url: pathToFileURL(bare).href };
+}
+
+/**
+ * A bare repo with a wholly UNRELATED history — its own root commit, NO shared
+ * ancestor with the local store — the "unrelated" fixture.
+ */
+function unrelatedBare(): { dir: string; url: string } {
+  const bare = join(scratch('bare-unrelated'), 'store.git');
+  execFileSync('git', ['init', '--bare', '-b', 'main', bare], { encoding: 'utf8' });
+  const wc = scratch('wc-unrelated');
+  execFileSync('git', ['init', '-b', 'main', wc], { env: GIT_ENV });
+  writeFileSync(join(wc, 'UNRELATED.md'), 'unrelated\n', 'utf8');
+  g(wc, 'add', '-A');
+  g(wc, 'commit', '-m', 'unrelated-root');
   g(wc, 'push', bare, 'main');
   return { dir: bare, url: pathToFileURL(bare).href };
 }
@@ -268,3 +284,105 @@ describe('remote 2.3: RELATED candidate → integrate then adopt', () => {
     expect(subjects(paths.store)).toEqual(localBefore); // local intact
   });
 });
+
+describe('remote 2.3: UNRELATED candidate → refuse / cancel / archive-and-adopt', () => {
+  /** Set up a local store with an old remote, a distinctive local commit, and an
+   *  unrelated candidate. Returns the pieces every unrelated test needs. */
+  async function setup(): Promise<{
+    th: TempHome;
+    paths: ReturnType<typeof resolvePaths>;
+    oldRemote: { dir: string; url: string };
+    unrelated: { dir: string; url: string };
+  }> {
+    const th = gitHome();
+    const paths = resolvePaths(th.env);
+    const oldRemote = emptyBare();
+    await run(['init'], { env: th.env });
+    await run(['remote', oldRemote.url], { env: th.env });
+    await run(['create', 'writing'], { env: th.env }); // a distinctive local commit
+    const unrelated = unrelatedBare();
+    return { th, paths, oldRemote, unrelated };
+  }
+
+  it('--non-interactive REFUSES (exit non-zero, nothing changed)', async () => {
+    const { th, paths, oldRemote, unrelated } = await setup();
+    const localBefore = subjects(paths.store);
+
+    const res = await run(['remote', unrelated.url, '--non-interactive'], { env: th.env });
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toMatch(/unrelated/i);
+    expect(originUrl(paths.store)).toBe(oldRemote.url); // unchanged
+    expect(subjects(paths.store)).toEqual(localBefore); // intact
+  });
+
+  it('interactive DEFAULT is cancel (nothing changed)', async () => {
+    const { th, paths, oldRemote, unrelated } = await setup();
+    const localBefore = subjects(paths.store);
+
+    const res = await run(['remote', unrelated.url], {
+      env: th.env,
+      confirm: async () => false, // the user declines → cancel (the default)
+    });
+    expect(res.code).toBe(0);
+    expect(res.stdout).toMatch(/cancel/i);
+    expect(originUrl(paths.store)).toBe(oldRemote.url); // unchanged
+    expect(subjects(paths.store)).toEqual(localBefore); // intact
+  });
+
+  it('explicit archive-and-adopt: local archived (recoverable) then unrelated remote adopted', async () => {
+    const { th, paths, unrelated } = await setup();
+    const localBefore = subjects(paths.store);
+    expect(localBefore).toContain('agentenv: create env writing');
+
+    const rec = recordingRunner();
+    const res = await run(['remote', unrelated.url], {
+      env: th.env,
+      gitRun: rec.run,
+      confirm: async () => true, // explicit archive-and-adopt
+    });
+    expect(res.code).toBe(0);
+
+    // The remote was adopted wholesale: url flipped, local history == the remote's.
+    expect(originUrl(paths.store)).toBe(unrelated.url);
+    expect(subjects(paths.store)).toEqual(['unrelated-root']);
+    expect(existsSync(join(paths.store, 'UNRELATED.md'))).toBe(true);
+
+    // The previous local store is RECOVERABLE from the archive (its history survives).
+    const archived = archiveDirEntries(paths);
+    expect(archived.length).toBe(1);
+    expect(subjects(archived[0]!)).toEqual(localBefore); // full original history
+
+    // No force-push, and NO auto-merge of unrelated histories anywhere.
+    assertNoForcePush(rec.calls());
+    assertNoUnrelatedMerge(rec.calls());
+    for (const argv of rec.calls()) expect(argv[0]).not.toBe('merge');
+  });
+
+  it('an archive failure leaves the OLD remote configured and local content intact', async () => {
+    const { th, paths, oldRemote, unrelated } = await setup();
+    const localBefore = subjects(paths.store);
+
+    // Block the archive: a regular FILE where the archives directory must be created.
+    writeFileSync(archivesDir(paths), 'not a directory\n', 'utf8');
+
+    const res = await run(['remote', unrelated.url], {
+      env: th.env,
+      confirm: async () => true, // user opted to archive-and-adopt, but archiving fails
+    });
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toMatch(/archive/i);
+    expect(originUrl(paths.store)).toBe(oldRemote.url); // OLD url intact
+    expect(subjects(paths.store)).toEqual(localBefore); // local intact
+    expect(existsSync(join(paths.store, 'UNRELATED.md'))).toBe(false); // remote NOT adopted
+  });
+});
+
+/** The store archives that exist under ~/.agentenv/archives (each a recoverable copy). */
+function archiveDirEntries(paths: ReturnType<typeof resolvePaths>): string[] {
+  const dir = archivesDir(paths);
+  if (!existsSync(dir)) return [];
+  return execFileSync('ls', ['-1', dir], { encoding: 'utf8' })
+    .split('\n')
+    .filter((n) => n.trim() !== '')
+    .map((n) => join(dir, n.trim()));
+}

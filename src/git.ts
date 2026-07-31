@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { access, readFile, readdir, rm } from 'node:fs/promises';
+import { access, cp, mkdir, readFile, readdir, rm } from 'node:fs/promises';
 import { join, relative, sep } from 'node:path';
 import { parseEnvConfig } from './env-config.js';
 import { writeFileAtomic } from './fs-atomic.js';
@@ -789,6 +789,39 @@ export async function integrateCandidate(
     }
   }
   return { status: 'error', detail: redactRemoteUrl(firstLine(res.stderr)) || 'integration failed' };
+}
+
+/** Where recoverable pre-adoption store archives land (design D14): beside the store,
+ *  under `~/.agentenv/archives/`, NEVER inside the store repo (so it never syncs). */
+export function archivesDir(paths: Paths): string {
+  return join(paths.base, 'archives');
+}
+
+/** Outcome of an {@link archiveStore}. `path` is the recoverable copy on success. */
+export interface ArchiveResult {
+  status: 'ok' | 'error';
+  path?: string;
+  detail?: string;
+}
+
+/**
+ * Archive the ENTIRE local store — working tree AND `.git` (so every local commit is
+ * recoverable) — to a timestamped copy under {@link archivesDir} before an
+ * unrelated-remote adoption discards it (design D14, spec criterion 8). NEVER
+ * destructive: it only copies. A copy failure returns `error` so the caller aborts
+ * BEFORE touching local content — nothing is lost, nothing changed. The archive sits
+ * beside the store, never inside it, so it is never synced.
+ */
+export async function archiveStore(paths: Paths, opts: { now?: () => number } = {}): Promise<ArchiveResult> {
+  const stamp = new Date((opts.now ?? Date.now)()).toISOString().replace(/[:.]/g, '-');
+  const dest = join(archivesDir(paths), `store-${stamp}`);
+  try {
+    await mkdir(archivesDir(paths), { recursive: true });
+    await cp(paths.store, dest, { recursive: true });
+    return { status: 'ok', path: dest };
+  } catch (err) {
+    return { status: 'error', detail: (err as Error).message };
+  }
 }
 
 // ---------------------------------------------------------------------------
