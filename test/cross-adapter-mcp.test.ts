@@ -230,19 +230,154 @@ describe('F1: canonical servers.yaml round-trips across every adapter', () => {
       });
 
       for (const reader of MCP_ADAPTERS) {
-        it(`compiles to the same config for ${reader.id} as the edited canonical would`, async () => {
-          const outDir = await driftWriteBack(writer);
-          const expectedDir = tmp();
-          mkdirSync(join(expectedDir, 'mcp'), { recursive: true });
-          writeFileSync(
-            join(expectedDir, 'mcp', 'servers.yaml'),
-            JSON.stringify(expectedCanonical()),
-          );
-          expect(await compileMap(reader, outDir)).toEqual(
-            await compileMap(reader, expectedDir),
-          );
+        it(`still compiles to a faithful ${reader.id} config`, async () => {
+          // NOT `compileMap(reader, out) === compileMap(reader, expectedCanonical())` —
+          // the first cell already asserts `out === expectedCanonical()`, so that
+          // comparison is `f(x) === f(x)` and can never fail independently. These are
+          // HAND-WRITTEN facts about what each harness must end up seeing, so a
+          // write-back that corrupts the store in a way the deep-equality cell somehow
+          // tolerated still fails here.
+          assertReaderFacts(reader, await compileMap(reader, await driftWriteBack(writer)));
         });
       }
+    });
+  }
+});
+
+/**
+ * What each harness must SEE after any writer's drift write-back, written out by hand
+ * rather than derived from the canonical expectation. These are the cross-adapter
+ * properties the shared store exists to guarantee: the sse/http distinction survives for
+ * the harnesses that can express it, a disabled server stays disabled, a bespoke transport
+ * is never turned into http, and no secret is ever baked into a compiled value.
+ */
+function assertReaderFacts(reader: Adapter, map: Record<string, JsonValue>): void {
+  expect(Object.keys(map).sort()).toEqual(Object.keys(CANONICAL_SHAPE).sort());
+
+  if (reader.id === 'claude-code') {
+    expect(map.gh).toMatchObject({ type: 'stdio', command: 'npx', env: { TOKEN: '${TOKEN}' } });
+    expect(map.linear).toMatchObject({ type: 'sse' });
+    expect(map.docs).toMatchObject({ type: 'http', headers: { 'X-Api-Key': '${API_KEY}' } });
+    expect(map.shadow).toMatchObject({ headers: { Authorization: 'Basic ${SHADOW_BASIC}' } });
+    expect(map.bespoke).toMatchObject({ transport: 'websocket' });
+    expect(map.wrapped).toMatchObject({ type: 'stdio', command: ['bash', '-c', 'echo hi'] });
+  } else if (reader.id === 'cursor') {
+    // Cursor's stdio shape carries no `type`; every placeholder is `${env:VAR}`.
+    expect(map.gh).toMatchObject({ command: 'npx', env: { TOKEN: '${env:TOKEN}' } });
+    expect(map.linear).toMatchObject({ type: 'sse' });
+    expect(map.docs).toMatchObject({ type: 'http', headers: { 'X-Api-Key': '${env:API_KEY}' } });
+    expect(map.bespoke).toMatchObject({ transport: 'websocket' });
+  } else if (reader.id === 'opencode') {
+    // OpenCode flattens command+args and cannot express sse — but MUST keep `enabled`.
+    expect(map.gh).toMatchObject({
+      type: 'local',
+      command: ['npx', '-y', '@modelcontextprotocol/server-github'],
+      enabled: true,
+      env: { TOKEN: '{env:TOKEN}' },
+    });
+    expect(map.linear).toMatchObject({ type: 'remote', enabled: true });
+    expect(map.offswitch).toMatchObject({ enabled: false });
+    expect(map.docs).toMatchObject({ headers: { 'X-Api-Key': '{env:API_KEY}' } });
+    expect(map.bespoke).toMatchObject({ transport: 'websocket' });
+  } else {
+    // Codex: native indirections, so `${TOKEN}` becomes an `env_vars` allowlist entry.
+    expect(map.gh).toMatchObject({ command: 'npx', env_vars: ['TOKEN'] });
+    expect(map.linear).toMatchObject({ bearer_token_env_var: 'TOKEN' });
+    expect(map.docs).toMatchObject({ env_http_headers: { 'X-Api-Key': 'API_KEY' } });
+    // A bearer SHADOWED by an Authorization header is never re-emitted (F6/3).
+    expect((map.shadow as Record<string, JsonValue>).bearer_token_env_var).toBeUndefined();
+    expect(map.bespoke).toMatchObject({ transport: 'websocket' });
+  }
+
+  // No compiled value anywhere may carry a baked secret: every credential is an
+  // indirection in one of the three placeholder syntaxes.
+  expect(JSON.stringify(map)).not.toMatch(/Bearer [A-Za-z0-9]{8,}/);
+}
+
+// ---------------------------------------------------------------------------
+// Every KIND of user edit, not just an addition
+// ---------------------------------------------------------------------------
+
+/** Fold ONE harness value for `name` onto the pristine canonical corpus. */
+async function foldInto(
+  writer: Adapter,
+  name: string,
+  harnessValue: JsonValue,
+): Promise<Record<string, Record<string, JsonValue>>> {
+  const dir = envWith(CANONICAL_YAML);
+  const surface = mcpSurface(writer);
+  const mutations = await writer.syncBackConfigKeys!(
+    surface,
+    { style: 'keyed', keyPath: [...surface.keyPath, name], canonicalValue: harnessValue },
+    { envContentDir: dir, projectRoot: null, onWarn: () => {} },
+  );
+  return parseYaml(mutations[0]!.content) as Record<string, Record<string, JsonValue>>;
+}
+
+/** What `writer` compiles server `name` to from the pristine corpus. */
+async function compiled(writer: Adapter, name: string): Promise<Record<string, JsonValue>> {
+  const map = await compileMap(writer, envWith(CANONICAL_YAML));
+  return map[name] as Record<string, JsonValue>;
+}
+
+describe('F1: every KIND of user edit propagates, and only that edit', () => {
+  for (const writer of MCP_ADAPTERS) {
+    describe(`after a ${writer.id} edit`, () => {
+      it('DELETING a field deletes it from canonical (siblings untouched)', async () => {
+        const value = { ...(await compiled(writer, 'gh')) };
+        // Whichever way this harness spells the stdio env, drop it.
+        delete value.env;
+        delete value.env_vars;
+        const written = await foldInto(writer, 'gh', value);
+        expect(written.gh!.env).toBeUndefined();
+        expect(written.gh!.command).toBe('npx');
+        expect(written.gh!.args).toEqual(['-y', '@modelcontextprotocol/server-github']);
+        // Every other server is byte-for-byte what it was.
+        for (const other of Object.keys(CANONICAL_SHAPE)) {
+          if (other === 'gh') continue;
+          expect(written[other]).toEqual(CANONICAL_SHAPE[other]);
+        }
+      });
+
+      it('changing the TRANSPORT discriminator lands the right canonical transport', async () => {
+        const value = { ...(await compiled(writer, 'linear')) };
+        if (typeof value.type === 'string' && value.type !== 'remote') {
+          // Claude/Cursor record http-vs-sse natively: the edit must propagate.
+          value.type = 'http';
+          expect((await foldInto(writer, 'linear', value)).linear!.transport).toBe('http');
+        } else {
+          // OpenCode/Codex cannot express the difference, so an unrelated edit here must
+          // NOT collapse the canonical `sse` into `http`.
+          value.url = 'https://mcp.linear.app/sse?v=2';
+          expect((await foldInto(writer, 'linear', value)).linear!.transport).toBe('sse');
+        }
+      });
+
+      it('changing COMMAND/ARGS propagates the new command line', async () => {
+        const value = { ...(await compiled(writer, 'gh')) };
+        if (Array.isArray(value.command)) value.command = ['pnpx', '-y', 'other-server'];
+        else {
+          value.command = 'pnpx';
+          value.args = ['-y', 'other-server'];
+        }
+        const written = await foldInto(writer, 'gh', value);
+        expect(written.gh!.command).toBe('pnpx');
+        expect(written.gh!.args).toEqual(['-y', 'other-server']);
+        // The canonical-only `env` this branch never emits is still preserved.
+        expect(written.gh!.env).toEqual({ TOKEN: '${TOKEN}' });
+      });
+
+      it('changing FAMILY (stdio → remote) drops the stdio-only keys', async () => {
+        const remote: Record<string, JsonValue> = { url: 'https://gh.example.com/mcp' };
+        if (writer.id === 'opencode') {
+          remote.type = 'remote';
+          remote.enabled = true;
+        } else if (writer.id !== 'codex') {
+          remote.type = 'http';
+        }
+        const written = await foldInto(writer, 'gh', remote);
+        expect(written.gh).toEqual({ transport: 'http', url: 'https://gh.example.com/mcp' });
+      });
     });
   }
 });
