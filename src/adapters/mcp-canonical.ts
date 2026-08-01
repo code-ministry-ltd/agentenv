@@ -1,39 +1,40 @@
+import type { ConfigKeysDriftChange } from '../adapter.js';
 import type { JsonValue } from '../config-keys.js';
-import { secretLiteralReason } from '../git.js';
 
 /**
- * Shared machinery for the canonical (D6) `mcp/servers.yaml` ⇄ harness-shape round
- * trip. `servers.yaml` is the ONE canonical source every adapter's
- * `compileConfigKeys` reads, so a drift write-back by one harness must never leave
- * behind a shape — or a gap — that breaks the others (F1).
+ * Shared machinery for CLASSIFYING how a harness's MCP config differs from the canonical
+ * (D6) `mcp/servers.yaml`. `servers.yaml` is the ONE canonical source every adapter's
+ * `compileConfigKeys` reads; when a harness config drifts, agentenv says exactly which
+ * canonical fields disagree and leaves the store alone (v1 contract: detect and report).
  *
- * **Why OVERLAY-AND-PRESERVE rather than reconstruction.** The obvious inverse — build
- * a fresh canonical def out of the harness value — is unfixable in principle, because
- * `shape*` is NOT injective: canonical `transport: http` and `transport: sse` both
- * compile to OpenCode's `type:'remote'` and to a bare Codex `url` table, so no true
- * inverse exists. Reconstruction also silently drops every canonical field the shaper
- * does not emit (`timeout`, `enabled`, anything a future release adds) and every field
- * the un-shape whitelist does not know about.
+ * **Why this classifies rather than decides.** The obvious inverse — rebuild a canonical
+ * def out of the harness value — is unfixable in principle, because `shape*` is NOT
+ * injective: canonical `transport: http` and `transport: sse` both compile to OpenCode's
+ * `type:'remote'` and to a bare Codex `url` table, so no true inverse exists.
+ * Reconstruction also silently drops every canonical field the shaper does not emit
+ * (`timeout`, `enabled`, anything a future release adds).
  *
- * So a write-back instead OVERLAYS the changed fields onto the PRIOR canonical def read
- * from `servers.yaml`:
+ * The nearest thing to an inverse is an OVERLAY of the harness value onto the PRIOR
+ * canonical def read from `servers.yaml`:
  *
  *   1. the un-shape carries the harness value's fields over VERBATIM (no whitelist), so
- *      a field the user adds in the harness config survives into the store;
+ *      a field the user added in the harness config shows up;
  *   2. anything the shaper never emitted is preserved from the prior def, because the
  *      harness value could not possibly have contradicted it;
  *   3. `transport` propagates when the harness expresses the distinction NATIVELY and is
  *      preserved from the prior def only where the harness shape is genuinely lossy (see
  *      {@link TransportAuthority});
- *   4. only the keys a branch genuinely EMITS ({@link UnshapedServer.supersedes}) are
- *      deleted when the harness value no longer expresses them — that is how a user
- *      DELETING a field in the harness still propagates, without the remote branch
- *      claiming authority over `command`/`env` it never wrote.
+ *   4. only the keys a branch genuinely EMITS ({@link UnshapedServer.supersedes}) count as
+ *      DELETED when the harness value no longer expresses them, so the remote branch never
+ *      claims authority over `command`/`env` it never wrote.
  *
- * **The overriding rule (F6): where a drift is genuinely AMBIGUOUS, agentenv does not
- * infer.** It leaves the canonical field unchanged and surfaces a warning naming the
- * server and the field. A warning the user can act on beats a clever guess that silently
- * changes what a credential or an endpoint does.
+ * That overlay is a fixed lattice over a user-authored input space, and three adversarial
+ * review rounds each found a live defect at a boundary it did not cover. It is adequate to
+ * DESCRIBE a difference and was never adequate to DECIDE what to do about one — so
+ * {@link describeCanonicalDrift} diffs prior against overlay and returns the difference as
+ * NAMED FIELDS for a report. Nothing here writes, and nothing here carries a value: every
+ * ambiguity the lattice cannot resolve becomes a note the user acts on, and the canonical
+ * file changes only when the user edits it.
  */
 
 /** Is `v` a plain (non-array) JSON object? */
@@ -196,12 +197,15 @@ export function overlayCanonicalServer(prior: unknown, unshaped: UnshapedServer)
 
 /** What an un-shape needs in order to report an ambiguity it refuses to resolve. */
 export interface UnshapeContext {
-  /** The MCP server name, so a warning names the server the user must look at. */
+  /** The MCP server name, so a note names the server the user must look at. */
   server: string;
   /** The harness whose config the user edited, for the same reason. */
   adapterId: string;
-  /** The user-visible warning channel (see `ConfigKeysContext.onWarn`). */
-  warn: (message: string) => void;
+  /**
+   * Attach a caveat to one canonical field of the report. Prose plus field / server /
+   * harness names ONLY — never a value (see {@link ConfigKeysDriftChange}).
+   */
+  note: (field: string, text: string) => void;
 }
 
 /**
@@ -225,17 +229,17 @@ export function hasConflictingDiscriminators(
   );
 }
 
-/** Report a conflicting-discriminator drift: canonical `transport` is left alone (F6/9). */
-export function warnConflictingTransport(
+/** Note a conflicting-discriminator drift: the entry's transport is unknowable (F6/9). */
+export function noteConflictingTransport(
   ctx: UnshapeContext,
   transport: string,
   type: string,
 ): void {
-  ctx.warn(
-    `agentenv: MCP server '${ctx.server}' — the ${ctx.adapterId} config carries BOTH a ` +
-      `canonical transport ('${transport}') and that harness's own discriminator ` +
-      `(type: '${type}'), which disagree. agentenv cannot tell which you meant, so ` +
-      `transport in mcp/servers.yaml is UNCHANGED — set it there if you meant to change it.`,
+  ctx.note(
+    'transport',
+    `the ${ctx.adapterId} config carries BOTH a canonical transport ('${transport}') and ` +
+      `that harness's own discriminator (type: '${type}'), which disagree — agentenv ` +
+      'cannot tell which you meant',
   );
 }
 
@@ -275,8 +279,8 @@ function priorBearerEnv(prior: Record<string, JsonValue> | undefined): string | 
  * Everything else — replacing `Bearer ${OLD}` with a value that is not a bearer
  * indirection, or touching a header that SHADOWS a live `auth.bearer_env` — is AMBIGUOUS:
  * it could be a revocation or an unrelated header, and the two have opposite consequences
- * in a harness the user is not looking at. Canonical `auth` is left exactly as it was and
- * the user is told, naming the server and the env var (a NAME, never a secret value).
+ * in a harness the user is not looking at. The report says so against `auth.bearer_env`
+ * and the user decides — naming the server and the field, never a value.
  */
 export function resolveAuthDrift(opts: {
   /** The prior canonical def (`undefined` when this server is new to the store). */
@@ -336,19 +340,18 @@ export function resolveAuthDrift(opts: {
     const renamed = opts.bearerEnvFromHeader(opts.header);
     if (renamed !== null) return { kind: 'set', bearerEnv: renamed }; // a var rename
   }
-  // AMBIGUOUS. Leave canonical `auth` exactly as it was, and say so.
-  opts.ctx.warn(
-    `agentenv: MCP server '${opts.ctx.server}' — the Authorization header in the ` +
-      `${opts.ctx.adapterId} config no longer matches the one agentenv compiled from ` +
-      `canonical auth.bearer_env (${bearer}). agentenv cannot tell whether you replaced ` +
-      `that credential or changed an unrelated header, so auth.bearer_env in ` +
-      `mcp/servers.yaml is UNCHANGED — edit mcp/servers.yaml if you meant to change it.`,
+  // AMBIGUOUS. Say so against the field, and let the user decide.
+  opts.ctx.note(
+    'auth.bearer_env',
+    `the Authorization header in the ${opts.ctx.adapterId} config no longer matches the ` +
+      `one agentenv compiled from canonical auth.bearer_env (${bearer}) — agentenv cannot ` +
+      'tell whether you replaced that credential or changed an unrelated header',
   );
   return { kind: 'keep' };
 }
 
 // ---------------------------------------------------------------------------
-// The secret guard on the write-back path
+// The report: which canonical fields differ, named but never valued
 // ---------------------------------------------------------------------------
 
 /** Deep JSON equality by serialisation — enough for the canonical MCP shapes. */
@@ -356,83 +359,116 @@ function sameJson(a: JsonValue | undefined, b: JsonValue | undefined): boolean {
   return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 }
 
-/** The first secret-looking literal in a leaf (or in any element of a leaf array). */
-function secretLiteralIn(keyName: string, value: JsonValue): string | null {
-  if (typeof value === 'string') return secretLiteralReason(keyName, value);
-  if (Array.isArray(value)) {
-    for (const element of value) {
-      const reason = secretLiteralIn(keyName, element);
-      if (reason !== null) return reason;
-    }
-  }
-  return null;
+/**
+ * How deep a field path is followed before a difference is reported wholesale. Canonical
+ * MCP defs are two or three levels (`env.TOKEN`, `auth.bearer_env`); the cap only bounds a
+ * pathological hand-authored object so one entry cannot emit an unbounded report.
+ */
+const MAX_FIELD_DEPTH = 4;
+
+/**
+ * Put a hand-authored prior def into the same vocabulary the overlay emits, so agentenv's
+ * OWN normalisation is never reported as a difference the user has to act on.
+ *
+ * A `servers.yaml` may spell the transport as `type: sse` (every shaper honours it as the
+ * transport hint — see {@link priorTransport}); the overlay always emits `transport`. Diffing
+ * the two raw would report `type` removed / `transport` added for a user who only changed a
+ * URL, sending them to edit something that is already correct.
+ */
+function normalisePrior(prior: Record<string, JsonValue>): Record<string, JsonValue> {
+  const t = priorTransport(prior);
+  if (prior.transport !== undefined || t === undefined) return prior;
+  return { transport: t, ...omitKeys(prior, ['type']) };
 }
 
 /**
- * Refuse to persist a value that looks like a RESOLVED SECRET LITERAL (F6/7, SECURITY).
- *
- * `restoreSecrets` (config-keys) restores the `${VAR}` placeholder in every field agentenv
- * itself flagged at compile time. It cannot know about a field the user hand-created in the
- * harness config, nor — on a `substitutePlaceholders` surface, where the real file
- * legitimately holds literals — about a literal the user copied into another field. Since
- * the write-back carries every field over verbatim, both would flow into the git-backed
- * `servers.yaml`. The pre-commit scan is only a backstop: it misses innocuously-named
- * fields, and when it does fire it wedges every later store sync instead of sanitising.
- *
- * So the refusal happens HERE, before the value is ever written: the canonical field is
- * left exactly as it was (or omitted, when it is new) and the user is told which field —
- * never the value.
- *
- * Only CHANGED leaves are examined: a value already in the store is not made safer by
- * dropping it now, and re-reporting it every sweep would be noise.
+ * Diff two canonical defs into NAMED fields. Objects recurse (to {@link MAX_FIELD_DEPTH}),
+ * so a change lands on `env.TOKEN` rather than on `env`; arrays and scalars compare whole.
+ * Only names and kinds are produced — no value ever leaves this function.
  */
-function refuseSecretLiterals(
-  node: Record<string, JsonValue>,
-  prior: unknown,
-  path: readonly string[],
-  ctx: UnshapeContext,
+function diffFields(
+  prior: JsonValue | undefined,
+  next: JsonValue | undefined,
+  prefix: string,
+  depth: number,
+  out: ConfigKeysDriftChange[],
 ): void {
-  const priorObj = isJsonObject(prior) ? prior : undefined;
-  for (const [key, value] of Object.entries(node)) {
-    const before = priorObj === undefined ? undefined : priorObj[key];
-    if (before !== undefined && sameJson(before, value)) continue; // already in the store
-    if (isJsonObject(value)) {
-      refuseSecretLiterals(value, before, [...path, key], ctx);
-      continue;
-    }
-    const reason = secretLiteralIn(key, value);
-    if (reason === null) continue;
-    const where = [...path, key].join('.');
-    ctx.warn(
-      `agentenv: MCP server '${ctx.server}' — the value at '${where}' in the ` +
-        `${ctx.adapterId} config looks like a resolved secret (${reason}). agentenv will ` +
-        `not commit a secret to mcp/servers.yaml, so that field was ` +
-        `${before === undefined ? 'NOT written' : 'left UNCHANGED'} — use a \${VAR} ` +
-        `placeholder in the harness config instead.`,
-    );
-    if (before === undefined) delete node[key];
-    else node[key] = before;
+  const p = isJsonObject(prior) ? prior : undefined;
+  const n = isJsonObject(next) ? next : undefined;
+  if (p === undefined || n === undefined || depth >= MAX_FIELD_DEPTH) {
+    if (!sameJson(prior, next)) out.push({ field: prefix, kind: 'changed' });
+    return;
+  }
+  const keys = [...new Set([...Object.keys(p), ...Object.keys(n)])].sort();
+  for (const key of keys) {
+    const field = prefix === '' ? key : `${prefix}.${key}`;
+    const before = p[key];
+    const after = n[key];
+    if (before === undefined) out.push({ field, kind: 'added' });
+    else if (after === undefined) out.push({ field, kind: 'removed' });
+    else diffFields(before, after, field, depth + 1, out);
   }
 }
 
 /**
- * The whole write-back fold for one drifted server: un-shape `drifted`, overlay it onto
- * `prior`, and refuse to persist anything that looks like a resolved secret. A non-object
- * drift value (a harness entry the user replaced with a scalar) has nothing to overlay and
- * is written through verbatim.
+ * Classify one drifted harness entry against the env's PRIOR canonical def and return the
+ * canonical fields that differ (see the module header). This is the whole of what agentenv
+ * does with a harness-side MCP edit: it names the difference and stops. The canonical file
+ * is not read for writing, not rewritten, and not staged — the user reconciles it.
+ *
+ * `prior` absent (a server that exists only in the harness config) reports the entry as a
+ * whole rather than listing every field of it. A `drifted` value that is not an object (a
+ * harness entry replaced with a scalar) likewise reports the entry as a whole, since there
+ * is no canonical field structure to diff against.
  */
-export function foldDriftIntoCanonical(
-  prior: unknown,
-  drifted: JsonValue,
+export function describeCanonicalDrift(opts: {
+  /** The prior canonical def from `mcp/servers.yaml`, or `undefined` when there is none. */
+  prior: unknown;
+  /** The drifted harness value, `${VAR}` placeholders already restored (D6). */
+  drifted: JsonValue;
+  /** This adapter's un-shape (its shaper's classification lattice). */
   unshape: (
     def: Record<string, JsonValue>,
     prior: unknown,
     ctx: UnshapeContext,
-  ) => UnshapedServer,
-  ctx: UnshapeContext,
-): JsonValue {
-  if (!isJsonObject(drifted)) return drifted;
-  const out = overlayCanonicalServer(prior, unshape(drifted, prior, ctx));
-  if (isJsonObject(out)) refuseSecretLiterals(out, prior, [], ctx);
-  return out;
+  ) => UnshapedServer;
+  /** The MCP server name. */
+  server: string;
+  /** The harness whose config drifted. */
+  adapterId: string;
+}): ConfigKeysDriftChange[] {
+  const notes = new Map<string, string>();
+  const ctx: UnshapeContext = {
+    server: opts.server,
+    adapterId: opts.adapterId,
+    note: (field, text) => {
+      if (!notes.has(field)) notes.set(field, text);
+    },
+  };
+
+  const prior = isJsonObject(opts.prior) ? opts.prior : undefined;
+  const changes: ConfigKeysDriftChange[] = [];
+
+  if (!isJsonObject(opts.drifted)) {
+    changes.push({
+      field: '',
+      kind: 'changed',
+      note: `the ${opts.adapterId} config no longer holds an object for this server`,
+    });
+  } else if (prior === undefined) {
+    changes.push({ field: '', kind: 'added' });
+    // Still run the un-shape: it is where a transport/auth ambiguity is detected, and
+    // that caveat is exactly what the user needs before authoring a canonical entry.
+    opts.unshape(opts.drifted, undefined, ctx);
+  } else {
+    const next = overlayCanonicalServer(prior, opts.unshape(opts.drifted, prior, ctx));
+    diffFields(normalisePrior(prior), next as JsonValue, '', 0, changes);
+  }
+
+  for (const [field, text] of notes) {
+    const hit = changes.find((c) => c.field === field);
+    if (hit) hit.note = text;
+    else changes.push({ field, kind: 'changed', note: text });
+  }
+  return changes;
 }

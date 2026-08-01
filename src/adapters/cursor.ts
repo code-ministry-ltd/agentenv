@@ -4,13 +4,13 @@ import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseJsonc, type ParseError } from 'jsonc-parser';
-import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { parse as parseYaml } from 'yaml';
 import type {
   Adapter,
   ConfigKeysContext,
   ConfigKeysDrift,
   ConfigKeysInjection,
-  ConfigKeysStoreMutation,
+  ConfigKeysDriftReport,
   ConfigKeysSurface,
   EntryBucket,
   SelfCheckResult,
@@ -19,13 +19,13 @@ import type {
 import type { JsonValue } from '../config-keys.js';
 import { resolveBinaryOnPath } from '../session/resolve.js';
 import {
-  foldDriftIntoCanonical,
+  describeCanonicalDrift,
   omitKeys,
   hasConflictingDiscriminators,
   passthroughUnshape,
   resolveAuthDrift,
   transportFamily,
-  warnConflictingTransport,
+  noteConflictingTransport,
   type UnshapeContext,
   type UnshapedServer,
 } from './mcp-canonical.js';
@@ -294,7 +294,7 @@ function unshapeCursorServer(
   // case the two disagree and the transport is unknowable (F6/9).
   const conflicting = hasConflictingDiscriminators(canon, CURSOR_SHAPER_TYPES);
   if (typeof canon.transport === 'string' && !conflicting) return passthroughUnshape(canon, prior);
-  if (conflicting) warnConflictingTransport(ctx, canon.transport as string, canon.type as string);
+  if (conflicting) noteConflictingTransport(ctx, canon.transport as string, canon.type as string);
 
   if (canon.command !== undefined && canon.url === undefined) {
     return {
@@ -447,33 +447,36 @@ export const cursorAdapter: Adapter = {
     });
   },
 
-  async syncBackConfigKeys(
+  async describeConfigKeysDrift(
     surface: ConfigKeysSurface,
     drift: ConfigKeysDrift,
     ctx: ConfigKeysContext,
-  ): Promise<ConfigKeysStoreMutation[]> {
-    // Inverse of compileConfigKeys (spec criterion 4), consistent with Claude: fold the
-    // one drifted server (keyPath ['mcpServers', <name>]) back into servers.yaml,
-    // siblings untouched, in the PURE canonical D6 shape — NOT Cursor's `${env:}` shape.
+  ): Promise<ConfigKeysDriftReport | null> {
+    // Classify how one drifted `mcp.json` server (keyPath ['mcpServers', <name>])
+    // disagrees with the canonical D6 def in servers.yaml, consistent with Claude.
     // `canonicalValue` already has secret ${env:VAR} placeholders restored (D6);
-    // `unshapeCursorServer` + the OVERLAY map its harness shape back onto the PRIOR
-    // canonical def, so servers.yaml stays D6-canonical for EVERY adapter (F1) and
-    // nothing Cursor cannot express is lost (F5/1,3,4,11).
-    if (surface.id !== 'mcp' || drift.style !== 'keyed') return [];
-    if (drift.keyPath.length < 2) return [];
+    // `unshapeCursorServer` + the OVERLAY map Cursor's `${env:}` shape back onto
+    // canonical, so the report names CANONICAL fields — the ones the user will edit.
+    // servers.yaml is READ here and never written.
+    if (surface.id !== 'mcp' || drift.style !== 'keyed') return null;
+    if (drift.keyPath.length < 2) return null;
     const name = drift.keyPath[drift.keyPath.length - 1];
-    if (typeof name !== 'string') return [];
+    if (typeof name !== 'string') return null;
     const serversFile = join(ctx.envContentDir, 'mcp', 'servers.yaml');
     const existing = existsSync(serversFile)
       ? ((parseYaml(await readFile(serversFile, 'utf8')) as Record<string, unknown> | null) ?? {})
       : {};
-    existing[name] = foldDriftIntoCanonical(
-      existing[name],
-      drift.canonicalValue,
-      unshapeCursorServer,
-      { server: name, adapterId: 'cursor', warn: ctx.onWarn ?? ((m) => console.warn(m)) },
-    );
-    return [{ storeRelativePath: join('mcp', 'servers.yaml'), content: stringifyYaml(existing) }];
+    return {
+      entry: name,
+      storeRelativePath: join('mcp', 'servers.yaml'),
+      changes: describeCanonicalDrift({
+        prior: existing[name],
+        drifted: drift.canonicalValue,
+        unshape: unshapeCursorServer,
+        server: name,
+        adapterId: 'cursor',
+      }),
+    };
   },
 
   validateConfigFile(absPath: string, content: string): SelfCheckResult {

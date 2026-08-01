@@ -4,13 +4,13 @@ import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
-import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { parse as parseYaml } from 'yaml';
 import type {
   Adapter,
   ConfigKeysContext,
   ConfigKeysDrift,
   ConfigKeysInjection,
-  ConfigKeysStoreMutation,
+  ConfigKeysDriftReport,
   ConfigKeysSurface,
   EntryBucket,
   SelfCheckContext,
@@ -20,7 +20,7 @@ import type {
 import type { JsonValue } from '../config-keys.js';
 import { resolveBinaryOnPath } from '../session/resolve.js';
 import {
-  foldDriftIntoCanonical,
+  describeCanonicalDrift,
   omitKeys,
   passthroughUnshape,
   resolveAuthDrift,
@@ -470,34 +470,38 @@ export const codexAdapter: Adapter = {
     return injections;
   },
 
-  async syncBackConfigKeys(
+  async describeConfigKeysDrift(
     surface: ConfigKeysSurface,
     drift: ConfigKeysDrift,
     ctx: ConfigKeysContext,
-  ): Promise<ConfigKeysStoreMutation[]> {
-    // Inverse of compileConfigKeys (spec criterion 4): fold one drifted Codex
-    // `[mcp_servers.<name>]` table back into servers.yaml, siblings untouched, in
-    // the pure canonical D6 shape (`transport`/`auth`/`env` with `${VAR}` restored),
-    // OVERLAID on the PRIOR canonical def so nothing Codex cannot express is lost
-    // (F5/1,3,4) and a later compile reproduces the drift exactly — round-trip stable.
-    if (surface.id !== 'mcp' || drift.style !== 'keyed') return [];
-    // The trust entry (`['projects', <root>]`) is launch-derived, not stored — its
-    // drift is discarded, never written to servers.yaml.
-    if (drift.keyPath.length < 2 || drift.keyPath[0] !== 'mcp_servers') return [];
+  ): Promise<ConfigKeysDriftReport | null> {
+    // Classify how one drifted Codex `[mcp_servers.<name>]` table disagrees with the
+    // canonical D6 def in servers.yaml. `unshapeCodexServer` + the OVERLAY translate the
+    // native indirections (`env_vars`, `bearer_token_env_var`, `env_http_headers`) back
+    // to canonical `env`/`auth`/`headers`, so the report names CANONICAL fields — the
+    // ones the user will edit. servers.yaml is READ here and never written.
+    if (surface.id !== 'mcp' || drift.style !== 'keyed') return null;
+    // The trust entry (`['projects', <root>]`) is launch-derived, not stored — it has no
+    // canonical counterpart to disagree with, so there is nothing to report.
+    if (drift.keyPath.length < 2 || drift.keyPath[0] !== 'mcp_servers') return null;
     const name = drift.keyPath[drift.keyPath.length - 1];
-    if (typeof name !== 'string') return [];
+    if (typeof name !== 'string') return null;
 
     const serversFile = join(ctx.envContentDir, 'mcp', 'servers.yaml');
     const existing = existsSync(serversFile)
       ? ((parseYaml(await readFile(serversFile, 'utf8')) as Record<string, unknown> | null) ?? {})
       : {};
-    existing[name] = foldDriftIntoCanonical(
-      existing[name],
-      drift.canonicalValue,
-      unshapeCodexServer,
-      { server: name, adapterId: 'codex', warn: ctx.onWarn ?? ((m) => console.warn(m)) },
-    );
-    return [{ storeRelativePath: join('mcp', 'servers.yaml'), content: stringifyYaml(existing) }];
+    return {
+      entry: name,
+      storeRelativePath: join('mcp', 'servers.yaml'),
+      changes: describeCanonicalDrift({
+        prior: existing[name],
+        drifted: drift.canonicalValue,
+        unshape: unshapeCodexServer,
+        server: name,
+        adapterId: 'codex',
+      }),
+    };
   },
 
   async selfCheck(viewRoot: string, ctx: SelfCheckContext): Promise<SelfCheckResult> {

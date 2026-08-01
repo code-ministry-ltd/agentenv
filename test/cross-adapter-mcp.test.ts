@@ -3,33 +3,32 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { Adapter, ConfigKeysSurface } from '../src/adapter.js';
+import type { Adapter, ConfigKeysDriftReport, ConfigKeysSurface } from '../src/adapter.js';
 import { claudeAdapter } from '../src/adapters/claude.js';
 import { codexAdapter } from '../src/adapters/codex.js';
 import { cursorAdapter } from '../src/adapters/cursor.js';
 import { opencodeAdapter } from '../src/adapters/opencode.js';
 import { piAdapter } from '../src/adapters/pi.js';
 import type { JsonValue } from '../src/config-keys.js';
+import { driftKinds } from './helpers.js';
 
 /**
- * F1/F5 — the cross-adapter round-trip guarantee (Phase-4 decision D6): the canonical
- * `mcp/servers.yaml` stays D6-canonical across EVERY adapter, and a drift write-back
- * NEVER destroys canonical data the writing harness cannot express.
+ * The cross-adapter guarantee, under the v1 "detect and report, never write" contract.
  *
- * The production trigger for `syncBackConfigKeys` is a USER EDIT to the harness's own
- * config file — never the identity `unshape(shape(canonical))`. So every cell here
- * mutates the compiled harness shape first (a real edit: add a field, change a URL)
- * and only then folds it back, with the env's PRIOR canonical `servers.yaml` in place
- * exactly as production has it. That is what makes the matrix able to fail on:
+ * `mcp/servers.yaml` is the ONE canonical model every adapter's `compileConfigKeys` reads.
+ * Previously a drift write-back by one harness could destroy canonical data another harness
+ * needed — a bespoke `transport` re-inferred to `http`, an `sse` collapsed into `http`, a
+ * `timeout`/`enabled` dropped, an `auth.bearer_env` lost behind a shadowing header. Three
+ * review rounds fixed those one at a time and introduced fresh ones of the same shape.
  *
- *  - F1  a bespoke `transport` (`websocket`) re-inferred to `http` and destroyed;
- *  - F3  a field the unshape whitelist drops (`timeout`, and the user's own addition);
- *  - F4  `sse` collapsed to `http` because OpenCode/Codex cannot express the difference;
- *  - F11 `auth.bearer_env` dropped when a hand-authored `Authorization` header shadows it.
+ * They are all gone by construction now, and this file proves it in two halves:
  *
- * The fix is OVERLAY-AND-PRESERVE: the new canonical def is the PRIOR canonical def with
- * only the genuinely-changed fields written over it, so anything the shaper never touched
- * survives verbatim.
+ *  1. NO harness-side edit can change what any OTHER harness sees, because the sweep does
+ *     not write the store at all: `servers.yaml` is byte-identical afterwards, and every
+ *     reader compiles exactly what it compiled before.
+ *  2. The REPORT is still precise: it names the edited server and exactly the canonical
+ *     fields the user touched — no more (over-reporting is the residual form of the old
+ *     over-writing bugs) and no less.
  */
 
 const tmps: string[] = [];
@@ -86,7 +85,7 @@ const CANONICAL_YAML =
   '  command: ["bash", "-c", "echo hi"]\n' +
   '  args: []\n';
 
-/** The canonical D6 shape of the pristine corpus (parsed once, for the expectations). */
+/** The canonical D6 shape of the corpus (parsed once, for the expectations). */
 const CANONICAL_SHAPE = parseYaml(CANONICAL_YAML) as Record<string, Record<string, JsonValue>>;
 
 /** The 4 adapters that own an MCP config-keys surface (Pi's MCP is unsupported). */
@@ -124,10 +123,10 @@ async function compileMap(adapter: Adapter, dir: string): Promise<Record<string,
 }
 
 /**
- * A REAL user edit to a harness entry: append a key the harness config did not have,
- * and (where there is one) change the URL. Both are edits a user makes directly in
- * `.claude.json` / `opencode.json` / `mcp.json` / `config.toml` — the ONLY thing that
- * ever triggers `syncBackConfigKeys` in production.
+ * A REAL user edit to a harness entry: append a key the harness config did not have, and
+ * (where there is one) change the URL. Both are edits a user makes directly in
+ * `.claude.json` / `opencode.json` / `mcp.json` / `config.toml` — the only thing that ever
+ * triggers a drift classification in production.
  */
 function userEdit(value: JsonValue): JsonValue {
   if (!isObj(value)) return value;
@@ -136,49 +135,35 @@ function userEdit(value: JsonValue): JsonValue {
   return out;
 }
 
-/** The canonical def each server must hold AFTER the user edit is folded back. */
-function expectedCanonical(): Record<string, JsonValue> {
-  const out: Record<string, JsonValue> = {};
-  for (const [name, def] of Object.entries(CANONICAL_SHAPE)) {
-    const next: Record<string, JsonValue> = { ...def, userAdded: 'kept' };
-    if (typeof next.url === 'string') next.url = `${next.url}?edited=1`;
-    out[name] = next;
-  }
-  return out;
-}
-
 /**
- * Simulate `writer`'s harness holding the compiled servers, the USER EDITING them, then
- * a drift sweep folding each back via `syncBackConfigKeys`. The output dir starts with
- * the PRIOR canonical servers.yaml in place — exactly as `ctx.envContentDir` does in
- * production. Returns the dir whose servers.yaml is the post-write-back file.
+ * Simulate `writer`'s harness holding the compiled servers, the USER EDITING every one of
+ * them, and the drift sweep classifying each edit. Returns the env dir (whose servers.yaml
+ * must be untouched) plus each server's report.
  */
-async function driftWriteBack(writer: Adapter): Promise<string> {
-  const outDir = envWith(CANONICAL_YAML);
-  const harnessShape = await compileMap(writer, outDir); // what the harness config holds
+async function driftAll(
+  writer: Adapter,
+): Promise<{ dir: string; reports: Record<string, ConfigKeysDriftReport> }> {
+  const dir = envWith(CANONICAL_YAML);
+  const harnessShape = await compileMap(writer, dir); // what the harness config holds
   const surface = mcpSurface(writer);
-  const keyPrefix = surface.keyPath; // ['mcpServers'] | ['mcp'] | ['mcp_servers']
+  const reports: Record<string, ConfigKeysDriftReport> = {};
   for (const [name, value] of Object.entries(harnessShape)) {
-    const mutations = await writer.syncBackConfigKeys!(
+    const report = await writer.describeConfigKeysDrift!(
       surface,
-      { style: 'keyed', keyPath: [...keyPrefix, name], canonicalValue: userEdit(value) },
-      { envContentDir: outDir, projectRoot: null },
+      {
+        style: 'keyed',
+        keyPath: [...surface.keyPath, name],
+        canonicalValue: userEdit(value),
+      },
+      { envContentDir: dir, projectRoot: null },
     );
-    // Accumulate: each write-back reads the current servers.yaml and folds one server.
-    writeFileSync(join(outDir, 'mcp', 'servers.yaml'), mutations[0]!.content);
+    reports[name] = report!;
   }
-  return outDir;
+  return { dir, reports };
 }
 
-function readYaml(dir: string): Record<string, JsonValue> {
-  return parseYaml(readFileSync(join(dir, 'mcp', 'servers.yaml'), 'utf8')) as Record<
-    string,
-    JsonValue
-  >;
-}
-
-describe('F1: canonical servers.yaml round-trips across every adapter', () => {
-  it('Pi has no MCP write path (its MCP surface is declared unsupported)', () => {
+describe('a harness-side MCP edit cannot change what any other harness sees', () => {
+  it('Pi has no MCP path at all (its MCP surface is declared unsupported)', () => {
     const pi = piAdapter.surfaces.find((s) => s.id === 'mcp');
     expect(pi?.supported).toBe(false);
   });
@@ -188,68 +173,86 @@ describe('F1: canonical servers.yaml round-trips across every adapter', () => {
     for (const reader of MCP_ADAPTERS) {
       const map = await compileMap(reader, dir);
       expect(Object.keys(map).sort()).toEqual(Object.keys(CANONICAL_SHAPE).sort());
+      assertReaderFacts(reader, map);
     }
   });
 
-  // The cross-adapter matrix: every writer × every reader, over a USER-EDITED harness value.
   for (const writer of MCP_ADAPTERS) {
-    describe(`after ${writer.id} drift + syncBackConfigKeys`, () => {
-      it('preserves the whole prior canonical def, overlaying only the user edit', async () => {
-        const written = readYaml(await driftWriteBack(writer));
-        expect(written).toEqual(expectedCanonical());
-      });
-
-      it('keeps a bespoke transport verbatim (F1: `websocket` must not become `http`)', async () => {
-        const written = readYaml(await driftWriteBack(writer));
-        expect((written.bespoke as Record<string, JsonValue>).transport).toBe('websocket');
-      });
-
-      it('keeps `sse` distinct from `http` (F4: the shape is not injective)', async () => {
-        const written = readYaml(await driftWriteBack(writer));
-        expect((written.linear as Record<string, JsonValue>).transport).toBe('sse');
-      });
-
-      it('keeps fields the shaper never touched (F3: `timeout`, `enabled:false`)', async () => {
-        const written = readYaml(await driftWriteBack(writer));
-        expect((written.docs as Record<string, JsonValue>).timeout).toBe(30000);
-        expect((written.offswitch as Record<string, JsonValue>).enabled).toBe(false);
-      });
-
-      it("keeps the user's own harness addition (F3: no unshape whitelist)", async () => {
-        const written = readYaml(await driftWriteBack(writer));
-        for (const name of Object.keys(CANONICAL_SHAPE)) {
-          expect((written[name] as Record<string, JsonValue>).userAdded).toBe('kept');
+    describe(`after a ${writer.id} user edit to every server`, () => {
+      it('leaves mcp/servers.yaml byte-identical', async () => {
+        const dir = envWith(CANONICAL_YAML);
+        const file = join(dir, 'mcp', 'servers.yaml');
+        const before = readFileSync(file);
+        await driftAll(writer);
+        // driftAll builds its own dir; classify against THIS one too, to pin that the
+        // hook never writes the dir it was handed either.
+        const surface = mcpSurface(writer);
+        for (const [name, value] of Object.entries(await compileMap(writer, dir))) {
+          await writer.describeConfigKeysDrift!(
+            surface,
+            {
+              style: 'keyed',
+              keyPath: [...surface.keyPath, name],
+              canonicalValue: userEdit(value),
+            },
+            { envContentDir: dir, projectRoot: null },
+          );
         }
-      });
-
-      it('keeps auth.bearer_env shadowed by a hand-authored Authorization header (F11)', async () => {
-        const written = readYaml(await driftWriteBack(writer));
-        expect((written.shadow as Record<string, JsonValue>).auth).toEqual({
-          bearer_env: 'SHADOW_TOKEN',
-        });
+        expect(readFileSync(file).equals(before)).toBe(true);
       });
 
       for (const reader of MCP_ADAPTERS) {
-        it(`still compiles to a faithful ${reader.id} config`, async () => {
-          // NOT `compileMap(reader, out) === compileMap(reader, expectedCanonical())` —
-          // the first cell already asserts `out === expectedCanonical()`, so that
-          // comparison is `f(x) === f(x)` and can never fail independently. These are
-          // HAND-WRITTEN facts about what each harness must end up seeing, so a
-          // write-back that corrupts the store in a way the deep-equality cell somehow
-          // tolerated still fails here.
-          assertReaderFacts(reader, await compileMap(reader, await driftWriteBack(writer)));
+        it(`still compiles to the same faithful ${reader.id} config`, async () => {
+          // The cross-adapter guarantee, now structural: the store did not move, so every
+          // other harness sees exactly what it saw. These are HAND-WRITTEN facts about
+          // what each harness must end up seeing — an `sse` that stayed distinct from
+          // `http`, a disabled server still disabled, a bespoke transport never turned
+          // into http, and no baked secret anywhere.
+          const { dir } = await driftAll(writer);
+          assertReaderFacts(reader, await compileMap(reader, dir));
         });
       }
+
+      it('reports the edited server and EXACTLY the fields the user touched', async () => {
+        const { reports } = await driftAll(writer);
+        expect(Object.keys(reports).sort()).toEqual(Object.keys(CANONICAL_SHAPE).sort());
+        for (const [name, def] of Object.entries(CANONICAL_SHAPE)) {
+          const kinds = driftKinds(reports[name]!);
+          expect(reports[name]!.entry).toBe(name);
+          expect(reports[name]!.storeRelativePath).toBe(join('mcp', 'servers.yaml'));
+          // The edit adds `userAdded` and, where there is one, changes the url.
+          const expected: Record<string, string> = { userAdded: 'added' };
+          if (typeof def.url === 'string') expected.url = 'changed';
+          expect(kinds).toEqual(expected);
+        }
+      });
+
+      it('never puts a value — least of all a credential — in a report', async () => {
+        const { reports } = await driftAll(writer);
+        const text = JSON.stringify(reports);
+        // Every URL, placeholder and credential in the corpus, plus the edit's own value.
+        for (const secretish of [
+          '${TOKEN}',
+          '${API_KEY}',
+          '${SHADOW_BASIC}',
+          'mcp.linear.app',
+          'docs.example.com',
+          'bespoke.example.com',
+          'edited=1',
+          'kept',
+          'echo hi',
+        ]) {
+          expect(text).not.toContain(secretish);
+        }
+        expect(text).not.toMatch(/Bearer\s+\S/);
+      });
     });
   }
 });
 
 /**
- * What each harness must SEE after any writer's drift write-back, written out by hand
- * rather than derived from the canonical expectation. These are the cross-adapter
- * properties the shared store exists to guarantee: the sse/http distinction survives for
- * the harnesses that can express it, a disabled server stays disabled, a bespoke transport
- * is never turned into http, and no secret is ever baked into a compiled value.
+ * What each harness must SEE from the corpus. Written out by hand rather than derived, so
+ * a store that somehow moved still fails here even if a deep-equality cell tolerated it.
  */
 function assertReaderFacts(reader: Adapter, map: Record<string, JsonValue>): void {
   expect(Object.keys(map).sort()).toEqual(Object.keys(CANONICAL_SHAPE).sort());
@@ -284,7 +287,7 @@ function assertReaderFacts(reader: Adapter, map: Record<string, JsonValue>): voi
     expect(map.gh).toMatchObject({ command: 'npx', env_vars: ['TOKEN'] });
     expect(map.linear).toMatchObject({ bearer_token_env_var: 'TOKEN' });
     expect(map.docs).toMatchObject({ env_http_headers: { 'X-Api-Key': 'API_KEY' } });
-    // A bearer SHADOWED by an Authorization header is never re-emitted (F6/3).
+    // A bearer SHADOWED by an Authorization header is never re-emitted.
     expect((map.shadow as Record<string, JsonValue>).bearer_token_env_var).toBeUndefined();
     expect(map.bespoke).toMatchObject({ transport: 'websocket' });
   }
@@ -295,23 +298,26 @@ function assertReaderFacts(reader: Adapter, map: Record<string, JsonValue>): voi
 }
 
 // ---------------------------------------------------------------------------
-// Every KIND of user edit, not just an addition
+// Every KIND of user edit reports precisely, and only, that edit
 // ---------------------------------------------------------------------------
 
-/** Fold ONE harness value for `name` onto the pristine canonical corpus. */
-async function foldInto(
+/** Classify ONE harness value for `name` against the pristine canonical corpus. */
+async function reportOne(
   writer: Adapter,
   name: string,
   harnessValue: JsonValue,
-): Promise<Record<string, Record<string, JsonValue>>> {
+): Promise<Record<string, string>> {
   const dir = envWith(CANONICAL_YAML);
   const surface = mcpSurface(writer);
-  const mutations = await writer.syncBackConfigKeys!(
+  const file = join(dir, 'mcp', 'servers.yaml');
+  const before = readFileSync(file);
+  const report = await writer.describeConfigKeysDrift!(
     surface,
     { style: 'keyed', keyPath: [...surface.keyPath, name], canonicalValue: harnessValue },
-    { envContentDir: dir, projectRoot: null, onWarn: () => {} },
+    { envContentDir: dir, projectRoot: null },
   );
-  return parseYaml(mutations[0]!.content) as Record<string, Record<string, JsonValue>>;
+  expect(readFileSync(file).equals(before)).toBe(true);
+  return driftKinds(report);
 }
 
 /** What `writer` compiles server `name` to from the pristine corpus. */
@@ -320,54 +326,45 @@ async function compiled(writer: Adapter, name: string): Promise<Record<string, J
   return map[name] as Record<string, JsonValue>;
 }
 
-describe('F1: every KIND of user edit propagates, and only that edit', () => {
+describe('every KIND of user edit is reported, and only that edit', () => {
   for (const writer of MCP_ADAPTERS) {
     describe(`after a ${writer.id} edit`, () => {
-      it('DELETING a field deletes it from canonical (siblings untouched)', async () => {
+      it('DELETING a field is reported as a removal (siblings unmentioned)', async () => {
         const value = { ...(await compiled(writer, 'gh')) };
         // Whichever way this harness spells the stdio env, drop it.
         delete value.env;
         delete value.env_vars;
-        const written = await foldInto(writer, 'gh', value);
-        expect(written.gh!.env).toBeUndefined();
-        expect(written.gh!.command).toBe('npx');
-        expect(written.gh!.args).toEqual(['-y', '@modelcontextprotocol/server-github']);
-        // Every other server is byte-for-byte what it was.
-        for (const other of Object.keys(CANONICAL_SHAPE)) {
-          if (other === 'gh') continue;
-          expect(written[other]).toEqual(CANONICAL_SHAPE[other]);
-        }
+        expect(await reportOne(writer, 'gh', value)).toEqual({ env: 'removed' });
       });
 
-      it('changing the TRANSPORT discriminator lands the right canonical transport', async () => {
+      it('changing the TRANSPORT discriminator reports it only where the harness records it', async () => {
         const value = { ...(await compiled(writer, 'linear')) };
         if (typeof value.type === 'string' && value.type !== 'remote') {
-          // Claude/Cursor record http-vs-sse natively: the edit must propagate.
+          // Claude/Cursor record http-vs-sse natively: the edit must be reported.
           value.type = 'http';
-          expect((await foldInto(writer, 'linear', value)).linear!.transport).toBe('http');
+          expect(await reportOne(writer, 'linear', value)).toEqual({ transport: 'changed' });
         } else {
           // OpenCode/Codex cannot express the difference, so an unrelated edit here must
-          // NOT collapse the canonical `sse` into `http`.
+          // NOT be reported as collapsing the canonical `sse` into `http`.
           value.url = 'https://mcp.linear.app/sse?v=2';
-          expect((await foldInto(writer, 'linear', value)).linear!.transport).toBe('sse');
+          expect(await reportOne(writer, 'linear', value)).toEqual({ url: 'changed' });
         }
       });
 
-      it('changing COMMAND/ARGS propagates the new command line', async () => {
+      it('changing COMMAND/ARGS reports the command line and nothing else', async () => {
         const value = { ...(await compiled(writer, 'gh')) };
         if (Array.isArray(value.command)) value.command = ['pnpx', '-y', 'other-server'];
         else {
           value.command = 'pnpx';
           value.args = ['-y', 'other-server'];
         }
-        const written = await foldInto(writer, 'gh', value);
-        expect(written.gh!.command).toBe('pnpx');
-        expect(written.gh!.args).toEqual(['-y', 'other-server']);
-        // The canonical-only `env` this branch never emits is still preserved.
-        expect(written.gh!.env).toEqual({ TOKEN: '${TOKEN}' });
+        expect(await reportOne(writer, 'gh', value)).toEqual({
+          command: 'changed',
+          args: 'changed',
+        });
       });
 
-      it('changing FAMILY (stdio → remote) drops the stdio-only keys', async () => {
+      it('changing FAMILY (stdio → remote) reports the stdio-only keys as removed', async () => {
         const remote: Record<string, JsonValue> = { url: 'https://gh.example.com/mcp' };
         if (writer.id === 'opencode') {
           remote.type = 'remote';
@@ -375,56 +372,52 @@ describe('F1: every KIND of user edit propagates, and only that edit', () => {
         } else if (writer.id !== 'codex') {
           remote.type = 'http';
         }
-        const written = await foldInto(writer, 'gh', remote);
-        expect(written.gh).toEqual({ transport: 'http', url: 'https://gh.example.com/mcp' });
+        expect(await reportOne(writer, 'gh', remote)).toEqual({
+          transport: 'changed',
+          command: 'removed',
+          args: 'removed',
+          env: 'removed',
+          url: 'added',
+        });
       });
     });
   }
 });
 
-describe('F4: a server with NO prior canonical entry falls back to inference', () => {
+describe('a server with NO canonical entry is reported as a whole-entry addition', () => {
   /**
-   * The overlay needs a prior canonical def to preserve. With none (a server the user
-   * added directly to the harness config), the ambiguity is IRREDUCIBLE: OpenCode's
-   * `type:'remote'` and Codex's bare `url` table each map from BOTH `http` and `sse`,
-   * so the write-back must guess, and it guesses `http`. Claude/Cursor keep their
-   * native `type`, so they recover `sse` exactly. Documented, not fixable.
+   * The classification needs a prior canonical def to diff against. With none — a server
+   * the user added directly to the harness config — there is nothing to compare field by
+   * field, and the irreducible sse-vs-http ambiguity of OpenCode/Codex would make any
+   * per-field claim a guess. So the report says the entry is missing from canonical and
+   * stops, which is exactly the action the user must take.
    */
-  async function foldNew(writer: Adapter, harnessValue: JsonValue): Promise<JsonValue> {
+  async function reportNew(writer: Adapter, harnessValue: JsonValue) {
     const dir = envWith('other:\n  transport: stdio\n  command: x\n');
     const surface = mcpSurface(writer);
-    const mutations = await writer.syncBackConfigKeys!(
+    const file = join(dir, 'mcp', 'servers.yaml');
+    const before = readFileSync(file);
+    const report = await writer.describeConfigKeysDrift!(
       surface,
       { style: 'keyed', keyPath: [...surface.keyPath, 'fresh'], canonicalValue: harnessValue },
       { envContentDir: dir, projectRoot: null },
     );
-    return (parseYaml(mutations[0]!.content) as Record<string, JsonValue>).fresh!;
+    expect(readFileSync(file).equals(before)).toBe(true);
+    return report!;
   }
 
-  it('Claude recovers sse from its native `type`', async () => {
-    expect(await foldNew(claudeAdapter, { type: 'sse', url: 'https://x/sse' })).toEqual({
-      transport: 'sse',
-      url: 'https://x/sse',
+  for (const writer of MCP_ADAPTERS) {
+    it(`${writer.id}: names the new server without guessing its canonical fields`, async () => {
+      const value: Record<string, JsonValue> = { url: 'https://x/sse' };
+      if (writer.id === 'opencode') {
+        value.type = 'remote';
+        value.enabled = true;
+      } else if (writer.id !== 'codex') {
+        value.type = 'sse';
+      }
+      const report = await reportNew(writer, value);
+      expect(report.entry).toBe('fresh');
+      expect(report.changes).toEqual([{ field: '', kind: 'added' }]);
     });
-  });
-
-  it('Cursor recovers sse from its native `type`', async () => {
-    expect(await foldNew(cursorAdapter, { type: 'sse', url: 'https://x/sse' })).toEqual({
-      transport: 'sse',
-      url: 'https://x/sse',
-    });
-  });
-
-  it('OpenCode cannot: `remote` collapses http|sse, so a new server infers http', async () => {
-    expect(
-      await foldNew(opencodeAdapter, { type: 'remote', url: 'https://x/sse', enabled: true }),
-    ).toEqual({ transport: 'http', url: 'https://x/sse' });
-  });
-
-  it('Codex cannot: a bare url table collapses http|sse, so a new server infers http', async () => {
-    expect(await foldNew(codexAdapter, { url: 'https://x/sse' })).toEqual({
-      transport: 'http',
-      url: 'https://x/sse',
-    });
-  });
+  }
 });

@@ -41,6 +41,8 @@ const CANONICAL =
   'linear:\n' +
   '  transport: http\n' +
   '  url: https://mcp.linear.app/mcp\n' +
+  '  headers:\n' +
+  '    X-Api-Key: "${API_KEY}"\n' +
   '  env:\n' +
   '    TOKEN: "${GH_TOKEN}"\n';
 
@@ -144,10 +146,10 @@ describe('MCP drift is REPORTED, never written back to the canonical store', () 
     const { paths, env, storePath, cfgPath } = await materialised(th);
     const before = readFileSync(storePath);
 
-    // The user pastes a real token over the ${VAR} placeholder AND into a new field.
+    // The user pastes a real token over the ${VAR} placeholder AND into a new header.
     editRealConfig(cfgPath, (srv) => {
       (srv.env as Record<string, unknown>).TOKEN = LEAKED;
-      srv.headers = { Authorization: `Bearer ${LEAKED}` };
+      (srv.headers as Record<string, unknown>).Authorization = `Bearer ${LEAKED}`;
     });
 
     const notices: string[] = [];

@@ -1,11 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parse as parseYaml } from 'yaml';
 import { afterEach, describe, expect, it } from 'vitest';
 import { validateAdapter, type ConfigKeysSurface, type SelfCheckContext } from '../src/adapter.js';
 import { claudeAdapter } from '../src/adapters/claude.js';
 import type { JsonValue } from '../src/config-keys.js';
+import { driftKinds } from './helpers.js';
 
 const tmps: string[] = [];
 function tmp(): string {
@@ -183,77 +183,68 @@ describe('adapter.claude — compileConfigKeys (MCP → Claude mcpServers, D6)',
     expect(inj.value).toEqual({ type: 'sse', url: 'https://mcp.linear.app/sse' });
   });
 
-  it('keeps a canonical `enabled: false` in the store across a drift write-back (F5/3)', async () => {
-    // Claude's shape cannot express `enabled`, so the drifted entry says nothing about
-    // it — the overlay must preserve it rather than reconstruct the def without it.
-    const dir = envWithServers('echo:\n  transport: stdio\n  command: /bin/echo\n  enabled: false\n');
-    const mutations = await claudeAdapter.syncBackConfigKeys!(
-      MCP_SURFACE,
-      {
-        style: 'keyed',
-        keyPath: ['mcpServers', 'echo'],
-        canonicalValue: { type: 'stdio', command: '/bin/echo-v2' },
-      },
-      { envContentDir: dir, projectRoot: null },
-    );
-    const written = parseYaml(mutations[0]!.content) as Record<string, JsonValue>;
-    expect(written.echo).toEqual({
-      transport: 'stdio',
-      command: '/bin/echo-v2',
-      enabled: false,
-    });
-  });
 });
 
-describe('adapter.claude — syncBackConfigKeys (criterion 4)', () => {
-  it('folds one drifted server back into servers.yaml canonical shape, siblings intact', async () => {
-    // servers.yaml is D6-canonical; the drift value is Claude's harness shape (F1).
-    const dir = envWithServers('keep:\n  transport: stdio\n  command: keep-cmd\nlinear:\n  transport: http\n  url: https://old\n');
-    const mutations = await claudeAdapter.syncBackConfigKeys!(
+describe('adapter.claude — describeConfigKeysDrift (report only, store untouched)', () => {
+  /** Classify one drifted Claude value against the env's canonical servers.yaml. */
+  function report(dir: string, name: string, value: JsonValue) {
+    return claudeAdapter.describeConfigKeysDrift!(
       MCP_SURFACE,
-      {
-        style: 'keyed',
-        keyPath: ['mcpServers', 'linear'],
-        canonicalValue: { type: 'http', url: 'https://new', headers: { Authorization: 'Bearer ${LINEAR_TOKEN}' } },
-      },
+      { style: 'keyed', keyPath: ['mcpServers', name], canonicalValue: value },
       { envContentDir: dir, projectRoot: null },
     );
-    expect(mutations).toHaveLength(1);
-    expect(mutations[0]!.storeRelativePath).toBe(join('mcp', 'servers.yaml'));
-    const written = parseYaml(mutations[0]!.content) as Record<string, JsonValue>;
-    // Sibling preserved verbatim (already canonical).
-    expect(written.keep).toEqual({ transport: 'stdio', command: 'keep-cmd' });
-    // Drifted server reverse-mapped to canonical D6 (Authorization → auth.bearer_env).
-    expect(written.linear).toEqual({
-      transport: 'http',
-      url: 'https://new',
-      auth: { bearer_env: 'LINEAR_TOKEN' },
-    });
-  });
+  }
 
-  it('round-trips: compile(syncBack(drift)) reproduces the drifted value (stable)', async () => {
-    const dir = envWithServers('linear:\n  type: http\n  url: https://old\n');
-    const drifted: JsonValue = {
+  it('names the drifted server and the canonical fields that differ, leaving the store alone', async () => {
+    // servers.yaml is D6-canonical; the drift value is Claude's harness shape (F1). The
+    // report must speak CANONICAL (`auth.bearer_env`), not Claude's `headers`.
+    const dir = envWithServers(
+      'keep:\n  transport: stdio\n  command: keep-cmd\nlinear:\n  transport: http\n  url: https://old\n',
+    );
+    const before = readFileSync(join(dir, 'mcp', 'servers.yaml'));
+
+    const out = await report(dir, 'linear', {
       type: 'http',
       url: 'https://new',
       headers: { Authorization: 'Bearer ${LINEAR_TOKEN}' },
-    };
-    const mutations = await claudeAdapter.syncBackConfigKeys!(
-      MCP_SURFACE,
-      { style: 'keyed', keyPath: ['mcpServers', 'linear'], canonicalValue: drifted },
-      { envContentDir: dir, projectRoot: null },
-    );
-    // Persist the write-back, then re-compile: the value must be identical.
-    writeFileSync(join(dir, 'mcp', 'servers.yaml'), mutations[0]!.content);
-    const recompiled = await claudeAdapter.compileConfigKeys(MCP_SURFACE, {
-      envContentDir: dir,
-      projectRoot: null,
     });
-    const inj = recompiled.find((i) => i.style === 'keyed' && i.keyPath[1] === 'linear')!;
-    if (inj.style !== 'keyed') throw new Error('unreachable');
-    expect(inj.value).toEqual(drifted);
-    // And the restored placeholder is re-flagged as a secret field.
-    expect(inj.secretFields).toEqual({ 'headers.Authorization': 'Bearer ${LINEAR_TOKEN}' });
+
+    expect(out!.entry).toBe('linear');
+    expect(out!.storeRelativePath).toBe(join('mcp', 'servers.yaml'));
+    // The canonical entry had no `auth` at all, so the whole subtree is the addition —
+    // a report names the parent when the parent itself is new, and the LEAF when only
+    // one key inside an existing object changed.
+    expect(driftKinds(out)).toEqual({ url: 'changed', auth: 'added' });
+    // The sibling is never mentioned, and the canonical file is byte-identical.
+    expect(JSON.stringify(out)).not.toContain('keep');
+    expect(readFileSync(join(dir, 'mcp', 'servers.yaml')).equals(before)).toBe(true);
+  });
+
+  it('says nothing about a canonical field Claude cannot express (`enabled`, F5/3)', async () => {
+    // Claude's shape carries no `enabled`, so the drifted entry says nothing about it —
+    // reporting it as removed would send the user to change something they did not touch.
+    const dir = envWithServers(
+      'echo:\n  transport: stdio\n  command: /bin/echo\n  enabled: false\n',
+    );
+    const out = await report(dir, 'echo', { type: 'stdio', command: '/bin/echo-v2' });
+    expect(driftKinds(out)).toEqual({ command: 'changed' });
+  });
+
+  it('reports a server with no canonical entry as a whole-entry addition', async () => {
+    const dir = envWithServers('other:\n  transport: stdio\n  command: x\n');
+    const out = await report(dir, 'fresh', { type: 'sse', url: 'https://x/sse' });
+    expect(out!.changes).toEqual([{ field: '', kind: 'added' }]);
+  });
+
+  it('returns null for a key path that is not one server (never a bogus entry)', async () => {
+    const dir = envWithServers('a:\n  command: x\n');
+    expect(
+      await claudeAdapter.describeConfigKeysDrift!(
+        MCP_SURFACE,
+        { style: 'keyed', keyPath: ['mcpServers'], canonicalValue: {} },
+        { envContentDir: dir, projectRoot: null },
+      ),
+    ).toBeNull();
   });
 });
 

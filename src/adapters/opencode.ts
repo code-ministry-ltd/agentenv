@@ -3,13 +3,13 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { parse as parseYaml } from 'yaml';
 import type {
   Adapter,
   ConfigKeysContext,
   ConfigKeysDrift,
   ConfigKeysInjection,
-  ConfigKeysStoreMutation,
+  ConfigKeysDriftReport,
   ConfigKeysSurface,
   EntryBucket,
   OverrideEnv,
@@ -20,13 +20,13 @@ import type {
 import type { JsonValue } from '../config-keys.js';
 import { resolveBinaryOnPath } from '../session/resolve.js';
 import {
-  foldDriftIntoCanonical,
+  describeCanonicalDrift,
   isJsonObject,
   hasConflictingDiscriminators,
   omitKeys,
   passthroughUnshape,
   resolveAuthDrift,
-  warnConflictingTransport,
+  noteConflictingTransport,
   type UnshapeContext,
   type UnshapedServer,
 } from './mcp-canonical.js';
@@ -358,7 +358,7 @@ function unshapeOpenCodeServer(
   // would poison the store with BOTH shapes (a duplicated arg, a harness `type`) (F6/9).
   const conflicting = hasConflictingDiscriminators(canon, OPENCODE_SHAPER_TYPES);
   if (typeof canon.transport === 'string' && !conflicting) return passthroughUnshape(canon, prior);
-  if (conflicting) warnConflictingTransport(ctx, canon.transport as string, canon.type as string);
+  if (conflicting) noteConflictingTransport(ctx, canon.transport as string, canon.type as string);
 
   const priorDef = isJsonObject(prior) ? prior : undefined;
   const enabled = enabledDrift(canon.enabled, priorDef);
@@ -559,36 +559,39 @@ export const opencodeAdapter: Adapter = {
     return [];
   },
 
-  async syncBackConfigKeys(
+  async describeConfigKeysDrift(
     surface: ConfigKeysSurface,
     drift: ConfigKeysDrift,
     ctx: ConfigKeysContext,
-  ): Promise<ConfigKeysStoreMutation[]> {
-    // Inverse of compileConfigKeys (spec criterion 4), consistent with Claude's D6
-    // decision: fold the one drifted server (keyPath ['mcp', <name>]) back into
-    // servers.yaml, siblings untouched, in the PURE canonical D6 shape — NOT OpenCode's
-    // `{env:}`/`type:'local'`/command-array shape. `canonicalValue` already has secret
-    // {env:VAR} placeholders restored (D6); `unshapeOpenCodeServer` + the OVERLAY map its
-    // harness shape back onto the PRIOR canonical def, so servers.yaml stays D6-canonical
-    // for EVERY adapter (F1) and nothing OpenCode cannot express is lost (F5/1,3,4,11).
-    // Instructions are array-element (identity IS the value): no drift to sync back.
-    if (surface.id !== 'mcp' || drift.style !== 'keyed') return [];
+  ): Promise<ConfigKeysDriftReport | null> {
+    // Classify how one drifted `opencode.json` server (keyPath ['mcp', <name>])
+    // disagrees with the canonical D6 def in servers.yaml. `canonicalValue` already has
+    // secret {env:VAR} placeholders restored (D6); `unshapeOpenCodeServer` + the OVERLAY
+    // map OpenCode's `{env:}`/`type:'local'`/command-array shape back onto canonical, so
+    // the report names CANONICAL fields — the ones the user will edit. servers.yaml is
+    // READ here and never written. Instructions are array-element (identity IS the
+    // value), so that surface never drifts and has nothing to describe.
+    if (surface.id !== 'mcp' || drift.style !== 'keyed') return null;
     // A server injection is always keyPath ['mcp', <name>] (length 2); a length-1
-    // keyPath would fold a bogus `mcp` "server" into the store.
-    if (drift.keyPath.length < 2) return [];
+    // keyPath would describe a bogus `mcp` "server".
+    if (drift.keyPath.length < 2) return null;
     const name = drift.keyPath[drift.keyPath.length - 1];
-    if (typeof name !== 'string') return [];
+    if (typeof name !== 'string') return null;
     const serversFile = join(ctx.envContentDir, 'mcp', 'servers.yaml');
     const existing = existsSync(serversFile)
       ? ((parseYaml(await readFile(serversFile, 'utf8')) as Record<string, unknown> | null) ?? {})
       : {};
-    existing[name] = foldDriftIntoCanonical(
-      existing[name],
-      drift.canonicalValue,
-      unshapeOpenCodeServer,
-      { server: name, adapterId: 'opencode', warn: ctx.onWarn ?? ((m) => console.warn(m)) },
-    );
-    return [{ storeRelativePath: join('mcp', 'servers.yaml'), content: stringifyYaml(existing) }];
+    return {
+      entry: name,
+      storeRelativePath: join('mcp', 'servers.yaml'),
+      changes: describeCanonicalDrift({
+        prior: existing[name],
+        drifted: drift.canonicalValue,
+        unshape: unshapeOpenCodeServer,
+        server: name,
+        adapterId: 'opencode',
+      }),
+    };
   },
 
   async selfCheck(viewRoot: string, ctx: SelfCheckContext): Promise<SelfCheckResult> {

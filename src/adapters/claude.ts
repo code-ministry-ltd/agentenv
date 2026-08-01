@@ -3,13 +3,13 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { parse as parseYaml } from 'yaml';
 import type {
   Adapter,
   ConfigKeysContext,
   ConfigKeysDrift,
   ConfigKeysInjection,
-  ConfigKeysStoreMutation,
+  ConfigKeysDriftReport,
   ConfigKeysSurface,
   EntryBucket,
   SelfCheckContext,
@@ -19,12 +19,12 @@ import type {
 import type { JsonValue } from '../config-keys.js';
 import { resolveBinaryOnPath } from '../session/resolve.js';
 import {
-  foldDriftIntoCanonical,
+  describeCanonicalDrift,
   omitKeys,
   hasConflictingDiscriminators,
   passthroughUnshape,
   resolveAuthDrift,
-  warnConflictingTransport,
+  noteConflictingTransport,
   type UnshapeContext,
   type UnshapedServer,
 } from './mcp-canonical.js';
@@ -251,7 +251,7 @@ function unshapeClaudeServer(
   if (typeof def.transport === 'string' && !conflicting) return passthroughUnshape(def, prior);
   // …unless it sits beside a `type` the passthrough would never have written, in which
   // case the two disagree and the transport is unknowable (F6/9).
-  if (conflicting) warnConflictingTransport(ctx, def.transport as string, def.type as string);
+  if (conflicting) noteConflictingTransport(ctx, def.transport as string, def.type as string);
 
   // Claude records the http/sse distinction NATIVELY in `type`, so a `type` the user
   // edited must PROPAGATE — preserving the prior canonical transport here would rewrite
@@ -396,35 +396,37 @@ export const claudeAdapter: Adapter = {
     });
   },
 
-  async syncBackConfigKeys(
+  async describeConfigKeysDrift(
     surface: ConfigKeysSurface,
     drift: ConfigKeysDrift,
     ctx: ConfigKeysContext,
-  ): Promise<ConfigKeysStoreMutation[]> {
-    // Inverse of compileConfigKeys (spec criterion 4): fold the one drifted server
-    // (keyPath ['mcpServers', <name>]) back into servers.yaml, siblings untouched, in
-    // the PURE canonical D6 shape (`transport`/`command`/`url`/`auth`, `${VAR}` kept) —
-    // NOT Claude's `type`/`headers` shape. `canonicalValue` already has secret ${VAR}
-    // placeholders restored (D6); `unshapeClaudeServer` + the OVERLAY map its harness
-    // shape back onto the PRIOR canonical def, so servers.yaml stays D6-canonical for
-    // EVERY adapter (F1) and nothing Claude cannot express is lost (F5/1,3,4,11).
-    if (surface.id !== 'mcp' || drift.style !== 'keyed') return [];
+  ): Promise<ConfigKeysDriftReport | null> {
+    // Classify how one drifted `.claude.json` server (keyPath ['mcpServers', <name>])
+    // disagrees with the canonical D6 def in servers.yaml. `canonicalValue` already has
+    // secret ${VAR} placeholders restored (D6); `unshapeClaudeServer` + the OVERLAY map
+    // Claude's `type`/`headers` shape back onto canonical, so the report names CANONICAL
+    // fields — the ones the user will edit. servers.yaml is READ here and never written.
+    if (surface.id !== 'mcp' || drift.style !== 'keyed') return null;
     // A server injection is always keyPath ['mcpServers', <name>] (length 2); a
-    // length-1 keyPath would fold a bogus `mcpServers` "server" into the store.
-    if (drift.keyPath.length < 2) return [];
+    // length-1 keyPath would describe a bogus `mcpServers` "server".
+    if (drift.keyPath.length < 2) return null;
     const name = drift.keyPath[drift.keyPath.length - 1];
-    if (typeof name !== 'string') return [];
+    if (typeof name !== 'string') return null;
     const serversFile = join(ctx.envContentDir, 'mcp', 'servers.yaml');
     const existing = existsSync(serversFile)
       ? ((parseYaml(await readFile(serversFile, 'utf8')) as Record<string, unknown> | null) ?? {})
       : {};
-    existing[name] = foldDriftIntoCanonical(
-      existing[name],
-      drift.canonicalValue,
-      unshapeClaudeServer,
-      { server: name, adapterId: 'claude-code', warn: ctx.onWarn ?? ((m) => console.warn(m)) },
-    );
-    return [{ storeRelativePath: join('mcp', 'servers.yaml'), content: stringifyYaml(existing) }];
+    return {
+      entry: name,
+      storeRelativePath: join('mcp', 'servers.yaml'),
+      changes: describeCanonicalDrift({
+        prior: existing[name],
+        drifted: drift.canonicalValue,
+        unshape: unshapeClaudeServer,
+        server: name,
+        adapterId: 'claude-code',
+      }),
+    };
   },
 
   async selfCheck(viewRoot: string, ctx: SelfCheckContext): Promise<SelfCheckResult> {

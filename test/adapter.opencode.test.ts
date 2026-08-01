@@ -1,11 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { parse as parseYaml } from 'yaml';
 import { afterEach, describe, expect, it } from 'vitest';
 import { validateAdapter, type ConfigKeysSurface, type SelfCheckContext } from '../src/adapter.js';
 import { opencodeAdapter } from '../src/adapters/opencode.js';
 import type { JsonValue } from '../src/config-keys.js';
+import { driftKinds } from './helpers.js';
 
 const tmps: string[] = [];
 function tmp(): string {
@@ -287,97 +287,66 @@ describe('adapter.opencode — compileConfigKeys: instructions (array-element, a
   });
 });
 
-describe('adapter.opencode — syncBackConfigKeys (criterion 4)', () => {
-  it('folds one drifted server back into servers.yaml canonical shape, siblings intact', async () => {
-    // servers.yaml is D6-canonical; the drift value is OpenCode's harness shape (F1).
+describe('adapter.opencode — describeConfigKeysDrift (report only, store untouched)', () => {
+  /** Classify one drifted OpenCode entry against the env's canonical servers.yaml. */
+  function report(dir: string, name: string, value: JsonValue) {
+    return opencodeAdapter.describeConfigKeysDrift!(
+      MCP_SURFACE,
+      { style: 'keyed', keyPath: ['mcp', name], canonicalValue: value },
+      { envContentDir: dir, projectRoot: null },
+    );
+  }
+
+  it('names the canonical fields that differ, translating OpenCode\'s shape away', async () => {
+    // servers.yaml is D6-canonical; the drift value is OpenCode's harness shape (F1). The
+    // report must speak CANONICAL (`auth.bearer_env`) and never mention `type`/`enabled`,
+    // which OpenCode's shaper always writes and which therefore say nothing.
     const dir = envWithServers(
       'keep:\n  transport: stdio\n  command: keep-cmd\nlinear:\n  transport: http\n  url: https://old\n',
     );
-    const mutations = await opencodeAdapter.syncBackConfigKeys!(
-      MCP_SURFACE,
-      {
-        style: 'keyed',
-        keyPath: ['mcp', 'linear'],
-        canonicalValue: {
-          type: 'remote',
-          url: 'https://new',
-          enabled: true,
-          headers: { Authorization: 'Bearer {env:LINEAR_TOKEN}' },
-        },
-      },
-      { envContentDir: dir, projectRoot: null },
-    );
-    expect(mutations).toHaveLength(1);
-    expect(mutations[0]!.storeRelativePath).toBe(join('mcp', 'servers.yaml'));
-    const written = parseYaml(mutations[0]!.content) as Record<string, JsonValue>;
-    // Sibling preserved verbatim (already canonical).
-    expect(written.keep).toEqual({ transport: 'stdio', command: 'keep-cmd' });
-    // Drifted server reverse-mapped to canonical D6 ({env:VAR} → ${VAR}, remote → http,
-    // Authorization → auth.bearer_env, `enabled`/`type` dropped).
-    expect(written.linear).toEqual({
-      transport: 'http',
-      url: 'https://new',
-      auth: { bearer_env: 'LINEAR_TOKEN' },
-    });
-  });
+    const before = readFileSync(join(dir, 'mcp', 'servers.yaml'));
 
-  it('round-trips: compile(syncBack(drift)) reproduces the drifted value (stable)', async () => {
-    const dir = envWithServers('linear:\n  type: remote\n  url: https://old\n  enabled: true\n');
-    const drifted: JsonValue = {
+    const out = await report(dir, 'linear', {
       type: 'remote',
       url: 'https://new',
       enabled: true,
       headers: { Authorization: 'Bearer {env:LINEAR_TOKEN}' },
-    };
-    const mutations = await opencodeAdapter.syncBackConfigKeys!(
-      MCP_SURFACE,
-      { style: 'keyed', keyPath: ['mcp', 'linear'], canonicalValue: drifted },
-      { envContentDir: dir, projectRoot: null },
-    );
-    writeFileSync(join(dir, 'mcp', 'servers.yaml'), mutations[0]!.content);
-    const recompiled = await opencodeAdapter.compileConfigKeys(MCP_SURFACE, {
-      envContentDir: dir,
-      projectRoot: null,
     });
-    const inj = recompiled.find((i) => i.style === 'keyed' && i.keyPath[1] === 'linear')!;
-    if (inj.style !== 'keyed') throw new Error('unreachable');
-    expect(inj.value).toEqual(drifted);
-    expect(inj.secretFields).toEqual({ 'headers.Authorization': 'Bearer {env:LINEAR_TOKEN}' });
+
+    expect(out!.entry).toBe('linear');
+    expect(out!.storeRelativePath).toBe(join('mcp', 'servers.yaml'));
+    // The canonical entry had no `auth` at all, so the whole subtree is the addition —
+    // a report names the parent when the parent itself is new, and the LEAF when only
+    // one key inside an existing object changed.
+    expect(driftKinds(out)).toEqual({ url: 'changed', auth: 'added' });
+    expect(JSON.stringify(out)).not.toContain('keep');
+    expect(readFileSync(join(dir, 'mcp', 'servers.yaml')).equals(before)).toBe(true);
   });
 
-  it("does not mangle Cursor's ${env:VAR} into $${VAR} on write-back (F5/9)", async () => {
-    // A `servers.yaml` written by a pre-F1 Cursor drift sweep still holds Cursor's
-    // `${env:VAR}`. OpenCode's compile leaves it alone (its own syntax is `{env:VAR}`),
-    // so it reaches the write-back — where a `{env:…}` regex without a `$` guard also
-    // matched the INNER braces and produced `$${VAR}`, which no harness interpolates.
-    const dir = envWithServers('gh:\n  transport: stdio\n  command: gh-mcp\n');
-    const mutations = await opencodeAdapter.syncBackConfigKeys!(
-      MCP_SURFACE,
-      {
-        style: 'keyed',
-        keyPath: ['mcp', 'gh'],
-        canonicalValue: {
-          type: 'local',
-          command: ['gh-mcp'],
-          enabled: true,
-          env: { CURSOR_STYLE: '${env:GH_TOKEN}', OPENCODE_STYLE: '{env:GH_TOKEN}' },
-        },
-      },
-      { envContentDir: dir, projectRoot: null },
+  it("does not mistake Cursor's ${env:VAR} for one of its own placeholders (F5/9)", async () => {
+    // A `servers.yaml` may hold Cursor's `${env:VAR}` (another harness authored it).
+    // OpenCode's compile leaves it alone — its own syntax is `{env:VAR}` — so it reaches
+    // the classifier, where a `{env:…}` regex without a `$` guard also matched the INNER
+    // braces and produced `$${VAR}`, reporting a change the user never made.
+    const dir = envWithServers(
+      'gh:\n  transport: stdio\n  command: gh-mcp\n  env:\n    CURSOR_STYLE: "${env:GH_TOKEN}"\n',
     );
-    const written = parseYaml(mutations[0]!.content) as Record<string, JsonValue>;
-    const env = (written.gh as Record<string, JsonValue>).env as Record<string, JsonValue>;
-    expect(env.CURSOR_STYLE).toBe('${env:GH_TOKEN}'); // left alone, NOT '$${GH_TOKEN}'
-    expect(env.OPENCODE_STYLE).toBe('${GH_TOKEN}'); // OpenCode's own form still converts
+    const out = await report(dir, 'gh', {
+      type: 'local',
+      command: ['gh-mcp'],
+      enabled: true,
+      env: { CURSOR_STYLE: '${env:GH_TOKEN}' },
+    });
+    expect(driftKinds(out)).toEqual({}); // nothing canonical differs
   });
 
-  it('ignores a non-mcp / non-keyed drift (instructions array-element carries no drift)', async () => {
-    const out = await opencodeAdapter.syncBackConfigKeys!(
+  it('returns null for a non-mcp / non-keyed drift (instructions carry no drift)', async () => {
+    const out = await opencodeAdapter.describeConfigKeysDrift!(
       INSTR_SURFACE,
       { style: 'array-element', keyPath: ['instructions'], canonicalValue: '/some/path.md' },
       { envContentDir: tmp(), projectRoot: null },
     );
-    expect(out).toEqual([]);
+    expect(out).toBeNull();
   });
 });
 

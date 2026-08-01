@@ -1,34 +1,38 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parse as parseYaml } from 'yaml';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { Adapter, ConfigKeysSurface } from '../src/adapter.js';
+import type { Adapter, ConfigKeysDriftReport, ConfigKeysSurface } from '../src/adapter.js';
 import { claudeAdapter } from '../src/adapters/claude.js';
 import { codexAdapter } from '../src/adapters/codex.js';
 import { cursorAdapter } from '../src/adapters/cursor.js';
 import { opencodeAdapter } from '../src/adapters/opencode.js';
 import type { JsonValue } from '../src/config-keys.js';
+import { driftKinds } from './helpers.js';
 
 /**
- * F6/3+4 (SECURITY) — an `Authorization` header that does NOT unambiguously correspond to
- * canonical `auth.bearer_env` is an AMBIGUOUS drift. agentenv must not keep it, must not
- * drop it, and must not guess: it leaves canonical `auth` UNCHANGED and warns.
+ * SECURITY — an `Authorization` header that does NOT unambiguously correspond to canonical
+ * `auth.bearer_env` is an AMBIGUOUS drift. Under the v1 contract nothing is written either
+ * way, so the question is what the report SAYS: it must point at `auth.bearer_env`, say
+ * plainly that agentenv cannot tell what the edit meant, and name the env VAR — never a
+ * credential value.
  *
- * Round 2 guessed in both directions, and both guesses were unsafe:
+ * The two unsafe guesses an earlier round made are the reason this must never be resolved
+ * automatically:
  *
  *  - replacing a `Bearer ${OLD}` header with something else KEPT `auth.bearer_env: OLD`
  *    alongside the new header. `shapeCodexServer` maps `auth.bearer_env` →
- *    `bearer_token_env_var` unconditionally, so Codex went on authenticating with the
- *    token the user believed they had just revoked — in a harness they were not looking at.
+ *    `bearer_token_env_var` unconditionally, so Codex went on authenticating with the token
+ *    the user believed they had just revoked — in a harness they were not looking at.
  *  - deleting a SHADOWING header (a `Basic` one, say) silently dropped an unrelated
- *    `auth.bearer_env` the user never saw, because `hadAuthorization` was treated as a
- *    statement about `auth`.
+ *    `auth.bearer_env` the user never saw.
+ *
+ * Both are now the user's call, made with the report in front of them.
  */
 
 const tmps: string[] = [];
 function tmp(): string {
-  const d = mkdtempSync(join(tmpdir(), 'agentenv-wbauth-'));
+  const d = mkdtempSync(join(tmpdir(), 'agentenv-drift-auth-'));
   tmps.push(d);
   return d;
 }
@@ -59,27 +63,32 @@ async function compileOne(adapter: Adapter, yaml: string, name: string): Promise
   return hit.value;
 }
 
-interface Folded {
-  def: Record<string, JsonValue>;
-  warnings: string[];
-}
-
-async function foldOne(
+/** Classify one drifted harness value; assert `servers.yaml` came through untouched. */
+async function describeOne(
   adapter: Adapter,
   yaml: string,
   name: string,
   harnessValue: JsonValue,
-): Promise<Folded> {
+): Promise<ConfigKeysDriftReport> {
   const dir = envWith(yaml);
   const surface = mcpSurface(adapter);
-  const warnings: string[] = [];
-  const mutations = await adapter.syncBackConfigKeys!(
+  const storeFile = join(dir, 'mcp', 'servers.yaml');
+  const before = readFileSync(storeFile);
+  const report = await adapter.describeConfigKeysDrift!(
     surface,
     { style: 'keyed', keyPath: [...surface.keyPath, name], canonicalValue: harnessValue },
-    { envContentDir: dir, projectRoot: null, onWarn: (m) => warnings.push(m) },
+    { envContentDir: dir, projectRoot: null },
   );
-  const all = parseYaml(mutations[0]!.content) as Record<string, Record<string, JsonValue>>;
-  return { def: all[name]!, warnings };
+  expect(readFileSync(storeFile).equals(before)).toBe(true);
+  return report!;
+}
+
+/** Every note in a report, joined — what the user actually reads about an ambiguity. */
+function notes(report: ConfigKeysDriftReport): string {
+  return report.changes
+    .map((c) => c.note ?? '')
+    .filter((n) => n !== '')
+    .join('\n');
 }
 
 function obj(v: JsonValue): Record<string, JsonValue> {
@@ -119,7 +128,7 @@ function placeholder(adapter: Adapter, name: string): string {
 const HEADER_ADAPTERS: Adapter[] = [claudeAdapter, cursorAdapter, opencodeAdapter];
 
 // ---------------------------------------------------------------------------
-// F6/3 — replacing a bearer header must NOT leave the old credential live
+// Replacing a bearer header is AMBIGUOUS — reported as such, never resolved
 // ---------------------------------------------------------------------------
 
 const PRIOR_BEARER =
@@ -129,31 +138,34 @@ const PRIOR_BEARER =
   '  auth:\n' +
   '    bearer_env: OLD_TOKEN\n';
 
-describe('F6/3: replacing a bearer credential is AMBIGUOUS, never a silent keep', () => {
+describe('replacing a bearer credential is reported as ambiguous', () => {
   for (const adapter of HEADER_ADAPTERS) {
-    it(`${adapter.id}: a non-bearer replacement leaves auth unchanged AND warns`, async () => {
+    it(`${adapter.id}: a non-bearer replacement is flagged against auth.bearer_env`, async () => {
       const compiled = obj(await compileOne(adapter, PRIOR_BEARER, 'linear'));
       const replaced = withAuthorization(
         adapter,
         compiled,
         `Basic ${placeholder(adapter, 'NEW_CREDS')}`,
       );
-      const { def, warnings } = await foldOne(adapter, PRIOR_BEARER, 'linear', replaced);
+      const report = await describeOne(adapter, PRIOR_BEARER, 'linear', replaced);
 
-      // Unchanged — agentenv does not decide whether this was a revocation.
-      expect(def.auth).toEqual({ bearer_env: 'OLD_TOKEN' });
-      // …but the user is TOLD, by server name and field, so they can act.
-      expect(warnings.join('\n')).toMatch(/linear/);
-      expect(warnings.join('\n')).toMatch(/auth/i);
-      expect(warnings.join('\n')).toMatch(/OLD_TOKEN/);
-      // The warning must never carry the header value itself.
-      expect(warnings.join('\n')).not.toMatch(/NEW_CREDS/);
+      // agentenv does not decide whether this was a revocation — it says so, by field.
+      expect(driftKinds(report)).toEqual({
+        headers: 'added',
+        'auth.bearer_env': 'changed (noted)',
+      });
+      expect(report.entry).toBe('linear');
+      expect(notes(report)).toMatch(/cannot tell/);
+      expect(notes(report)).toMatch(/OLD_TOKEN/); // the env VAR name is safe to print
+      // The report must never carry the header value itself.
+      expect(JSON.stringify(report)).not.toMatch(/NEW_CREDS/);
     });
   }
 
-  it('codex refuses to reuse a bearer that an Authorization header shadows', async () => {
-    // The canonical entry that F6/3 produces: a live `auth.bearer_env` PLUS a header the
-    // user just wrote. Codex must not go on sending the old token behind their back.
+  it('codex refuses to compile a bearer that an Authorization header shadows', async () => {
+    // The canonical entry this ambiguity leaves behind: a live `auth.bearer_env` PLUS a
+    // header the user just wrote. Codex must not go on sending the old token behind their
+    // back while they decide.
     const shadowed =
       'linear:\n' +
       '  transport: http\n' +
@@ -167,7 +179,7 @@ describe('F6/3: replacing a bearer credential is AMBIGUOUS, never a silent keep'
     expect(compiled.http_headers).toEqual({ Authorization: 'Basic ${NEW_CREDS}' });
   });
 
-  it('a bearer VAR RENAME is unambiguous and still propagates', async () => {
+  it('a bearer VAR RENAME is unambiguous and reported plainly', async () => {
     for (const adapter of HEADER_ADAPTERS) {
       const compiled = obj(await compileOne(adapter, PRIOR_BEARER, 'linear'));
       const renamed = withAuthorization(
@@ -175,33 +187,32 @@ describe('F6/3: replacing a bearer credential is AMBIGUOUS, never a silent keep'
         compiled,
         `Bearer ${placeholder(adapter, 'NEW_TOKEN')}`,
       );
-      const { def, warnings } = await foldOne(adapter, PRIOR_BEARER, 'linear', renamed);
-      expect(def.auth).toEqual({ bearer_env: 'NEW_TOKEN' });
-      expect(def.headers).toBeUndefined();
-      expect(warnings).toEqual([]);
+      const report = await describeOne(adapter, PRIOR_BEARER, 'linear', renamed);
+      expect(driftKinds(report)).toEqual({ 'auth.bearer_env': 'changed' });
     }
   });
 
-  it('DELETING an unshadowed bearer header is unambiguous and still removes auth', async () => {
+  it('DELETING an unshadowed bearer header is unambiguous and reported as a removal', async () => {
     for (const adapter of HEADER_ADAPTERS) {
       const compiled = obj(await compileOne(adapter, PRIOR_BEARER, 'linear'));
       const removed = withAuthorization(adapter, compiled, undefined);
-      const { def, warnings } = await foldOne(adapter, PRIOR_BEARER, 'linear', removed);
-      expect(def.auth).toBeUndefined();
-      expect(warnings).toEqual([]);
+      expect(driftKinds(await describeOne(adapter, PRIOR_BEARER, 'linear', removed))).toEqual({
+        auth: 'removed',
+      });
     }
   });
 
-  it('an UNTOUCHED bearer header round-trips with no warning', async () => {
+  it('an UNTOUCHED bearer header is not reported at all', async () => {
     for (const adapter of HEADER_ADAPTERS) {
       const compiled = obj(await compileOne(adapter, PRIOR_BEARER, 'linear'));
-      const { def, warnings } = await foldOne(adapter, PRIOR_BEARER, 'linear', {
-        ...compiled,
-        url: 'https://mcp.linear.app/mcp?v=2',
-      });
-      expect(def.auth).toEqual({ bearer_env: 'OLD_TOKEN' });
-      expect(def.headers).toBeUndefined();
-      expect(warnings).toEqual([]);
+      expect(
+        driftKinds(
+          await describeOne(adapter, PRIOR_BEARER, 'linear', {
+            ...compiled,
+            url: 'https://mcp.linear.app/mcp?v=2',
+          }),
+        ),
+      ).toEqual({ url: 'changed' });
     }
   });
 
@@ -214,15 +225,15 @@ describe('F6/3: replacing a bearer credential is AMBIGUOUS, never a silent keep'
         compiled,
         `Bearer ${placeholder(adapter, 'FRESH_TOKEN')}`,
       );
-      const { def, warnings } = await foldOne(adapter, priorNoAuth, 'plain', added);
-      expect(def.auth).toEqual({ bearer_env: 'FRESH_TOKEN' });
-      expect(warnings).toEqual([]);
+      expect(driftKinds(await describeOne(adapter, priorNoAuth, 'plain', added))).toEqual({
+        auth: 'added',
+      });
     }
   });
 });
 
 // ---------------------------------------------------------------------------
-// F6/4 — deleting a SHADOWING header must not silently drop an unrelated auth
+// Touching a SHADOWING header says nothing reliable about auth
 // ---------------------------------------------------------------------------
 
 const PRIOR_SHADOWED =
@@ -234,52 +245,60 @@ const PRIOR_SHADOWED =
   '  headers:\n' +
   '    Authorization: "Basic ${SHADOW_BASIC}"\n';
 
-describe('F6/4: touching a SHADOWING header says nothing about auth', () => {
+describe('touching a SHADOWING header is reported as ambiguous, not as an auth removal', () => {
   for (const adapter of [...HEADER_ADAPTERS, codexAdapter]) {
-    it(`${adapter.id}: deleting it leaves auth unchanged AND warns`, async () => {
+    it(`${adapter.id}: deleting it flags auth.bearer_env rather than dropping it`, async () => {
       const compiled = obj(await compileOne(adapter, PRIOR_SHADOWED, 'shadow'));
       const removed = withAuthorization(adapter, compiled, undefined);
-      const { def, warnings } = await foldOne(adapter, PRIOR_SHADOWED, 'shadow', removed);
-      expect(def.auth).toEqual({ bearer_env: 'SHADOW_TOKEN' });
-      expect(warnings.join('\n')).toMatch(/shadow/);
-      expect(warnings.join('\n')).toMatch(/SHADOW_TOKEN/);
-      expect(warnings.join('\n')).not.toMatch(/SHADOW_BASIC/);
+      const report = await describeOne(adapter, PRIOR_SHADOWED, 'shadow', removed);
+      expect(driftKinds(report)).toEqual({
+        headers: 'removed',
+        'auth.bearer_env': 'changed (noted)',
+      });
+      expect(notes(report)).toMatch(/SHADOW_TOKEN/);
+      // The shadowing header's own placeholder is a value — never echoed.
+      expect(JSON.stringify(report)).not.toMatch(/SHADOW_BASIC/);
     });
 
-    it(`${adapter.id}: leaving it alone keeps auth and stays quiet`, async () => {
+    it(`${adapter.id}: leaving it alone reports nothing about auth`, async () => {
       const compiled = obj(await compileOne(adapter, PRIOR_SHADOWED, 'shadow'));
-      const { def, warnings } = await foldOne(adapter, PRIOR_SHADOWED, 'shadow', {
-        ...compiled,
-        url: 'https://shadow.example.com/mcp?v=2',
-      });
-      expect(def.auth).toEqual({ bearer_env: 'SHADOW_TOKEN' });
-      expect(def.headers).toEqual({ Authorization: 'Basic ${SHADOW_BASIC}' });
-      expect(warnings).toEqual([]);
+      expect(
+        driftKinds(
+          await describeOne(adapter, PRIOR_SHADOWED, 'shadow', {
+            ...compiled,
+            url: 'https://shadow.example.com/mcp?v=2',
+          }),
+        ),
+      ).toEqual({ url: 'changed' });
     });
   }
 });
 
 // ---------------------------------------------------------------------------
-// Codex's own exact mapping is unaffected
+// Codex's own exact mapping stays exact
 // ---------------------------------------------------------------------------
 
 describe('codex `bearer_token_env_var` remains an exact, unambiguous mapping', () => {
-  it('removing it removes canonical auth', async () => {
+  it('removing it is reported as an auth removal, with no caveat', async () => {
     const compiled = obj(await compileOne(codexAdapter, PRIOR_BEARER, 'linear'));
     expect(compiled.bearer_token_env_var).toBe('OLD_TOKEN');
-    const { def, warnings } = await foldOne(codexAdapter, PRIOR_BEARER, 'linear', {
-      url: 'https://mcp.linear.app/mcp',
-    });
-    expect(def.auth).toBeUndefined();
-    expect(warnings).toEqual([]);
+    expect(
+      driftKinds(
+        await describeOne(codexAdapter, PRIOR_BEARER, 'linear', {
+          url: 'https://mcp.linear.app/mcp',
+        }),
+      ),
+    ).toEqual({ auth: 'removed' });
   });
 
-  it('renaming it renames canonical auth', async () => {
-    const { def, warnings } = await foldOne(codexAdapter, PRIOR_BEARER, 'linear', {
-      url: 'https://mcp.linear.app/mcp',
-      bearer_token_env_var: 'NEW_TOKEN',
-    });
-    expect(def.auth).toEqual({ bearer_env: 'NEW_TOKEN' });
-    expect(warnings).toEqual([]);
+  it('renaming it is reported as a bearer_env change, with no caveat', async () => {
+    expect(
+      driftKinds(
+        await describeOne(codexAdapter, PRIOR_BEARER, 'linear', {
+          url: 'https://mcp.linear.app/mcp',
+          bearer_token_env_var: 'NEW_TOKEN',
+        }),
+      ),
+    ).toEqual({ 'auth.bearer_env': 'changed' });
   });
 });

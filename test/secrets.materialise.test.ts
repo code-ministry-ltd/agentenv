@@ -16,11 +16,11 @@ import { makeTempHome, type TempHome } from './helpers.js';
  *
  *  - 7a SUBSTITUTE rung (fixture adapter, `substitutePlaceholders`): a fake token
  *    in secrets.env is substituted into the REAL config as a literal; a mid-session
- *    edit + write-back leaves the STORE holding the `${VAR}` placeholder, never the
- *    token.
+ *    edit is REPORTED and the STORE is untouched, so it still holds the `${VAR}`
+ *    placeholder and never the token.
  *  - 7b PASSTHROUGH rung (Claude): the user bakes a literal token over a `${VAR}`
- *    placeholder in the real `.claude.json`; write-back restores the placeholder to
- *    the store, never the literal.
+ *    placeholder in the real `.claude.json`; the store keeps the indirection, never
+ *    the literal.
  *
  * Plus the fail-closed-per-server path: an unresolved `${VAR}` on a substitute
  * surface warns and skips only that server, leaving the rest materialised.
@@ -96,21 +96,25 @@ describe('secrets materialise 7a: substitute rung keeps the token out of the sto
     );
 
     // The user edits the harness config mid-session (a non-secret change → drift).
+    const storeFile = join(paths.envDir('work'), 'mcp', 'servers.yaml');
+    const storeBefore = readFileSync(storeFile);
     cfg.mcpServers.github.command = 'mcp-server-github-v2';
     writeFileSync(join(realRoot, 'config.json'), `${JSON.stringify(cfg, null, 2)}\n`);
 
-    // Next invocation runs the drift sweep → write-back to the store.
+    // Next invocation runs the drift sweep → the edit is REPORTED, never applied.
     const again = await run(['use', 'work', '--global'], opts);
     expect(again.code).toBe(0);
+    expect(again.stderr).toContain("'github'");
+    expect(again.stderr).toMatch(/changed\s+command/);
 
-    // STORE DIFF: the edit persisted, but the secret is the PLACEHOLDER, not the token.
-    const storeYaml = readFileSync(join(paths.envDir('work'), 'mcp', 'servers.yaml'), 'utf8');
-    expect(storeYaml).toContain('${FAKE_TOKEN}');
-    expect(storeYaml).toContain('mcp-server-github-v2');
-    expect(storeYaml).not.toContain(FAKE_TOKEN);
+    // STORE: byte-identical. The substitute rung's literal cannot reach it, because the
+    // sweep does not write it at all — the placeholder stands until the user edits it.
+    expect(readFileSync(storeFile).equals(storeBefore)).toBe(true);
+    expect(readFileSync(storeFile, 'utf8')).toContain('${FAKE_TOKEN}');
 
-    // The token literal appears in NO store commit and NO working-tree file.
+    // The token literal appears in NO store commit, NO working-tree file, and no report.
     expect(storeHistoryAndTree(paths.store)).not.toContain(FAKE_TOKEN);
+    expect(again.stderr ?? '').not.toContain(FAKE_TOKEN);
   });
 });
 

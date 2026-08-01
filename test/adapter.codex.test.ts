@@ -1,11 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parse as parseYaml } from 'yaml';
 import { afterEach, describe, expect, it } from 'vitest';
 import { validateAdapter, type ConfigKeysSurface, type SelfCheckContext } from '../src/adapter.js';
 import { codexAdapter } from '../src/adapters/codex.js';
 import type { JsonValue } from '../src/config-keys.js';
+import { driftKinds } from './helpers.js';
 
 const tmps: string[] = [];
 function tmp(): string {
@@ -230,87 +230,66 @@ describe('adapter.codex — compileConfigKeys (MCP → native indirections, D6)'
   });
 });
 
-describe('adapter.codex — syncBackConfigKeys (criterion 4, D6-canonical)', () => {
-  it('folds one drifted Codex server back into servers.yaml canonical shape, siblings intact', async () => {
+describe('adapter.codex — describeConfigKeysDrift (report only, store untouched)', () => {
+  /** Classify one drifted Codex table against the env's canonical servers.yaml. */
+  function report(dir: string, name: string, value: JsonValue) {
+    return codexAdapter.describeConfigKeysDrift!(
+      MCP_SURFACE,
+      { style: 'keyed', keyPath: ['mcp_servers', name], canonicalValue: value },
+      { envContentDir: dir, projectRoot: null },
+    );
+  }
+
+  it('names the canonical fields that differ, translating the native indirections away', async () => {
     const dir = envWithServers(
       'keep:\n  transport: stdio\n  command: keep-cmd\nlinear:\n  transport: http\n  url: https://old\n',
     );
-    const mutations = await codexAdapter.syncBackConfigKeys!(
-      MCP_SURFACE,
-      {
-        style: 'keyed',
-        keyPath: ['mcp_servers', 'linear'],
-        canonicalValue: { url: 'https://new', bearer_token_env_var: 'LINEAR_TOKEN' },
-      },
-      { envContentDir: dir, projectRoot: null },
-    );
-    expect(mutations).toHaveLength(1);
-    expect(mutations[0]!.storeRelativePath).toBe(join('mcp', 'servers.yaml'));
-    const written = parseYaml(mutations[0]!.content) as Record<string, JsonValue>;
-    // Sibling preserved verbatim.
-    expect(written.keep).toEqual({ transport: 'stdio', command: 'keep-cmd' });
-    // Drifted server reverse-mapped to canonical D6 (bearer_token_env_var → auth.bearer_env).
-    expect(written.linear).toEqual({
-      transport: 'http',
+    const before = readFileSync(join(dir, 'mcp', 'servers.yaml'));
+
+    // `bearer_token_env_var` is Codex's native, EXACT bearer indirection → auth.bearer_env.
+    const out = await report(dir, 'linear', {
       url: 'https://new',
-      auth: { bearer_env: 'LINEAR_TOKEN' },
+      bearer_token_env_var: 'LINEAR_TOKEN',
     });
+
+    expect(out!.entry).toBe('linear');
+    expect(out!.storeRelativePath).toBe(join('mcp', 'servers.yaml'));
+    // The canonical entry had no `auth` at all, so the whole subtree is the addition —
+    // a report names the parent when the parent itself is new, and the LEAF when only
+    // one key inside an existing object changed.
+    expect(driftKinds(out)).toEqual({ url: 'changed', auth: 'added' });
+    expect(JSON.stringify(out)).not.toContain('keep');
+    expect(readFileSync(join(dir, 'mcp', 'servers.yaml')).equals(before)).toBe(true);
   });
 
-  it('reverse-maps env_vars/env_http_headers to canonical ${VAR} placeholders', async () => {
-    const dir = envWithServers('placeholder:\n  transport: stdio\n  command: c\n');
-    const stdioMut = await codexAdapter.syncBackConfigKeys!(
-      MCP_SURFACE,
-      {
-        style: 'keyed',
-        keyPath: ['mcp_servers', 'gh'],
-        canonicalValue: { command: 'npx', env_vars: ['GITHUB_TOKEN'] },
-      },
-      { envContentDir: dir, projectRoot: null },
+  it('reports env_vars / env_http_headers under their CANONICAL field names', async () => {
+    // The user must be told to edit `env.EXTRA` / `headers.X-New` in servers.yaml, not
+    // Codex's `env_vars` / `env_http_headers` — those key paths do not exist there.
+    const dir = envWithServers(
+      'gh:\n  transport: stdio\n  command: npx\n  env:\n    GITHUB_TOKEN: "${GITHUB_TOKEN}"\n' +
+        'x:\n  transport: http\n  url: https://x\n  headers:\n    X-Api-Key: "${API_KEY}"\n',
     );
-    const gh = (parseYaml(stdioMut[0]!.content) as Record<string, JsonValue>).gh;
-    expect(gh).toEqual({ transport: 'stdio', command: 'npx', env: { GITHUB_TOKEN: '${GITHUB_TOKEN}' } });
-
-    const httpMut = await codexAdapter.syncBackConfigKeys!(
-      MCP_SURFACE,
-      {
-        style: 'keyed',
-        keyPath: ['mcp_servers', 'x'],
-        canonicalValue: { url: 'https://x', env_http_headers: { 'X-Api-Key': 'API_KEY' } },
-      },
-      { envContentDir: dir, projectRoot: null },
-    );
-    const x = (parseYaml(httpMut[0]!.content) as Record<string, JsonValue>).x;
-    expect(x).toEqual({ transport: 'http', url: 'https://x', headers: { 'X-Api-Key': '${API_KEY}' } });
+    expect(
+      driftKinds(await report(dir, 'gh', { command: 'npx', env_vars: ['GITHUB_TOKEN', 'EXTRA'] })),
+    ).toEqual({ 'env.EXTRA': 'added' });
+    expect(
+      driftKinds(
+        await report(dir, 'x', {
+          url: 'https://x',
+          env_http_headers: { 'X-Api-Key': 'API_KEY', 'X-New': 'NEW_VAR' },
+        }),
+      ),
+    ).toEqual({ 'headers.X-New': 'added' });
   });
 
-  it('ignores a drifted trust entry (launch-derived, never persisted to the store)', async () => {
+  it('ignores a drifted trust entry (launch-derived, no canonical counterpart)', async () => {
     const dir = envWithServers('a:\n  transport: stdio\n  command: a\n');
-    const mutations = await codexAdapter.syncBackConfigKeys!(
+    const out = await codexAdapter.describeConfigKeysDrift!(
       MCP_SURFACE,
       { style: 'keyed', keyPath: ['projects', '/repo'], canonicalValue: { trust_level: 'trusted' } },
       { envContentDir: dir, projectRoot: null },
     );
-    expect(mutations).toEqual([]);
-  });
-
-  it('round-trips: compile(syncBack(codexDrift)) reproduces the drifted value (stable)', async () => {
-    const dir = envWithServers('linear:\n  transport: http\n  url: https://old\n');
-    // A Codex-shaped drift value (what actually lives in config.toml).
-    const drifted: JsonValue = { url: 'https://new', bearer_token_env_var: 'LINEAR_TOKEN' };
-    const mutations = await codexAdapter.syncBackConfigKeys!(
-      MCP_SURFACE,
-      { style: 'keyed', keyPath: ['mcp_servers', 'linear'], canonicalValue: drifted },
-      { envContentDir: dir, projectRoot: null },
-    );
-    writeFileSync(join(dir, 'mcp', 'servers.yaml'), mutations[0]!.content);
-    const recompiled = await codexAdapter.compileConfigKeys(MCP_SURFACE, {
-      envContentDir: dir,
-      projectRoot: null,
-    });
-    const inj = recompiled.find((i) => i.style === 'keyed' && i.keyPath[1] === 'linear')!;
-    if (inj.style !== 'keyed') throw new Error('unreachable');
-    expect(inj.value).toEqual(drifted);
+    expect(out).toBeNull();
   });
 });
 

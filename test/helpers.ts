@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { expect } from 'vitest';
+import type { ConfigKeysDriftReport } from '../src/adapter.js';
 
 /** A hermetic temp AGENTENV_HOME plus the env object to inject into run(). */
 export interface TempHome {
@@ -200,4 +201,16 @@ export function makeFixtureRepo(): FixtureRepo {
     git,
     cleanup: () => rmSync(dir, { recursive: true, force: true }),
   };
+}
+
+/**
+ * A drift report's changes as `field → kind` — the readable form for assertions, and a
+ * deliberate reminder of the contract: a report holds NAMES and KINDS, never values.
+ * A change carrying a `note` renders as `<kind> (noted)` so a test can assert that the
+ * classifier flagged the field as ambiguous without pinning the prose.
+ */
+export function driftKinds(report: ConfigKeysDriftReport | null): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const c of report?.changes ?? []) out[c.field] = c.note ? `${c.kind} (noted)` : c.kind;
+  return out;
 }
