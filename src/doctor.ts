@@ -305,7 +305,13 @@ async function detectReserialisedConfig(manifest: StateManifest): Promise<Doctor
         kind: 'reserialised-config',
         where: `${item.path} (${item.key ?? ''})`,
         what: `could not parse ${item.path} to check owned key '${item.key ?? ''}': ${(err as Error).message}`,
-        repair: 'reconcile by parse once the file parses again',
+        // The one problem in this file that `--repair` deliberately cannot act on:
+        // reconciliation is BY PARSE, so a file that does not parse can only be
+        // fixed by a human (or by restoring a backup). Say so plainly rather than
+        // promising a repair that will never come.
+        repair:
+          'NOT repairable automatically — agentenv will not guess at a config it cannot parse. ' +
+          "Fix the file by hand (or 'agentenv doctor --restore <backup>'), then re-run 'agentenv doctor --repair'",
       });
       continue;
     }
@@ -496,6 +502,14 @@ async function repairRegionStoreDrift(
  * the owned value and, on drift, writes it back with secret-flagged fields restored
  * to their `${VAR}` placeholders (never the literal, D6) and the record's hash
  * brought into agreement — so the file, the record, and the store all match again.
+ *
+ * A key whose FILE cannot be read or parsed is SKIPPED, not thrown on (Task 5.1).
+ * Reconciliation is by parse, so such a file is genuinely unrepairable here — but
+ * `doctor --repair` is the one command whose whole job is broken states, and
+ * letting the parse error escape killed the entire run with a stack trace, taking
+ * every OTHER surface's fix down with it. Nothing has been mutated when `syncBack`
+ * throws (it parses before it journals), so skipping is safe; the closing re-scan
+ * re-reports the key with guidance naming it as needing a human.
  */
 async function repairReserialisedConfig(
   paths: Paths,
@@ -508,7 +522,12 @@ async function repairReserialisedConfig(
     const tx = await beginTransaction(paths);
     try {
       for (const item of items) {
-        const sync = await cfgSyncBack(paths, tx, item);
+        let sync;
+        try {
+          sync = await cfgSyncBack(paths, tx, item);
+        } catch {
+          continue;
+        }
         if (sync.drifted) {
           actions.push(`reconciled reserialised config key '${item.key ?? ''}' in ${item.path}`);
         }
