@@ -200,9 +200,9 @@ function toCommandArray(command: JsonValue | undefined, args: JsonValue | undefi
 
 /**
  * Shape one canonical `mcp/servers.yaml` server (D6) into OpenCode's `opencode.json`
- * `mcp.<name>` object. `servers.yaml` is ALWAYS D6-canonical (F1: every adapter's
- * {@link syncBackConfigKeys} writes canonical, never its harness shape), so the input
- * normally carries `transport`.
+ * `mcp.<name>` object. `servers.yaml` is ALWAYS D6-canonical — agentenv never writes a
+ * harness shape into it, because drift is REPORTED rather than applied
+ * ({@link Adapter.describeConfigKeysDrift}) — so the input normally carries `transport`.
  *
  * A HAND-AUTHORED harness-shaped entry is still honoured: `type` is the transport hint
  * when there is no `transport` (so `{ type: sse, url }` compiles to a remote server
@@ -358,7 +358,7 @@ function unshapeOpenCodeServer(
   // would poison the store with BOTH shapes (a duplicated arg, a harness `type`) (F6/9).
   const conflicting = hasConflictingDiscriminators(canon, OPENCODE_SHAPER_TYPES);
   if (typeof canon.transport === 'string' && !conflicting) return passthroughUnshape(canon, prior);
-  if (conflicting) noteConflictingTransport(ctx, canon.transport as string, canon.type as string);
+  if (conflicting) noteConflictingTransport(ctx, canon.type as string);
 
   const priorDef = isJsonObject(prior) ? prior : undefined;
   const enabled = enabledDrift(canon.enabled, priorDef);

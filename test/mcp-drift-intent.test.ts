@@ -329,7 +329,12 @@ describe('a hand-written canonical `transport` beside a harness `type`', () => {
     expect(driftKinds(report)).toEqual({ transport: 'changed (noted)' });
     const note = report!.changes.find((c) => c.field === 'transport')!.note!;
     expect(note).toMatch(/cannot tell/);
-    expect(note).toMatch(/websocket/);
+    // A report is a VALUE-FREE channel (D6): it names the conflicting fields, never the
+    // drifted value. `type` is safe to echo (it is one of the shaper's own fixed
+    // discriminators); the hand-written `transport` is an arbitrary user string, so it
+    // must not reach stderr — the same reason a diff says `changed url`, not the URLs.
+    expect(note).not.toMatch(/websocket/);
+    expect(note).toMatch(/transport/);
   });
 
   it('claude-code: reports the transport as ambiguous', async () => {

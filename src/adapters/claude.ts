@@ -152,9 +152,9 @@ function collectPlaceholders(value: unknown, prefix: string, out: Record<string,
 
 /**
  * Shape one canonical `mcp/servers.yaml` server (D6) into Claude's `.claude.json`
- * `mcpServers.<name>` object. `servers.yaml` is ALWAYS D6-canonical (F1: every
- * adapter's {@link syncBackConfigKeys} writes canonical, never its harness shape), so
- * the input normally carries `transport`.
+ * `mcpServers.<name>` object. `servers.yaml` is ALWAYS D6-canonical — agentenv never
+ * writes a harness shape into it, because drift is REPORTED rather than applied
+ * ({@link Adapter.describeConfigKeysDrift}) — so the input normally carries `transport`.
  *
  * A HAND-AUTHORED harness-shaped entry (no `transport`, a Claude `type`) is still
  * honoured: `type` is the transport hint, so `{ type: sse, url }` compiles to an SSE
@@ -251,7 +251,7 @@ function unshapeClaudeServer(
   if (typeof def.transport === 'string' && !conflicting) return passthroughUnshape(def, prior);
   // …unless it sits beside a `type` the passthrough would never have written, in which
   // case the two disagree and the transport is unknowable (F6/9).
-  if (conflicting) noteConflictingTransport(ctx, def.transport as string, def.type as string);
+  if (conflicting) noteConflictingTransport(ctx, def.type as string);
 
   // Claude records the http/sse distinction NATIVELY in `type`, so a `type` the user
   // edited must PROPAGATE — preserving the prior canonical transport here would rewrite

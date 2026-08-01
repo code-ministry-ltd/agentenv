@@ -234,17 +234,21 @@ export function hasConflictingDiscriminators(
   );
 }
 
-/** Note a conflicting-discriminator drift: the entry's transport is unknowable (F6/9). */
-export function noteConflictingTransport(
-  ctx: UnshapeContext,
-  transport: string,
-  type: string,
-): void {
+/**
+ * Note a conflicting-discriminator drift: the entry's transport is unknowable (F6/9).
+ *
+ * Names the conflicting FIELDS, never the drifted transport's value. `type` is safe to
+ * echo — {@link hasConflictingDiscriminators} only fires when it is one of the shaper's
+ * own fixed discriminators — but `transport` is an arbitrary user-authored string, and a
+ * report is a value-free channel by construction (D6): it says which field differs, the
+ * same way {@link diffFields} says `changed url` rather than the two URLs.
+ */
+export function noteConflictingTransport(ctx: UnshapeContext, type: string): void {
   ctx.note(
     'transport',
-    `the ${ctx.adapterId} config carries BOTH a canonical transport ('${transport}') and ` +
-      `that harness's own discriminator (type: '${type}'), which disagree — agentenv ` +
-      'cannot tell which you meant',
+    `the ${ctx.adapterId} config carries BOTH a canonical 'transport' and that harness's ` +
+      `own discriminator (type: '${type}'), which disagree — agentenv cannot tell which ` +
+      'you meant',
   );
 }
 

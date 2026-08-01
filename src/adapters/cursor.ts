@@ -189,8 +189,8 @@ function collectPlaceholders(value: unknown, prefix: string, out: Record<string,
  * already-Cursor-shaped entry (no `transport`; `type` present for http/sse, or a bare
  * `command` for stdio) — a HAND-AUTHORED harness-shaped entry keeps its `type` as the
  * transport hint, so `{ type: sse, url }` is not re-inferred to `http` (F5/2A).
- * {@link syncBackConfigKeys} writes the CANONICAL shape back (F1), overlaid on the prior
- * canonical def, and `compile(syncBack(v)) === v` still holds (spec criterion 4).
+ * A harness-side edit is never folded back: {@link Adapter.describeConfigKeysDrift}
+ * reports the differing fields and leaves `mcp/servers.yaml` untouched.
  *
  * Mappings:
  *   stdio → `{ command, args?, env? }`  (Cursor infers stdio from `command`; no `type`)
@@ -294,7 +294,7 @@ function unshapeCursorServer(
   // case the two disagree and the transport is unknowable (F6/9).
   const conflicting = hasConflictingDiscriminators(canon, CURSOR_SHAPER_TYPES);
   if (typeof canon.transport === 'string' && !conflicting) return passthroughUnshape(canon, prior);
-  if (conflicting) noteConflictingTransport(ctx, canon.transport as string, canon.type as string);
+  if (conflicting) noteConflictingTransport(ctx, canon.type as string);
 
   if (canon.command !== undefined && canon.url === undefined) {
     return {
