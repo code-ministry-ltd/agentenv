@@ -1,9 +1,59 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LockError, withLock } from '../src/lock.js';
 import { resolvePaths } from '../src/paths.js';
 import { expectRealHomeUntouched, makeTempHome, guardRealHome } from './helpers.js';
+
+/**
+ * A one-shot barrier that parks an acquirer at the instant the lock file
+ * becomes visible to everyone else.
+ *
+ * `withLock` publishes the lock through `node:fs/promises`, so wrapping that
+ * module is the only seam that can stop time inside the publish itself — and
+ * the publish window is precisely what the mid-publish test is about. Keeping
+ * the seam in the test rather than in {@link withLock} means production code
+ * carries no test-only hook. It is a straight pass-through unless a test arms
+ * it, so every other test in this file sees the real `node:fs/promises`.
+ */
+const publishBarrier = vi.hoisted(() => {
+  let armed: { path: string; parked: () => void; release: Promise<void> } | null = null;
+  return {
+    /** Park the next publish of `path`; `parked()` fires once it is stopped. */
+    arm(path: string, parked: () => void, release: Promise<void>) {
+      armed = { path, parked, release };
+    },
+    disarm() {
+      armed = null;
+    },
+    /** Called after each fs op that makes `path` appear. Parks at most once. */
+    async afterPublishing(path: string): Promise<void> {
+      if (armed === null || armed.path !== path) return;
+      const { parked, release } = armed;
+      armed = null; // one-shot: later publishes (including the waiter's) run free
+      parked();
+      await release;
+    },
+  };
+});
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const real = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...real,
+    // The two ways a lock file can come into existence: an O_EXCL create, or a
+    // hard link from a fully-written temp file.
+    open: async (...args: Parameters<typeof real.open>) => {
+      const handle = await real.open(...args);
+      await publishBarrier.afterPublishing(String(args[0]));
+      return handle;
+    },
+    link: async (...args: Parameters<typeof real.link>) => {
+      await real.link(...args);
+      await publishBarrier.afterPublishing(String(args[1]));
+    },
+  };
+});
 
 /** A promise plus its resolver — the barrier these tests sequence on. */
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -39,6 +89,7 @@ describe('withLock', () => {
   });
 
   afterEach(() => {
+    publishBarrier.disarm(); // a test that threw mid-park must not arm the next
     temp.cleanup();
     expectRealHomeUntouched(realBefore);
   });
@@ -113,6 +164,74 @@ describe('withLock', () => {
     expect(events).toHaveLength(4);
     expect(events[0]!.split(':')[0]).toBe(events[1]!.split(':')[0]);
     expect(events[2]!.split(':')[0]).toBe(events[3]!.split(':')[0]);
+    expect(events[1]).toMatch(/:end$/);
+    expect(events[3]).toMatch(/:end$/);
+  });
+
+  it('never publishes a lock a waiter can read as malformed — no double-entry mid-acquire', async () => {
+    const p = paths();
+    // The window under test: between "the lock path exists" and "the lock path
+    // carries its holder record". A waiter that reads the lock inside that
+    // window sees bytes it cannot parse, judges the lock ownerless, reclaims it
+    // out from under a live acquirer and enters alongside it. The barrier stops
+    // the winner exactly there, so the overlap is forced rather than hoped for.
+    const aPublished = deferred(); // A has made p.lock visible and is parked in it
+    const mayFinish = deferred(); // ...until we let it complete the acquire
+    const bSettled = deferred(); // B is inside, or provably refused entry
+    const contended = deferred(); // frees whichever section is being held open
+    publishBarrier.arm(p.lock, aPublished.resolve, mayFinish.promise);
+
+    const warnings: string[] = [];
+    const events: string[] = [];
+    let inside = 0;
+    let maxInside = 0;
+    const critical = (tag: string) =>
+      withLock(
+        p,
+        async () => {
+          inside += 1;
+          maxInside = Math.max(maxInside, inside);
+          events.push(`${tag}:start`);
+          if (tag === 'B') bSettled.resolve();
+          // Both in at once => no one is left to contend and release the
+          // barrier; free it so this fails on the assertion, not on a timeout.
+          if (inside > 1) contended.resolve();
+          await contended.promise;
+          events.push(`${tag}:end`);
+          inside -= 1;
+        },
+        {
+          pollMs: 5,
+          timeoutMs: 60_000,
+          staleMs: 10_000_000, // age must play no part in this test
+          isProcessAlive: () => {
+            // A liveness probe is one failed acquire: B announcing "I tried and
+            // was refused". That, not a sleep, is what says B has settled.
+            bSettled.resolve();
+            contended.resolve();
+            return true;
+          },
+          onWarn: (m) => warnings.push(m),
+        },
+      );
+
+    const a = critical('A');
+    // Safety nets: a rejection must not park the test on a barrier forever.
+    void a.catch(() => {}).finally(() => aPublished.resolve());
+    await aPublished.promise; // A owns the lock path but has not finished acquiring
+
+    const b = critical('B');
+    void b.catch(() => {}).finally(() => bSettled.resolve());
+    await bSettled.promise; // B has met the half-published lock and reacted
+
+    mayFinish.resolve(); // A completes its acquire and enters its section
+    await Promise.all([a, b]);
+
+    expect(maxInside).toBe(1); // the sections never overlapped
+    expect(warnings).toEqual([]); // an in-flight lock was never judged malformed
+    expect(events).toHaveLength(4);
+    // Whichever ran first completed fully before the other started.
+    expect(events[0]!.split(':')[0]).toBe(events[1]!.split(':')[0]);
     expect(events[1]).toMatch(/:end$/);
     expect(events[3]).toMatch(/:end$/);
   });
