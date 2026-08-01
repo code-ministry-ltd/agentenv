@@ -234,6 +234,14 @@ export interface ConfigKeysContext {
    * project context (e.g. a probe). An adapter keys project-scoped config by it.
    */
   projectRoot: string | null;
+  /**
+   * OPTIONAL user-visible warning channel. A drift write-back that meets a GENUINELY
+   * AMBIGUOUS edit must NOT guess what the user meant: it leaves the canonical field
+   * unchanged and says so here, naming the server and the field (F6). Absent (as in the
+   * compile direction, which has nothing ambiguous to report) the adapter falls back to
+   * `console.warn`, so a warning is never silently swallowed.
+   */
+  onWarn?: (message: string) => void;
 }
 
 /** Outcome of an adapter's launch self-check (D15 fail-closed probe). */

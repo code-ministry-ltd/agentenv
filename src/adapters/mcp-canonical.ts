@@ -21,15 +21,18 @@ import type { JsonValue } from '../config-keys.js';
  *      a field the user adds in the harness config survives into the store;
  *   2. anything the shaper never emitted is preserved from the prior def, because the
  *      harness value could not possibly have contradicted it;
- *   3. `transport` is preserved verbatim from the prior def whenever the drifted entry
- *      is still in the same transport FAMILY — never re-inferred over a value the user
- *      authored (this is the whole fix for the non-injectivity);
- *   4. only the keys a branch is genuinely authoritative for ({@link UnshapedServer.supersedes})
- *      are deleted when the harness value no longer expresses them — that is how a user
- *      DELETING a field in the harness still propagates.
+ *   3. `transport` propagates when the harness expresses the distinction NATIVELY and is
+ *      preserved from the prior def only where the harness shape is genuinely lossy (see
+ *      {@link TransportAuthority});
+ *   4. only the keys a branch genuinely EMITS ({@link UnshapedServer.supersedes}) are
+ *      deleted when the harness value no longer expresses them — that is how a user
+ *      DELETING a field in the harness still propagates, without the remote branch
+ *      claiming authority over `command`/`env` it never wrote.
  *
- * Inference is the fallback for a server with NO prior canonical entry only; there the
- * `http`/`sse` ambiguity is irreducible and resolves to `http` (documented per adapter).
+ * **The overriding rule (F6): where a drift is genuinely AMBIGUOUS, agentenv does not
+ * infer.** It leaves the canonical field unchanged and surfaces a warning naming the
+ * server and the field. A warning the user can act on beats a clever guess that silently
+ * changes what a credential or an endpoint does.
  */
 
 /** Is `v` a plain (non-array) JSON object? */
@@ -47,6 +50,30 @@ export function transportFamily(transport: unknown): TransportFamily {
   return 'bespoke';
 }
 
+/**
+ * How much authority the drifted harness value has over canonical `transport`:
+ *
+ * - `native` — the harness records the distinction ITSELF and the user authored it
+ *   (Claude/Cursor `type: 'sse'|'http'`; any `command`-shaped entry, since `stdio` is
+ *   unambiguous). It PROPAGATES: preserving the prior value here would silently rewrite
+ *   the user's own edit back on the next `use` (F6/1).
+ * - `inferred` — the harness shape is genuinely non-injective (OpenCode's `type:'remote'`
+ *   and Codex's bare `url` table each map from BOTH `http` and `sse`), so the value in
+ *   `fields.transport` is a GUESS. The prior canonical transport wins while the entry
+ *   stays in the same family; only a family change (or no prior at all) writes the guess.
+ * - `verbatim` — the value already carried a canonical `transport` (the shaper's bespoke
+ *   passthrough emitted it), so it IS the user's current value.
+ * - `ambiguous` — the harness value carries CONTRADICTORY discriminators. Never write a
+ *   transport from it: keep the prior one (or none) and warn.
+ */
+export type TransportAuthority = 'native' | 'inferred' | 'verbatim' | 'ambiguous';
+
+/** The canonical keys that belong to ONE transport family and go with it when it changes. */
+const FAMILY_KEYS: Readonly<Record<'stdio' | 'remote', readonly string[]>> = {
+  stdio: ['command', 'args', 'env'],
+  remote: ['url', 'headers', 'auth'],
+};
+
 /** A copy of `value` without `keys` — the harness-only fields an un-shape translates away. */
 export function omitKeys(
   value: Record<string, JsonValue>,
@@ -59,6 +86,27 @@ export function omitKeys(
   return out;
 }
 
+/**
+ * The prior canonical def's effective transport: its explicit `transport`, else a
+ * hand-authored `type` that names a canonical transport (a servers.yaml a user wrote in
+ * harness shape — every shaper honours `type` as the transport hint, so the write-back
+ * must read it the same way rather than treating the entry as transport-less).
+ */
+export function priorTransport(prior: Record<string, JsonValue>): string | undefined {
+  if (typeof prior.transport === 'string') return prior.transport;
+  if (prior.type === 'stdio' || prior.type === 'http' || prior.type === 'sse') return prior.type;
+  return undefined;
+}
+
+/** The prior canonical def's family, inferred from its shape when it names no transport. */
+export function priorFamily(prior: Record<string, JsonValue>): TransportFamily | undefined {
+  const t = priorTransport(prior);
+  if (t !== undefined) return transportFamily(t);
+  if (prior.command !== undefined) return 'stdio';
+  if (prior.url !== undefined) return 'remote';
+  return undefined;
+}
+
 /** One harness value translated towards canonical, ready to overlay onto the prior def. */
 export interface UnshapedServer {
   /**
@@ -67,24 +115,41 @@ export interface UnshapedServer {
    */
   fields: Record<string, JsonValue>;
   /**
-   * The prior-canonical keys this branch is authoritative for. A key listed here and
-   * ABSENT from {@link fields} was deleted by the user in the harness config, so it is
-   * deleted from canonical too. Everything NOT listed survives from the prior def.
+   * The prior-canonical keys THIS BRANCH emits and is therefore authoritative for. A key
+   * listed here and ABSENT from {@link fields} was deleted by the user in the harness
+   * config, so it is deleted from canonical too. Everything NOT listed survives from the
+   * prior def — so a remote branch must NOT list `command`/`args`/`env` (it never writes
+   * them, so their absence says nothing), and a stdio branch must not list `url`/`headers`
+   * (F6/6). A genuine FAMILY change is handled separately by {@link FAMILY_KEYS}.
    */
   supersedes: readonly string[];
-  /** The family the harness value expresses, used to decide whether `transport` survives. */
+  /** The family the harness value expresses (drives the family-change key sweep). */
   family: TransportFamily;
+  /** How far {@link fields}.transport may be trusted — see {@link TransportAuthority}. */
+  transportAuthority: TransportAuthority;
 }
 
 /**
  * The identity un-shape: the harness value IS already canonical-shaped. Every shaper
  * passes a bespoke/unknown transport through untouched, so a harness value that still
  * carries a canonical `transport` came from that passthrough — re-inferring it would
- * destroy the user's authored transport (F1). `supersedes` is empty: a passthrough
- * entry makes no claim about fields it never saw.
+ * destroy the user's authored transport (F1).
+ *
+ * The passthrough shaper emits the def VERBATIM, so it saw (and wrote) every canonical
+ * field: a prior key missing from the harness value really was deleted by the user, and
+ * `supersedes` says so — every prior key (F6/5). Round 2's empty list meant NO deletion
+ * ever propagated for a bespoke entry, contradicting the guarantee it claimed.
  */
-export function passthroughUnshape(def: Record<string, JsonValue>): UnshapedServer {
-  return { fields: { ...def }, supersedes: [], family: transportFamily(def.transport) };
+export function passthroughUnshape(
+  def: Record<string, JsonValue>,
+  prior: unknown,
+): UnshapedServer {
+  return {
+    fields: { ...def },
+    supersedes: isJsonObject(prior) ? Object.keys(prior) : [],
+    family: transportFamily(def.transport),
+    transportAuthority: 'verbatim',
+  };
 }
 
 /**
@@ -93,23 +158,33 @@ export function passthroughUnshape(def: Record<string, JsonValue>): UnshapedServ
  * object (or absent) means there is no prior def and the un-shaped fields stand alone.
  */
 export function overlayCanonicalServer(prior: unknown, unshaped: UnshapedServer): JsonValue {
-  const out: Record<string, JsonValue> = isJsonObject(prior) ? { ...prior } : {};
+  const priorObj = isJsonObject(prior) ? prior : undefined;
+  const out: Record<string, JsonValue> = priorObj ? { ...priorObj } : {};
+
+  // A genuine FAMILY change takes the departed family's exclusive keys with it: a server
+  // that is now remote has no `command`, and one that is now stdio has no `url`/`auth`.
+  // (Within one family this must NOT happen — see UnshapedServer.supersedes.)
+  const from = priorObj ? priorFamily(priorObj) : undefined;
+  if (from !== undefined && from !== 'bespoke' && from !== unshaped.family) {
+    for (const key of FAMILY_KEYS[from]) delete out[key];
+  }
+
   for (const key of unshaped.supersedes) {
     if (!(key in unshaped.fields)) delete out[key];
   }
   Object.assign(out, unshaped.fields);
-  // `shape*` is not injective on transport, so a re-inferred one would silently rewrite
-  // the user's authored value (`sse` → `http`). While the entry is still in the same
-  // family, the prior canonical `transport` is authoritative. A `bespoke` family is
-  // excluded: there `fields.transport` came from the passthrough itself (the harness
-  // value carried it), so it already IS the user's current value.
-  if (
-    unshaped.family !== 'bespoke' &&
-    isJsonObject(prior) &&
-    typeof prior.transport === 'string' &&
-    transportFamily(prior.transport) === unshaped.family
-  ) {
-    out.transport = prior.transport;
+
+  if (unshaped.transportAuthority === 'inferred') {
+    // The harness shape cannot tell `http` from `sse`, so `fields.transport` is a guess.
+    // While the entry is still in the same family the prior canonical value is the truth.
+    const pt = priorObj ? priorTransport(priorObj) : undefined;
+    if (pt !== undefined && transportFamily(pt) === unshaped.family) out.transport = pt;
+  } else if (unshaped.transportAuthority === 'ambiguous') {
+    // Contradictory discriminators: never write one. Keep the prior, else say nothing
+    // (the shapers still infer a family from `command`/`url`).
+    const pt = priorObj ? priorTransport(priorObj) : undefined;
+    if (pt !== undefined) out.transport = pt;
+    else delete out.transport;
   }
   return out;
 }

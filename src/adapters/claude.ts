@@ -214,13 +214,16 @@ function bearerEnvFromHeader(value: unknown): string | null {
 }
 
 /**
- * The canonical keys {@link shapeClaudeServer} is authoritative for — the ones it reads
- * and re-emits, so their absence from a drifted entry is a real user deletion. Every
- * OTHER canonical field (`enabled`, `timeout`, anything a future release adds) is
- * preserved from the prior canonical def by the overlay. `auth` is added conditionally
- * (see below); `transport` is handled by the overlay's family rule.
+ * The canonical keys each {@link shapeClaudeServer} BRANCH emits, so their absence from a
+ * drifted entry is a real user deletion. The lists are FAMILY-AWARE (F6/6): the stdio
+ * branch never writes `url`/`headers`, so it may not delete them, and the remote branch
+ * never writes `command`/`args`/`env`, so it may not delete those. A genuine family change
+ * is handled by the overlay, which drops the departed family's keys wholesale. Every OTHER
+ * canonical field (`enabled`, `timeout`, anything a future release adds) is preserved from
+ * the prior def. `auth` is added conditionally (see below).
  */
-const CLAUDE_SUPERSEDES = ['type', 'command', 'args', 'env', 'url', 'headers'] as const;
+const CLAUDE_STDIO_SUPERSEDES = ['type', 'command', 'args', 'env'] as const;
+const CLAUDE_REMOTE_SUPERSEDES = ['type', 'url', 'headers'] as const;
 
 /**
  * The inverse of {@link shapeClaudeServer}, as an OVERLAY over the prior canonical def
@@ -230,26 +233,30 @@ const CLAUDE_SUPERSEDES = ['type', 'command', 'args', 'env', 'url', 'headers'] a
  * a whitelist (F5/3). What Claude cannot express is preserved from the prior def, and a
  * bespoke `transport` the shaper passed through is never re-inferred (F5/1).
  */
-function unshapeClaudeServer(def: Record<string, JsonValue>): UnshapedServer {
+function unshapeClaudeServer(def: Record<string, JsonValue>, prior: unknown): UnshapedServer {
   // A `transport` in `.claude.json` can only have come from the shaper's bespoke
   // passthrough, so the entry is already canonical — never re-infer over it (F5/1).
-  if (typeof def.transport === 'string') return passthroughUnshape(def);
+  if (typeof def.transport === 'string') return passthroughUnshape(def, prior);
 
-  const type =
-    typeof def.type === 'string'
-      ? def.type
-      : def.command !== undefined
-        ? 'stdio'
-        : def.url !== undefined
-          ? 'http'
-          : undefined;
+  // Claude records the http/sse distinction NATIVELY in `type`, so a `type` the user
+  // edited must PROPAGATE — preserving the prior canonical transport here would rewrite
+  // their edit back on the next `use` (F6/1). Only a `type`-less entry is a guess.
+  const nativeType = typeof def.type === 'string';
+  const type = nativeType
+    ? (def.type as string)
+    : def.command !== undefined
+      ? 'stdio'
+      : def.url !== undefined
+        ? 'http'
+        : undefined;
 
   if (type === 'stdio') {
     return {
       fields: { transport: 'stdio', ...omitKeys(def, ['type']) },
-      // Family changed away from remote → the remote-only canonical keys go with it.
-      supersedes: [...CLAUDE_SUPERSEDES, 'auth'],
+      supersedes: CLAUDE_STDIO_SUPERSEDES,
       family: 'stdio',
+      // `stdio` is unambiguous in every direction — nothing else compiles to a `command`.
+      transportAuthority: 'native',
     };
   }
   if (type === 'http' || type === 'sse') {
@@ -276,12 +283,15 @@ function unshapeClaudeServer(def: Record<string, JsonValue>): UnshapedServer {
       // entry carries no `Authorization` header at all (the bearer really was removed).
       // A hand-authored header that SHADOWS `auth.bearer_env` must not delete it — Codex
       // maps that same `auth` to `bearer_token_env_var` and would lose its config (F5/11).
-      supersedes: hadAuthorization ? CLAUDE_SUPERSEDES : [...CLAUDE_SUPERSEDES, 'auth'],
+      supersedes: hadAuthorization
+        ? CLAUDE_REMOTE_SUPERSEDES
+        : [...CLAUDE_REMOTE_SUPERSEDES, 'auth'],
       family: 'remote',
+      transportAuthority: nativeType ? 'native' : 'inferred',
     };
   }
   // Neither a Claude discriminator nor an inferable one: carry the whole entry over.
-  return passthroughUnshape(def);
+  return passthroughUnshape(def, prior);
 }
 
 /** Run `claude --version`, resolving `true` only on a clean exit 0. Never throws. */

@@ -176,7 +176,10 @@ async function writeBackConfigDrift(
     const mutations = await match.adapter.syncBackConfigKeys(
       match.surface,
       { style: item.mode, keyPath: item.keyPath, canonicalValue },
-      { envContentDir, projectRoot: null },
+      // `onWarn` is the AMBIGUITY channel (F6): a write-back that cannot tell what the
+      // user meant leaves canonical unchanged and reports it here, where the invocation
+      // surfaces it to the user, instead of guessing silently.
+      { envContentDir, projectRoot: null, onWarn },
     );
     for (const mutation of mutations) {
       const abs = join(envContentDir, mutation.storeRelativePath);

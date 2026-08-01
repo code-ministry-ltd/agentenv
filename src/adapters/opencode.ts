@@ -297,16 +297,31 @@ function sameJson(a: JsonValue, b: JsonValue): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-/** The canonical keys {@link shapeOpenCodeServer} is authoritative for (see Claude's note). */
-const OPENCODE_SUPERSEDES = [
-  'type',
-  'enabled',
-  'command',
-  'args',
-  'env',
-  'url',
-  'headers',
-] as const;
+/**
+ * The canonical keys each {@link shapeOpenCodeServer} branch emits (FAMILY-AWARE, see the
+ * Claude adapter's note). `enabled` is deliberately ABSENT from both: OpenCode's shape
+ * always carries an `enabled`, so its value is only a user statement when it DIFFERS from
+ * what the shaper emitted — see {@link enabledDrift}.
+ */
+const OPENCODE_LOCAL_SUPERSEDES = ['type', 'command', 'args', 'env'] as const;
+const OPENCODE_REMOTE_SUPERSEDES = ['type', 'url', 'headers'] as const;
+
+/**
+ * What the drifted `enabled` says about canonical `enabled`. The shaper ALWAYS writes one
+ * (defaulting to `true`), so a value equal to what it wrote carries no information — the
+ * prior canonical `enabled` must survive untouched, including a non-boolean one a user
+ * hand-authored (`enabled: maybe` would otherwise be destroyed, F5/12). Only a value that
+ * DIFFERS from the compiled one is the user toggling the server.
+ */
+function enabledDrift(
+  drifted: JsonValue | undefined,
+  prior: Record<string, JsonValue> | undefined,
+): { changed: false } | { changed: true; value: JsonValue } {
+  // OpenCode treats an absent `enabled` as `true`, and so does the shaper's default.
+  const current: JsonValue = drifted === undefined ? true : drifted;
+  const compiled: JsonValue = typeof prior?.enabled === 'boolean' ? prior.enabled : true;
+  return sameJson(current, compiled) ? { changed: false } : { changed: true, value: current };
+}
 
 /**
  * The inverse of {@link shapeOpenCodeServer}, as an OVERLAY over the prior canonical def
@@ -327,12 +342,10 @@ function unshapeOpenCodeServer(def: Record<string, JsonValue>, prior: unknown): 
   const canon: Record<string, JsonValue> = isObject(raw) ? raw : {};
   // A `transport` in `opencode.json` can only have come from the shaper's bespoke
   // passthrough, so the entry is already canonical — never re-infer over it (F5/1).
-  if (typeof canon.transport === 'string') return passthroughUnshape(canon);
+  if (typeof canon.transport === 'string') return passthroughUnshape(canon, prior);
 
   const priorDef = isJsonObject(prior) ? prior : undefined;
-  // `enabled:true` is the shaper's default and carries no canonical information; any
-  // other value (notably `false`) is the user's explicit state and must survive (F5/2).
-  const explicitEnabled = canon.enabled !== undefined && canon.enabled !== true;
+  const enabled = enabledDrift(canon.enabled, priorDef);
 
   const type =
     typeof canon.type === 'string'
@@ -363,8 +376,13 @@ function unshapeOpenCodeServer(def: Record<string, JsonValue>, prior: unknown): 
     } else if (cmd !== undefined) {
       fields.command = cmd;
     }
-    if (explicitEnabled) fields.enabled = canon.enabled!;
-    return { fields, supersedes: [...OPENCODE_SUPERSEDES, 'auth'], family: 'stdio' };
+    if (enabled.changed) fields.enabled = enabled.value;
+    return {
+      fields,
+      supersedes: OPENCODE_LOCAL_SUPERSEDES,
+      family: 'stdio',
+      transportAuthority: 'native', // `type:'local'` means exactly `transport: stdio`
+    };
   }
 
   if (type === 'remote') {
@@ -385,17 +403,22 @@ function unshapeOpenCodeServer(def: Record<string, JsonValue>, prior: unknown): 
     } else if (canon.headers !== undefined) {
       fields.headers = canon.headers; // not an object — carry verbatim, never guess
     }
-    if (explicitEnabled) fields.enabled = canon.enabled!;
+    if (enabled.changed) fields.enabled = enabled.value;
     return {
       // `auth` is superseded only when the drifted entry has no `Authorization` header
       // at all; a hand-authored header that SHADOWS it must not delete it (F5/11).
       fields,
-      supersedes: hadAuthorization ? OPENCODE_SUPERSEDES : [...OPENCODE_SUPERSEDES, 'auth'],
+      supersedes: hadAuthorization
+        ? OPENCODE_REMOTE_SUPERSEDES
+        : [...OPENCODE_REMOTE_SUPERSEDES, 'auth'],
       family: 'remote',
+      // `type:'remote'` maps from BOTH `http` and `sse`, so the `http` above is a GUESS
+      // the prior canonical transport overrides (F5/4).
+      transportAuthority: 'inferred',
     };
   }
   // Unknown/bespoke OpenCode entry: carry the whole (var-converted) entry over.
-  return passthroughUnshape(canon);
+  return passthroughUnshape(canon, prior);
 }
 
 /** Run `opencode --version`, resolving `true` only on a clean exit 0. Never throws. */

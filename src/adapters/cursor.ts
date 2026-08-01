@@ -261,8 +261,9 @@ function bearerEnvFromHeader(value: unknown): string | null {
   return m ? m[1]! : null;
 }
 
-/** The canonical keys {@link shapeCursorServer} is authoritative for (see Claude's note). */
-const CURSOR_SUPERSEDES = ['type', 'command', 'args', 'env', 'url', 'headers'] as const;
+/** The canonical keys each {@link shapeCursorServer} branch emits (see Claude's note). */
+const CURSOR_STDIO_SUPERSEDES = ['type', 'command', 'args', 'env'] as const;
+const CURSOR_REMOTE_SUPERSEDES = ['type', 'url', 'headers'] as const;
 
 /**
  * The inverse of {@link shapeCursorServer} + {@link toCursorEnvPlaceholders}, as an
@@ -273,22 +274,27 @@ const CURSOR_SUPERSEDES = ['type', 'command', 'args', 'env', 'url', 'headers'] a
  * dropped by a whitelist (F5/3). A bespoke `transport` the shaper passed through is never
  * re-inferred (F5/1).
  */
-function unshapeCursorServer(def: Record<string, JsonValue>): UnshapedServer {
+function unshapeCursorServer(def: Record<string, JsonValue>, prior: unknown): UnshapedServer {
   const raw = fromCursorEnvPlaceholders(def);
   const canon: Record<string, JsonValue> = isObject(raw) ? raw : {};
   // A `transport` in `mcp.json` can only have come from the shaper's bespoke
   // passthrough, so the entry is already canonical — never re-infer over it (F5/1).
-  if (typeof canon.transport === 'string') return passthroughUnshape(canon);
+  if (typeof canon.transport === 'string') return passthroughUnshape(canon, prior);
 
   if (canon.command !== undefined && canon.url === undefined) {
     return {
       fields: { transport: 'stdio', ...omitKeys(canon, ['type']) },
-      supersedes: [...CURSOR_SUPERSEDES, 'auth'],
+      supersedes: CURSOR_STDIO_SUPERSEDES,
       family: 'stdio',
+      transportAuthority: 'native',
     };
   }
   if (canon.url !== undefined) {
-    const type = typeof canon.type === 'string' ? canon.type : 'http';
+    // Cursor records the http/sse distinction NATIVELY in `type`, so a `type` the user
+    // edited PROPAGATES; only a `type`-less entry is a guess to be resolved from the
+    // prior canonical def (F6/1).
+    const nativeType = typeof canon.type === 'string';
+    const type = nativeType ? (canon.type as string) : 'http';
     const fields: Record<string, JsonValue> = {
       transport: type,
       ...omitKeys(canon, ['type', 'headers']),
@@ -310,12 +316,15 @@ function unshapeCursorServer(def: Record<string, JsonValue>): UnshapedServer {
       // `auth` is superseded only when the drifted entry has no `Authorization` header
       // at all; a hand-authored header that SHADOWS it must not delete it (F5/11).
       fields,
-      supersedes: hadAuthorization ? CURSOR_SUPERSEDES : [...CURSOR_SUPERSEDES, 'auth'],
+      supersedes: hadAuthorization
+        ? CURSOR_REMOTE_SUPERSEDES
+        : [...CURSOR_REMOTE_SUPERSEDES, 'auth'],
       family: transportFamily(type),
+      transportAuthority: nativeType ? 'native' : 'inferred',
     };
   }
   // Unknown/bespoke Cursor entry: carry the whole (var-canonicalised) entry over.
-  return passthroughUnshape(canon);
+  return passthroughUnshape(canon, prior);
 }
 
 /** Run `cursor-agent --version`, resolving `true` only on a clean exit 0. Never throws. */

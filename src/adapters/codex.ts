@@ -242,12 +242,14 @@ const CODEX_NATIVE_KEYS = [
 ] as const;
 
 /**
- * The canonical keys {@link shapeCodexServer} is authoritative for. Unlike the other
- * adapters, `auth` is unconditional: Codex's `bearer_token_env_var` is an EXACT
- * bidirectional mapping with no header shadowing it, so its absence really does mean
- * the bearer was removed.
+ * The canonical keys each {@link shapeCodexServer} branch emits (FAMILY-AWARE, see the
+ * Claude adapter's note): the stdio branch never writes `url`/`headers`, so it may not
+ * delete them, and vice versa. Unlike the other adapters, `auth` is unconditional on the
+ * remote branch: Codex's `bearer_token_env_var` is an EXACT bidirectional mapping with no
+ * header shadowing it, so its absence really does mean the bearer was removed.
  */
-const CODEX_SUPERSEDES = ['command', 'args', 'env', 'url', 'headers', 'auth'] as const;
+const CODEX_STDIO_SUPERSEDES = ['command', 'args', 'env'] as const;
+const CODEX_REMOTE_SUPERSEDES = ['url', 'headers', 'auth'] as const;
 
 /**
  * The inverse of {@link shapeCodexServer}, as an OVERLAY over the prior canonical def
@@ -259,10 +261,10 @@ const CODEX_SUPERSEDES = ['command', 'args', 'env', 'url', 'headers', 'auth'] as
  * `url`), so the prior canonical `transport` is kept verbatim by the overlay (F5/4); a
  * bespoke `transport` the shaper passed through is never re-inferred (F5/1).
  */
-function unshapeCodexServer(def: Record<string, JsonValue>): UnshapedServer {
+function unshapeCodexServer(def: Record<string, JsonValue>, prior: unknown): UnshapedServer {
   // A `transport` in `config.toml` can only have come from the shaper's bespoke
   // passthrough, so the entry is already canonical — never re-infer over it (F5/1).
-  if (typeof def.transport === 'string') return passthroughUnshape(def);
+  if (typeof def.transport === 'string') return passthroughUnshape(def, prior);
 
   if (def.command !== undefined) {
     const fields: Record<string, JsonValue> = {
@@ -275,7 +277,12 @@ function unshapeCodexServer(def: Record<string, JsonValue>): UnshapedServer {
     }
     if (Object.keys(env).length > 0) fields.env = env;
     else if (def.env !== undefined && !isObject(def.env)) fields.env = def.env;
-    return { fields, supersedes: CODEX_SUPERSEDES, family: 'stdio' };
+    return {
+      fields,
+      supersedes: CODEX_STDIO_SUPERSEDES,
+      family: 'stdio',
+      transportAuthority: 'native', // `stdio` is unambiguous — only a command compiles to one
+    };
   }
 
   if (def.url !== undefined) {
@@ -295,12 +302,19 @@ function unshapeCodexServer(def: Record<string, JsonValue>): UnshapedServer {
       }
     }
     if (Object.keys(headers).length > 0) fields.headers = headers;
-    return { fields, supersedes: CODEX_SUPERSEDES, family: 'remote' };
+    return {
+      fields,
+      supersedes: CODEX_REMOTE_SUPERSEDES,
+      family: 'remote',
+      // A Codex table is just a `url`: `http` and `sse` are indistinguishable, so the
+      // `http` above is a GUESS the prior canonical transport overrides (F5/4).
+      transportAuthority: 'inferred',
+    };
   }
 
   // Unknown/bespoke Codex entry: carry the whole table over so a user's hand-authored
   // one is never corrupted on write-back.
-  return passthroughUnshape(def);
+  return passthroughUnshape(def, prior);
 }
 
 /** Run `codex --version`, resolving `true` only on a clean exit 0. Never throws. */
