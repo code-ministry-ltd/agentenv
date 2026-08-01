@@ -22,6 +22,8 @@ import {
   foldDriftIntoCanonical,
   omitKeys,
   passthroughUnshape,
+  resolveAuthDrift,
+  type UnshapeContext,
   type UnshapedServer,
 } from './mcp-canonical.js';
 
@@ -233,7 +235,11 @@ const CLAUDE_REMOTE_SUPERSEDES = ['type', 'url', 'headers'] as const;
  * a whitelist (F5/3). What Claude cannot express is preserved from the prior def, and a
  * bespoke `transport` the shaper passed through is never re-inferred (F5/1).
  */
-function unshapeClaudeServer(def: Record<string, JsonValue>, prior: unknown): UnshapedServer {
+function unshapeClaudeServer(
+  def: Record<string, JsonValue>,
+  prior: unknown,
+  ctx: UnshapeContext,
+): UnshapedServer {
   // A `transport` in `.claude.json` can only have come from the shaper's bespoke
   // passthrough, so the entry is already canonical — never re-infer over it (F5/1).
   if (typeof def.transport === 'string') return passthroughUnshape(def, prior);
@@ -264,28 +270,27 @@ function unshapeClaudeServer(def: Record<string, JsonValue>, prior: unknown): Un
       transport: type,
       ...omitKeys(def, ['type', 'headers']),
     };
-    let hadAuthorization = false;
-    if (isObject(def.headers)) {
-      const headers = { ...def.headers };
-      hadAuthorization = headers.Authorization !== undefined;
-      const bearer = bearerEnvFromHeader(headers.Authorization);
-      if (bearer !== null) {
-        fields.auth = { bearer_env: bearer };
-        delete headers.Authorization;
-      }
+    const headers = isObject(def.headers) ? { ...def.headers } : undefined;
+    // A credential is never guessed at: an `Authorization` header that does not map
+    // EXACTLY onto canonical `auth.bearer_env` leaves it alone and warns (F6/3+4).
+    const auth = resolveAuthDrift({
+      prior,
+      header: headers?.Authorization,
+      bearerEnvFromHeader,
+      foldsBearerIntoHeader: true,
+      ctx,
+    });
+    if (auth.kind === 'set') fields.auth = { bearer_env: auth.bearerEnv };
+    if (headers !== undefined) {
+      if (auth.kind === 'set') delete headers.Authorization; // now carried by `auth`
       if (Object.keys(headers).length > 0) fields.headers = headers;
     } else if (def.headers !== undefined) {
       fields.headers = def.headers; // not an object — carry verbatim, never guess
     }
     return {
       fields,
-      // `auth` has no Claude counterpart, so it is superseded ONLY when the drifted
-      // entry carries no `Authorization` header at all (the bearer really was removed).
-      // A hand-authored header that SHADOWS `auth.bearer_env` must not delete it — Codex
-      // maps that same `auth` to `bearer_token_env_var` and would lose its config (F5/11).
-      supersedes: hadAuthorization
-        ? CLAUDE_REMOTE_SUPERSEDES
-        : [...CLAUDE_REMOTE_SUPERSEDES, 'auth'],
+      supersedes:
+        auth.kind === 'delete' ? [...CLAUDE_REMOTE_SUPERSEDES, 'auth'] : CLAUDE_REMOTE_SUPERSEDES,
       family: 'remote',
       transportAuthority: nativeType ? 'native' : 'inferred',
     };
@@ -408,6 +413,7 @@ export const claudeAdapter: Adapter = {
       existing[name],
       drift.canonicalValue,
       unshapeClaudeServer,
+      { server: name, adapterId: 'claude-code', warn: ctx.onWarn ?? ((m) => console.warn(m)) },
     );
     return [{ storeRelativePath: join('mcp', 'servers.yaml'), content: stringifyYaml(existing) }];
   },

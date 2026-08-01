@@ -23,7 +23,9 @@ import {
   foldDriftIntoCanonical,
   omitKeys,
   passthroughUnshape,
+  resolveAuthDrift,
   transportFamily,
+  type UnshapeContext,
   type UnshapedServer,
 } from './mcp-canonical.js';
 
@@ -178,7 +180,11 @@ function collectPlaceholders(value: unknown, prefix: string, out: Record<string,
  * A bespoke/unknown transport is passed through unchanged (fail-soft — never
  * corrupt a user's authored entry).
  */
-function shapeCodexServer(def: unknown): JsonValue {
+function shapeCodexServer(
+  def: unknown,
+  name: string,
+  warn: (message: string) => void,
+): JsonValue {
   if (!isObject(def)) return def as JsonValue;
 
   // A HAND-AUTHORED harness-shaped entry (no `transport`, a `type`) is honoured exactly
@@ -219,8 +225,23 @@ function shapeCodexServer(def: unknown): JsonValue {
     const out: Record<string, JsonValue> = {};
     if (def.url !== undefined) out.url = def.url;
     const auth = def.auth;
+    // SECURITY (F6/3): an `Authorization` header SHADOWS the bearer — it is what the
+    // server will actually receive. Emitting `bearer_token_env_var` beside it would have
+    // Codex keep authenticating with a credential the user may believe they replaced, in
+    // a harness they were not looking at. Refuse, and say why.
+    const shadowedBy =
+      isObject(def.headers) && def.headers.Authorization !== undefined ? 'headers' : null;
     if (isObject(auth) && typeof auth.bearer_env === 'string') {
-      out.bearer_token_env_var = auth.bearer_env;
+      if (shadowedBy !== null) {
+        warn(
+          `agentenv: MCP server '${name}' — canonical auth.bearer_env (${auth.bearer_env}) is ` +
+            `SHADOWED by an Authorization header, so codex's bearer_token_env_var was NOT ` +
+            `written; the header is what codex will send. Remove one of the two in ` +
+            `mcp/servers.yaml to settle it.`,
+        );
+      } else {
+        out.bearer_token_env_var = auth.bearer_env;
+      }
     }
     if (isObject(def.headers)) {
       const httpHeaders: Record<string, JsonValue> = {};
@@ -256,7 +277,7 @@ const CODEX_NATIVE_KEYS = [
  * header shadowing it, so its absence really does mean the bearer was removed.
  */
 const CODEX_STDIO_SUPERSEDES = ['type', 'command', 'args', 'env'] as const;
-const CODEX_REMOTE_SUPERSEDES = ['type', 'url', 'headers', 'auth'] as const;
+const CODEX_REMOTE_SUPERSEDES = ['type', 'url', 'headers'] as const;
 
 /**
  * The inverse of {@link shapeCodexServer}, as an OVERLAY over the prior canonical def
@@ -268,7 +289,11 @@ const CODEX_REMOTE_SUPERSEDES = ['type', 'url', 'headers', 'auth'] as const;
  * `url`), so the prior canonical `transport` is kept verbatim by the overlay (F5/4); a
  * bespoke `transport` the shaper passed through is never re-inferred (F5/1).
  */
-function unshapeCodexServer(def: Record<string, JsonValue>, prior: unknown): UnshapedServer {
+function unshapeCodexServer(
+  def: Record<string, JsonValue>,
+  prior: unknown,
+  ctx: UnshapeContext,
+): UnshapedServer {
   // A `transport` — or a `type` naming a transport Codex has no table shape for — can
   // only have come from the shaper's bespoke passthrough, so the entry is already
   // canonical; never re-infer over it (F5/1, F6/2, symmetric with {@link shapeCodexServer}).
@@ -301,9 +326,6 @@ function unshapeCodexServer(def: Record<string, JsonValue>, prior: unknown): Uns
       transport: 'http',
       ...omitKeys(def, [...CODEX_NATIVE_KEYS, 'headers']),
     };
-    if (typeof def.bearer_token_env_var === 'string') {
-      fields.auth = { bearer_env: def.bearer_token_env_var };
-    }
     const headers: Record<string, JsonValue> = isObject(def.http_headers)
       ? { ...def.http_headers }
       : {};
@@ -313,9 +335,22 @@ function unshapeCodexServer(def: Record<string, JsonValue>, prior: unknown): Uns
       }
     }
     if (Object.keys(headers).length > 0) fields.headers = headers;
+    // `bearer_token_env_var` is EXACT, so it settles `auth` outright. Without one, the
+    // question falls to the shared rule: a table whose Authorization header no longer
+    // matches what agentenv compiled says nothing reliable about the bearer (F6/3+4).
+    const auth = resolveAuthDrift({
+      prior,
+      header: headers.Authorization,
+      bearerEnvFromHeader: () => null, // Codex has no Bearer-header convention
+      nativeBearer: typeof def.bearer_token_env_var === 'string' ? def.bearer_token_env_var : null,
+      foldsBearerIntoHeader: false,
+      ctx,
+    });
+    if (auth.kind === 'set') fields.auth = { bearer_env: auth.bearerEnv };
     return {
       fields,
-      supersedes: CODEX_REMOTE_SUPERSEDES,
+      supersedes:
+        auth.kind === 'delete' ? [...CODEX_REMOTE_SUPERSEDES, 'auth'] : CODEX_REMOTE_SUPERSEDES,
       family: 'remote',
       // A Codex table is just a `url`: `http` and `sse` are indistinguishable, so the
       // `http` above is a GUESS the prior canonical transport overrides (F5/4).
@@ -397,6 +432,8 @@ export const codexAdapter: Adapter = {
   ): Promise<ConfigKeysInjection[]> {
     if (surface.id !== 'mcp') return [];
     const injections: ConfigKeysInjection[] = [];
+    // The shaper refuses to emit a SHADOWED bearer (F6/3) and must say so out loud.
+    const warn = ctx.onWarn ?? ((m: string) => console.warn(m));
 
     const serversFile = join(ctx.envContentDir, 'mcp', 'servers.yaml');
     if (existsSync(serversFile)) {
@@ -406,7 +443,7 @@ export const codexAdapter: Adapter = {
         | undefined;
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
         for (const [name, def] of Object.entries(parsed)) {
-          const value = shapeCodexServer(def);
+          const value = shapeCodexServer(def, name, warn);
           const secretFields: Record<string, string> = {};
           collectPlaceholders(value, '', secretFields);
           injections.push({
@@ -458,6 +495,7 @@ export const codexAdapter: Adapter = {
       existing[name],
       drift.canonicalValue,
       unshapeCodexServer,
+      { server: name, adapterId: 'codex', warn: ctx.onWarn ?? ((m) => console.warn(m)) },
     );
     return [{ storeRelativePath: join('mcp', 'servers.yaml'), content: stringifyYaml(existing) }];
   },

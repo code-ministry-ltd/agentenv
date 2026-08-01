@@ -24,6 +24,8 @@ import {
   isJsonObject,
   omitKeys,
   passthroughUnshape,
+  resolveAuthDrift,
+  type UnshapeContext,
   type UnshapedServer,
 } from './mcp-canonical.js';
 
@@ -337,7 +339,11 @@ function enabledDrift(
  *     `{command:['a','b']}` — when the flattened array is UNCHANGED from what the prior
  *     def would produce, the prior split is kept verbatim rather than re-guessed.
  */
-function unshapeOpenCodeServer(def: Record<string, JsonValue>, prior: unknown): UnshapedServer {
+function unshapeOpenCodeServer(
+  def: Record<string, JsonValue>,
+  prior: unknown,
+  ctx: UnshapeContext,
+): UnshapedServer {
   const raw = convertVarsBack(def);
   const canon: Record<string, JsonValue> = isObject(raw) ? raw : {};
   // A `transport` in `opencode.json` can only have come from the shaper's bespoke
@@ -390,27 +396,30 @@ function unshapeOpenCodeServer(def: Record<string, JsonValue>, prior: unknown): 
       transport: 'http',
       ...omitKeys(canon, ['type', 'enabled', 'headers']),
     };
-    let hadAuthorization = false;
-    if (isObject(canon.headers)) {
-      const headers = { ...canon.headers };
-      hadAuthorization = headers.Authorization !== undefined;
-      const bearer = bearerEnvFromHeader(headers.Authorization);
-      if (bearer !== null) {
-        fields.auth = { bearer_env: bearer };
-        delete headers.Authorization;
-      }
+    const headers = isObject(canon.headers) ? { ...canon.headers } : undefined;
+    // A credential is never guessed at: an `Authorization` header that does not map
+    // EXACTLY onto canonical `auth.bearer_env` leaves it alone and warns (F6/3+4).
+    const auth = resolveAuthDrift({
+      prior,
+      header: headers?.Authorization,
+      bearerEnvFromHeader,
+      foldsBearerIntoHeader: true,
+      ctx,
+    });
+    if (auth.kind === 'set') fields.auth = { bearer_env: auth.bearerEnv };
+    if (headers !== undefined) {
+      if (auth.kind === 'set') delete headers.Authorization; // now carried by `auth`
       if (Object.keys(headers).length > 0) fields.headers = headers;
     } else if (canon.headers !== undefined) {
       fields.headers = canon.headers; // not an object — carry verbatim, never guess
     }
     if (enabled.changed) fields.enabled = enabled.value;
     return {
-      // `auth` is superseded only when the drifted entry has no `Authorization` header
-      // at all; a hand-authored header that SHADOWS it must not delete it (F5/11).
       fields,
-      supersedes: hadAuthorization
-        ? OPENCODE_REMOTE_SUPERSEDES
-        : [...OPENCODE_REMOTE_SUPERSEDES, 'auth'],
+      supersedes:
+        auth.kind === 'delete'
+          ? [...OPENCODE_REMOTE_SUPERSEDES, 'auth']
+          : OPENCODE_REMOTE_SUPERSEDES,
       family: 'remote',
       // `type:'remote'` maps from BOTH `http` and `sse`, so the `http` above is a GUESS
       // the prior canonical transport overrides (F5/4).
@@ -565,6 +574,7 @@ export const opencodeAdapter: Adapter = {
       existing[name],
       drift.canonicalValue,
       unshapeOpenCodeServer,
+      { server: name, adapterId: 'opencode', warn: ctx.onWarn ?? ((m) => console.warn(m)) },
     );
     return [{ storeRelativePath: join('mcp', 'servers.yaml'), content: stringifyYaml(existing) }];
   },

@@ -402,6 +402,9 @@ async function materialiseConfigKeys(
           injections = await adapter.compileConfigKeys(surface, {
             envContentDir: paths.envDir(envName),
             projectRoot: null,
+            // A compile that refuses to emit something unsafe (a SHADOWED bearer, F6/3)
+            // must reach the user rather than vanish into a default console.warn.
+            onWarn,
           });
         } catch (err) {
           skips.push({

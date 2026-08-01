@@ -388,6 +388,7 @@ async function composeConfigKeysFile(
         injections = await adapter.compileConfigKeys(surface, {
           envContentDir: paths.envDir(env),
           projectRoot: req.projectRoot ?? null,
+          onWarn,
         });
       } catch (err) {
         onWarn(`agentenv: env '${env}' ${surface.id} compile failed: ${(err as Error).message}`);

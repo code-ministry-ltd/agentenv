@@ -189,6 +189,128 @@ export function overlayCanonicalServer(prior: unknown, unshaped: UnshapedServer)
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// The AMBIGUITY channel
+// ---------------------------------------------------------------------------
+
+/** What an un-shape needs in order to report an ambiguity it refuses to resolve. */
+export interface UnshapeContext {
+  /** The MCP server name, so a warning names the server the user must look at. */
+  server: string;
+  /** The harness whose config the user edited, for the same reason. */
+  adapterId: string;
+  /** The user-visible warning channel (see `ConfigKeysContext.onWarn`). */
+  warn: (message: string) => void;
+}
+
+/** What a drifted `Authorization` header says about canonical `auth.bearer_env`. */
+export type AuthDrift =
+  /** Write `auth: { bearer_env }` — an exact, unambiguous correspondence. */
+  | { kind: 'set'; bearerEnv: string }
+  /** The bearer really was removed — supersede `auth`. */
+  | { kind: 'delete' }
+  /** Say nothing: the prior canonical `auth` stands (quietly, or after a warning). */
+  | { kind: 'keep' };
+
+/** How the header-folding adapters render `auth.bearer_env` once placeholders are canonical. */
+function renderBearerHeader(varName: string): string {
+  return `Bearer \${${varName}}`;
+}
+
+/** The prior canonical def's `auth.bearer_env`, if it has one. */
+function priorBearerEnv(prior: Record<string, JsonValue> | undefined): string | undefined {
+  const auth = prior?.auth;
+  if (isJsonObject(auth) && typeof auth.bearer_env === 'string') return auth.bearer_env;
+  return undefined;
+}
+
+/**
+ * Decide what a drifted `Authorization` header means for canonical `auth.bearer_env` —
+ * the ONE rule all four adapters share (F6/3+4, SECURITY).
+ *
+ * A credential is the last thing to guess about. So the mapping is written back only when
+ * it is EXACT in both directions:
+ *
+ *  - unchanged from what agentenv compiled → the prior `auth` stands;
+ *  - `Bearer ${VAR}` where the prior header was also the bearer rendering → a var rename;
+ *  - the header (or Codex's `bearer_token_env_var`) gone where nothing shadowed it → the
+ *    bearer was removed.
+ *
+ * Everything else — replacing `Bearer ${OLD}` with a value that is not a bearer
+ * indirection, or touching a header that SHADOWS a live `auth.bearer_env` — is AMBIGUOUS:
+ * it could be a revocation or an unrelated header, and the two have opposite consequences
+ * in a harness the user is not looking at. Canonical `auth` is left exactly as it was and
+ * the user is told, naming the server and the env var (a NAME, never a secret value).
+ */
+export function resolveAuthDrift(opts: {
+  /** The prior canonical def (`undefined` when this server is new to the store). */
+  prior: unknown;
+  /** The drifted `Authorization` header value, already canonicalised to `${VAR}` form. */
+  header: JsonValue | undefined;
+  /** `Bearer ${VAR}` → VAR for this harness's header syntax, else `null`. */
+  bearerEnvFromHeader: (value: unknown) => string | null;
+  /**
+   * A bearer this harness expresses NATIVELY and exactly (Codex's `bearer_token_env_var`),
+   * or `null`. Its presence settles the question outright.
+   */
+  nativeBearer?: string | null;
+  /**
+   * Whether this harness's shaper folds `auth.bearer_env` INTO the `Authorization` header
+   * (Claude/Cursor/OpenCode) or expresses it separately (Codex).
+   */
+  foldsBearerIntoHeader: boolean;
+  ctx: UnshapeContext;
+}): AuthDrift {
+  const prior = isJsonObject(opts.prior) ? opts.prior : undefined;
+  const bearer = priorBearerEnv(prior);
+  const priorHeader = isJsonObject(prior?.headers) ? prior.headers.Authorization : undefined;
+  const shadowing = bearer !== undefined && priorHeader !== undefined;
+
+  // A native, exact indirection settles it with no header reasoning at all.
+  if (opts.nativeBearer != null) return { kind: 'set', bearerEnv: opts.nativeBearer };
+
+  // What agentenv's own compile put in the harness's `Authorization` header for this def.
+  const compiled: JsonValue | undefined =
+    priorHeader !== undefined
+      ? priorHeader
+      : opts.foldsBearerIntoHeader && bearer !== undefined
+        ? renderBearerHeader(bearer)
+        : undefined;
+
+  const unchanged = JSON.stringify(opts.header ?? null) === JSON.stringify(compiled ?? null);
+  if (unchanged) {
+    if (bearer === undefined) return { kind: 'keep' };
+    // Untouched and NOT shadowed → the header IS the bearer; re-state it so the caller
+    // strips it from `headers` (it belongs in `auth`).
+    if (!shadowing && opts.foldsBearerIntoHeader) return { kind: 'set', bearerEnv: bearer };
+    // Codex, unshadowed: the table carries no `bearer_token_env_var` and nothing hid it,
+    // so the user really did delete it.
+    if (!shadowing) return { kind: 'delete' };
+    return { kind: 'keep' }; // shadowing header untouched — says nothing about `auth`
+  }
+
+  // The user CHANGED the Authorization header.
+  if (bearer === undefined) {
+    // Nothing canonical is at stake; a bearer indirection still maps exactly.
+    const renamed = opts.foldsBearerIntoHeader ? opts.bearerEnvFromHeader(opts.header) : null;
+    return renamed !== null ? { kind: 'set', bearerEnv: renamed } : { kind: 'delete' };
+  }
+  if (!shadowing && opts.foldsBearerIntoHeader) {
+    if (opts.header === undefined) return { kind: 'delete' }; // the bearer was removed
+    const renamed = opts.bearerEnvFromHeader(opts.header);
+    if (renamed !== null) return { kind: 'set', bearerEnv: renamed }; // a var rename
+  }
+  // AMBIGUOUS. Leave canonical `auth` exactly as it was, and say so.
+  opts.ctx.warn(
+    `agentenv: MCP server '${opts.ctx.server}' — the Authorization header in the ` +
+      `${opts.ctx.adapterId} config no longer matches the one agentenv compiled from ` +
+      `canonical auth.bearer_env (${bearer}). agentenv cannot tell whether you replaced ` +
+      `that credential or changed an unrelated header, so auth.bearer_env in ` +
+      `mcp/servers.yaml is UNCHANGED — edit mcp/servers.yaml if you meant to change it.`,
+  );
+  return { kind: 'keep' };
+}
+
 /**
  * The whole write-back fold for one drifted server: un-shape `drifted` and overlay it
  * onto `prior`. A non-object drift value (a harness entry the user replaced with a
@@ -197,8 +319,13 @@ export function overlayCanonicalServer(prior: unknown, unshaped: UnshapedServer)
 export function foldDriftIntoCanonical(
   prior: unknown,
   drifted: JsonValue,
-  unshape: (def: Record<string, JsonValue>, prior: unknown) => UnshapedServer,
+  unshape: (
+    def: Record<string, JsonValue>,
+    prior: unknown,
+    ctx: UnshapeContext,
+  ) => UnshapedServer,
+  ctx: UnshapeContext,
 ): JsonValue {
   if (!isJsonObject(drifted)) return drifted;
-  return overlayCanonicalServer(prior, unshape(drifted, prior));
+  return overlayCanonicalServer(prior, unshape(drifted, prior, ctx));
 }
