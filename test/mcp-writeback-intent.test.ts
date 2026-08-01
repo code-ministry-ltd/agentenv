@@ -251,6 +251,117 @@ describe('F6/2: `supersedes` is family-aware — a branch only claims what it em
 });
 
 // ---------------------------------------------------------------------------
+// 2b. the bespoke PASSTHROUGH is authoritative for everything it emits
+// ---------------------------------------------------------------------------
+
+describe('F6/5: a bespoke passthrough propagates deletions too', () => {
+  const PRIOR_BESPOKE =
+    'ws:\n' +
+    '  transport: websocket\n' +
+    '  url: wss://bespoke.example.com/ws\n' +
+    '  timeout: 30000\n';
+
+  for (const adapter of [claudeAdapter, cursorAdapter, opencodeAdapter, codexAdapter]) {
+    it(`${adapter.id}: deleting a field from the passed-through entry deletes it`, async () => {
+      const compiled = obj(await compileOne(adapter, PRIOR_BESPOKE, 'ws'));
+      // The passthrough emits the canonical def VERBATIM, so it saw `timeout` and wrote
+      // it — its absence from the harness config is a real user deletion.
+      expect(compiled.timeout).toBe(30000);
+      const edited = { ...compiled };
+      delete edited.timeout;
+      const written = await foldOne(adapter, PRIOR_BESPOKE, 'ws', edited);
+      expect(written.timeout).toBeUndefined();
+      expect(written.transport).toBe('websocket');
+      expect(written.url).toBe('wss://bespoke.example.com/ws');
+    });
+  }
+
+  it('claude-code: the un-inferable fallback propagates deletions as well', async () => {
+    // Neither a Claude discriminator nor an inferable one — the entry the user gutted.
+    const prior = 'x:\n  transport: http\n  url: https://x.example.com/mcp\n  timeout: 5\n';
+    const written = await foldOne(claudeAdapter, prior, 'x', { note: 'wip' });
+    expect(written).toEqual({ note: 'wip' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2c. contradictory discriminators are AMBIGUOUS, never a merge of both
+// ---------------------------------------------------------------------------
+
+describe('F6/9: a hand-written canonical `transport` beside a harness `type`', () => {
+  const PRIOR_STDIO_SPLIT = 'gh:\n  transport: stdio\n  command: x\n  args: ["a"]\n';
+
+  it('opencode: does not poison the store with both shapes', async () => {
+    const compiled = obj(await compileOne(opencodeAdapter, PRIOR_STDIO_SPLIT, 'gh'));
+    expect(compiled).toEqual({ type: 'local', command: ['x', 'a'], enabled: true });
+    // The user hand-writes a canonical `transport` into opencode.json beside `type`.
+    const warnings: string[] = [];
+    const written = await foldOne(
+      opencodeAdapter,
+      PRIOR_STDIO_SPLIT,
+      'gh',
+      { ...compiled, transport: 'websocket' },
+      warnings,
+    );
+    // NOT `command:['x','a']` + `args:['a']` (arg duplicated) + `type` + `enabled`.
+    expect(written).toEqual({ transport: 'stdio', command: 'x', args: ['a'] });
+    expect(warnings.join('\n')).toMatch(/gh/);
+    expect(warnings.join('\n')).toMatch(/transport/);
+  });
+
+  it('claude-code: leaves canonical transport unchanged and warns', async () => {
+    // Claude's stdio shape DOES carry `type: 'stdio'`, so a hand-written `transport`
+    // beside it is a genuine contradiction.
+    const compiled = obj(await compileOne(claudeAdapter, PRIOR_STDIO_SPLIT, 'gh'));
+    expect(compiled.type).toBe('stdio');
+    const warnings: string[] = [];
+    const written = await foldOne(
+      claudeAdapter,
+      PRIOR_STDIO_SPLIT,
+      'gh',
+      { ...compiled, transport: 'websocket' },
+      warnings,
+    );
+    expect(written).toEqual({ transport: 'stdio', command: 'x', args: ['a'] });
+    expect(warnings.join('\n')).toMatch(/transport/);
+  });
+
+  it('cursor: leaves canonical transport unchanged and warns', async () => {
+    // Cursor's stdio shape carries no `type` at all, so the contradiction can only arise
+    // on a remote entry — where `type` IS Cursor's own discriminator.
+    const priorRemote = 'docs:\n  transport: http\n  url: https://docs.example.com/mcp\n';
+    const compiled = obj(await compileOne(cursorAdapter, priorRemote, 'docs'));
+    expect(compiled.type).toBe('http');
+    const warnings: string[] = [];
+    const written = await foldOne(
+      cursorAdapter,
+      priorRemote,
+      'docs',
+      { ...compiled, transport: 'websocket' },
+      warnings,
+    );
+    expect(written).toEqual({ transport: 'http', url: 'https://docs.example.com/mcp' });
+    expect(warnings.join('\n')).toMatch(/transport/);
+  });
+
+  it('cursor: a `transport` with NO competing discriminator is taken at face value', async () => {
+    // Cursor's stdio entry has no `type`, so nothing contradicts the user's `transport`:
+    // this is the ordinary bespoke passthrough, and it must stay silent and lossless.
+    const warnings: string[] = [];
+    const compiled = obj(await compileOne(cursorAdapter, PRIOR_STDIO_SPLIT, 'gh'));
+    const written = await foldOne(
+      cursorAdapter,
+      PRIOR_STDIO_SPLIT,
+      'gh',
+      { ...compiled, transport: 'websocket' },
+      warnings,
+    );
+    expect(written).toEqual({ transport: 'websocket', command: 'x', args: ['a'] });
+    expect(warnings).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 3. OpenCode `enabled`: a shaper DEFAULT is not a user statement
 // ---------------------------------------------------------------------------
 

@@ -22,9 +22,11 @@ import { resolveBinaryOnPath } from '../session/resolve.js';
 import {
   foldDriftIntoCanonical,
   isJsonObject,
+  hasConflictingDiscriminators,
   omitKeys,
   passthroughUnshape,
   resolveAuthDrift,
+  warnConflictingTransport,
   type UnshapeContext,
   type UnshapedServer,
 } from './mcp-canonical.js';
@@ -306,6 +308,9 @@ function sameJson(a: JsonValue, b: JsonValue): boolean {
  * what the shaper emitted — see {@link enabledDrift}.
  */
 const OPENCODE_LOCAL_SUPERSEDES = ['type', 'command', 'args', 'env'] as const;
+
+/** The `type` values {@link shapeOpenCodeServer}'s non-passthrough branches emit. */
+const OPENCODE_SHAPER_TYPES = new Set(['local', 'remote']);
 const OPENCODE_REMOTE_SUPERSEDES = ['type', 'url', 'headers'] as const;
 
 /**
@@ -347,8 +352,13 @@ function unshapeOpenCodeServer(
   const raw = convertVarsBack(def);
   const canon: Record<string, JsonValue> = isObject(raw) ? raw : {};
   // A `transport` in `opencode.json` can only have come from the shaper's bespoke
-  // passthrough, so the entry is already canonical — never re-infer over it (F5/1).
-  if (typeof canon.transport === 'string') return passthroughUnshape(canon, prior);
+  // passthrough, so the entry is already canonical — never re-infer over it (F5/1) —
+  // unless it sits beside a `type` the passthrough would never have written. Then the two
+  // disagree, the transport is unknowable, and carrying the whole value over verbatim
+  // would poison the store with BOTH shapes (a duplicated arg, a harness `type`) (F6/9).
+  const conflicting = hasConflictingDiscriminators(canon, OPENCODE_SHAPER_TYPES);
+  if (typeof canon.transport === 'string' && !conflicting) return passthroughUnshape(canon, prior);
+  if (conflicting) warnConflictingTransport(ctx, canon.transport as string, canon.type as string);
 
   const priorDef = isJsonObject(prior) ? prior : undefined;
   const enabled = enabledDrift(canon.enabled, priorDef);
@@ -365,7 +375,7 @@ function unshapeOpenCodeServer(
   if (type === 'local') {
     const fields: Record<string, JsonValue> = {
       transport: 'stdio',
-      ...omitKeys(canon, ['type', 'enabled', 'command', 'args']),
+      ...omitKeys(canon, ['type', 'transport', 'enabled', 'command', 'args']),
     };
     const cmd = canon.command;
     if (
@@ -387,14 +397,16 @@ function unshapeOpenCodeServer(
       fields,
       supersedes: OPENCODE_LOCAL_SUPERSEDES,
       family: 'stdio',
-      transportAuthority: 'native', // `type:'local'` means exactly `transport: stdio`
+      // `type:'local'` means exactly `transport: stdio` — unless a hand-written
+      // `transport` contradicts it, when nothing may be written (F6/9).
+      transportAuthority: conflicting ? 'ambiguous' : 'native',
     };
   }
 
   if (type === 'remote') {
     const fields: Record<string, JsonValue> = {
       transport: 'http',
-      ...omitKeys(canon, ['type', 'enabled', 'headers']),
+      ...omitKeys(canon, ['type', 'transport', 'enabled', 'headers']),
     };
     const headers = isObject(canon.headers) ? { ...canon.headers } : undefined;
     // A credential is never guessed at: an `Authorization` header that does not map
@@ -423,7 +435,7 @@ function unshapeOpenCodeServer(
       family: 'remote',
       // `type:'remote'` maps from BOTH `http` and `sse`, so the `http` above is a GUESS
       // the prior canonical transport overrides (F5/4).
-      transportAuthority: 'inferred',
+      transportAuthority: conflicting ? 'ambiguous' : 'inferred',
     };
   }
   // Unknown/bespoke OpenCode entry: carry the whole (var-converted) entry over.

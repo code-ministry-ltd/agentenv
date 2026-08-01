@@ -203,6 +203,41 @@ export interface UnshapeContext {
   warn: (message: string) => void;
 }
 
+/**
+ * Whether the drifted harness value carries CONTRADICTORY transport discriminators: a
+ * canonical `transport` (which only the shaper's bespoke passthrough ever emits) beside a
+ * harness-native `type` (which only the shaper's stdio/remote branches ever emit). The two
+ * cannot both have come from one compile, so the entry was hand-edited and its transport is
+ * unknowable. `shaperTypes` is the set of `type` values THIS harness's shaper emits.
+ *
+ * Round 2 took the bare presence of `transport` as proof of a passthrough and carried the
+ * whole harness value over verbatim, which poisoned the store with both shapes at once —
+ * OpenCode's flattened `command:[cmd, ...args]` landing beside the prior `args`, so the
+ * argument appeared twice, plus a harness `type`/`enabled` no other adapter understands.
+ */
+export function hasConflictingDiscriminators(
+  def: Record<string, JsonValue>,
+  shaperTypes: ReadonlySet<string>,
+): boolean {
+  return (
+    typeof def.transport === 'string' && typeof def.type === 'string' && shaperTypes.has(def.type)
+  );
+}
+
+/** Report a conflicting-discriminator drift: canonical `transport` is left alone (F6/9). */
+export function warnConflictingTransport(
+  ctx: UnshapeContext,
+  transport: string,
+  type: string,
+): void {
+  ctx.warn(
+    `agentenv: MCP server '${ctx.server}' — the ${ctx.adapterId} config carries BOTH a ` +
+      `canonical transport ('${transport}') and that harness's own discriminator ` +
+      `(type: '${type}'), which disagree. agentenv cannot tell which you meant, so ` +
+      `transport in mcp/servers.yaml is UNCHANGED — set it there if you meant to change it.`,
+  );
+}
+
 /** What a drifted `Authorization` header says about canonical `auth.bearer_env`. */
 export type AuthDrift =
   /** Write `auth: { bearer_env }` — an exact, unambiguous correspondence. */

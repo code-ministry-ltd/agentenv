@@ -21,9 +21,11 @@ import { resolveBinaryOnPath } from '../session/resolve.js';
 import {
   foldDriftIntoCanonical,
   omitKeys,
+  hasConflictingDiscriminators,
   passthroughUnshape,
   resolveAuthDrift,
   transportFamily,
+  warnConflictingTransport,
   type UnshapeContext,
   type UnshapedServer,
 } from './mcp-canonical.js';
@@ -265,6 +267,9 @@ function bearerEnvFromHeader(value: unknown): string | null {
 
 /** The canonical keys each {@link shapeCursorServer} branch emits (see Claude's note). */
 const CURSOR_STDIO_SUPERSEDES = ['type', 'command', 'args', 'env'] as const;
+
+/** The `type` values {@link shapeCursorServer}'s non-passthrough branches emit. */
+const CURSOR_SHAPER_TYPES = new Set(['http', 'sse']);
 const CURSOR_REMOTE_SUPERSEDES = ['type', 'url', 'headers'] as const;
 
 /**
@@ -284,15 +289,19 @@ function unshapeCursorServer(
   const raw = fromCursorEnvPlaceholders(def);
   const canon: Record<string, JsonValue> = isObject(raw) ? raw : {};
   // A `transport` in `mcp.json` can only have come from the shaper's bespoke
-  // passthrough, so the entry is already canonical — never re-infer over it (F5/1).
-  if (typeof canon.transport === 'string') return passthroughUnshape(canon, prior);
+  // passthrough, so the entry is already canonical — never re-infer over it (F5/1) —
+  // unless it sits beside a `type` the passthrough would never have written, in which
+  // case the two disagree and the transport is unknowable (F6/9).
+  const conflicting = hasConflictingDiscriminators(canon, CURSOR_SHAPER_TYPES);
+  if (typeof canon.transport === 'string' && !conflicting) return passthroughUnshape(canon, prior);
+  if (conflicting) warnConflictingTransport(ctx, canon.transport as string, canon.type as string);
 
   if (canon.command !== undefined && canon.url === undefined) {
     return {
-      fields: { transport: 'stdio', ...omitKeys(canon, ['type']) },
+      fields: { transport: 'stdio', ...omitKeys(canon, ['type', 'transport']) },
       supersedes: CURSOR_STDIO_SUPERSEDES,
       family: 'stdio',
-      transportAuthority: 'native',
+      transportAuthority: conflicting ? 'ambiguous' : 'native',
     };
   }
   if (canon.url !== undefined) {
@@ -303,7 +312,7 @@ function unshapeCursorServer(
     const type = nativeType ? (canon.type as string) : 'http';
     const fields: Record<string, JsonValue> = {
       transport: type,
-      ...omitKeys(canon, ['type', 'headers']),
+      ...omitKeys(canon, ['type', 'transport', 'headers']),
     };
     const headers = isObject(canon.headers) ? { ...canon.headers } : undefined;
     // A credential is never guessed at: an `Authorization` header that does not map
@@ -327,7 +336,7 @@ function unshapeCursorServer(
       supersedes:
         auth.kind === 'delete' ? [...CURSOR_REMOTE_SUPERSEDES, 'auth'] : CURSOR_REMOTE_SUPERSEDES,
       family: transportFamily(type),
-      transportAuthority: nativeType ? 'native' : 'inferred',
+      transportAuthority: conflicting ? 'ambiguous' : nativeType ? 'native' : 'inferred',
     };
   }
   // Unknown/bespoke Cursor entry: carry the whole (var-canonicalised) entry over.

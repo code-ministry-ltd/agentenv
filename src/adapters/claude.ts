@@ -21,8 +21,10 @@ import { resolveBinaryOnPath } from '../session/resolve.js';
 import {
   foldDriftIntoCanonical,
   omitKeys,
+  hasConflictingDiscriminators,
   passthroughUnshape,
   resolveAuthDrift,
+  warnConflictingTransport,
   type UnshapeContext,
   type UnshapedServer,
 } from './mcp-canonical.js';
@@ -225,6 +227,9 @@ function bearerEnvFromHeader(value: unknown): string | null {
  * the prior def. `auth` is added conditionally (see below).
  */
 const CLAUDE_STDIO_SUPERSEDES = ['type', 'command', 'args', 'env'] as const;
+
+/** The `type` values {@link shapeClaudeServer}'s non-passthrough branches emit. */
+const CLAUDE_SHAPER_TYPES = new Set(['stdio', 'http', 'sse']);
 const CLAUDE_REMOTE_SUPERSEDES = ['type', 'url', 'headers'] as const;
 
 /**
@@ -241,8 +246,12 @@ function unshapeClaudeServer(
   ctx: UnshapeContext,
 ): UnshapedServer {
   // A `transport` in `.claude.json` can only have come from the shaper's bespoke
-  // passthrough, so the entry is already canonical — never re-infer over it (F5/1).
-  if (typeof def.transport === 'string') return passthroughUnshape(def, prior);
+  // passthrough, so the entry is already canonical — never re-infer over it (F5/1)…
+  const conflicting = hasConflictingDiscriminators(def, CLAUDE_SHAPER_TYPES);
+  if (typeof def.transport === 'string' && !conflicting) return passthroughUnshape(def, prior);
+  // …unless it sits beside a `type` the passthrough would never have written, in which
+  // case the two disagree and the transport is unknowable (F6/9).
+  if (conflicting) warnConflictingTransport(ctx, def.transport as string, def.type as string);
 
   // Claude records the http/sse distinction NATIVELY in `type`, so a `type` the user
   // edited must PROPAGATE — preserving the prior canonical transport here would rewrite
@@ -258,17 +267,17 @@ function unshapeClaudeServer(
 
   if (type === 'stdio') {
     return {
-      fields: { transport: 'stdio', ...omitKeys(def, ['type']) },
+      fields: { transport: 'stdio', ...omitKeys(def, ['type', 'transport']) },
       supersedes: CLAUDE_STDIO_SUPERSEDES,
       family: 'stdio',
       // `stdio` is unambiguous in every direction — nothing else compiles to a `command`.
-      transportAuthority: 'native',
+      transportAuthority: conflicting ? 'ambiguous' : 'native',
     };
   }
   if (type === 'http' || type === 'sse') {
     const fields: Record<string, JsonValue> = {
       transport: type,
-      ...omitKeys(def, ['type', 'headers']),
+      ...omitKeys(def, ['type', 'transport', 'headers']),
     };
     const headers = isObject(def.headers) ? { ...def.headers } : undefined;
     // A credential is never guessed at: an `Authorization` header that does not map
@@ -292,7 +301,7 @@ function unshapeClaudeServer(
       supersedes:
         auth.kind === 'delete' ? [...CLAUDE_REMOTE_SUPERSEDES, 'auth'] : CLAUDE_REMOTE_SUPERSEDES,
       family: 'remote',
-      transportAuthority: nativeType ? 'native' : 'inferred',
+      transportAuthority: conflicting ? 'ambiguous' : nativeType ? 'native' : 'inferred',
     };
   }
   // Neither a Claude discriminator nor an inferable one: carry the whole entry over.
