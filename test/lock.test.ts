@@ -1,5 +1,6 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
+import { dirname } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LockError, withLock } from '../src/lock.js';
 import { resolvePaths } from '../src/paths.js';
@@ -37,6 +38,21 @@ const publishBarrier = vi.hoisted(() => {
   };
 });
 
+/**
+ * Makes `link` fail with a chosen errno, so the tests can reach the code that
+ * only runs on a filesystem without hard links — unreachable on any filesystem
+ * a test could realistically be run on, and therefore otherwise unverified.
+ */
+const hardLinkFault = vi.hoisted(() => {
+  let errno: string | null = null;
+  return {
+    fail(code: string | null) {
+      errno = code;
+    },
+    pending: () => errno,
+  };
+});
+
 vi.mock('node:fs/promises', async (importOriginal) => {
   const real = await importOriginal<typeof import('node:fs/promises')>();
   return {
@@ -49,6 +65,10 @@ vi.mock('node:fs/promises', async (importOriginal) => {
       return handle;
     },
     link: async (...args: Parameters<typeof real.link>) => {
+      const errno = hardLinkFault.pending();
+      if (errno !== null) {
+        throw Object.assign(new Error(`link: simulated ${errno}`), { code: errno });
+      }
       await real.link(...args);
       await publishBarrier.afterPublishing(String(args[1]));
     },
@@ -90,6 +110,7 @@ describe('withLock', () => {
 
   afterEach(() => {
     publishBarrier.disarm(); // a test that threw mid-park must not arm the next
+    hardLinkFault.fail(null);
     temp.cleanup();
     expectRealHomeUntouched(realBefore);
   });
@@ -471,6 +492,68 @@ describe('withLock', () => {
 
     expect(result).toBe('ran');
     expect(warnings.some((w) => /malformed lock file/.test(w))).toBe(true);
+  });
+
+  it('reclaims an EMPTY lock file left behind by a crashed process', async () => {
+    const p = paths();
+    // A zero-byte lock is exactly the state a half-finished publish used to
+    // leave visible, so it is tempting to close that hole by making empty locks
+    // un-reclaimable. That would trade a rare double-entry for a store wedged
+    // forever by one crash. The publish is atomic now, so an empty lock can
+    // only be debris — and debris must still be cleared.
+    writeFileSync(p.lock, '');
+    const warnings: string[] = [];
+
+    const result = await withLock(p, async () => 'ran', {
+      onWarn: (m) => warnings.push(m),
+    });
+
+    expect(result).toBe('ran');
+    expect(warnings.some((w) => /malformed lock file/.test(w))).toBe(true);
+    expect(existsSync(p.lock)).toBe(false);
+  });
+
+  it('still locks on a filesystem that cannot hard-link (falls back, EPERM)', async () => {
+    const p = paths();
+    // EPERM is what Linux reports for "this filesystem has no hard links". We
+    // would rather lock imperfectly there than not lock at all, so the acquire
+    // falls back to the plain exclusive create.
+    hardLinkFault.fail('EPERM');
+
+    const result = await withLock(p, async () => {
+      expect(JSON.parse(readFileSync(p.lock, 'utf8')).pid).toBe(process.pid);
+      return 'ran';
+    });
+
+    expect(result).toBe('ran');
+    expect(existsSync(p.lock)).toBe(false); // and it still releases
+    expect(readdirSync(dirname(p.lock)).filter((e) => e.startsWith('lock'))).toEqual([]);
+  });
+
+  it('propagates a link failure that is NOT "no hard links here"', async () => {
+    const p = paths();
+    // Only the specific "unsupported" errnos may downgrade to the weaker
+    // create; a genuine I/O fault must surface, not be silently worked around.
+    hardLinkFault.fail('EIO');
+
+    let ran = false;
+    await expect(
+      withLock(p, async () => {
+        ran = true;
+      }),
+    ).rejects.toThrow(/EIO/);
+
+    expect(ran).toBe(false);
+    expect(existsSync(p.lock)).toBe(false);
+    expect(readdirSync(dirname(p.lock)).filter((e) => e.startsWith('lock'))).toEqual([]);
+  });
+
+  it('leaves no scratch files beside the lock once it is released', async () => {
+    const p = paths();
+    await withLock(p, async () => 'ran');
+    // The atomic publish stages the holder record in a temp file next to the
+    // lock; a leaked one would accumulate in the user's ~/.agentenv forever.
+    expect(readdirSync(dirname(p.lock)).filter((e) => e.startsWith('lock'))).toEqual([]);
   });
 
   it('writes pid + timestamp into the lock while held', async () => {
