@@ -1,8 +1,9 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { expect } from 'vitest';
 
 /** A hermetic temp AGENTENV_HOME plus the env object to inject into run(). */
 export interface TempHome {
@@ -21,25 +22,83 @@ export function makeTempHome(extraEnv: NodeJS.ProcessEnv = {}): TempHome {
 }
 
 /**
- * Snapshot the real ~/.agentenv so a test can prove a command never touched it.
- * Works whether or not it already exists on the dev machine.
+ * A sandboxed stand-in for the process's home directory, installed for the span
+ * of one test by {@link guardRealHome} and torn down by
+ * {@link expectRealHomeUntouched}.
  */
-export function realHomeSnapshot(): { existed: boolean; mtimeMs?: number } {
-  const real = join(homedir(), '.agentenv');
-  if (!existsSync(real)) return { existed: false };
-  return { existed: true, mtimeMs: statSync(real).mtimeMs };
+export interface RealHomeGuard {
+  /** The temp dir `os.homedir()` resolves to while the guard is installed. */
+  home: string;
+  /** Where a leaked store lands: `<home>/.agentenv`. Must never be created. */
+  trap: string;
+  /** Restore the previous env and delete the sandbox home. Idempotent. */
+  restore: () => void;
 }
 
-export function expectRealHomeUntouched(before: { existed: boolean; mtimeMs?: number }): void {
-  const real = join(homedir(), '.agentenv');
-  if (!before.existed) {
-    if (existsSync(real)) {
-      throw new Error(`test created the real ~/.agentenv at ${real}`);
-    }
-    return;
-  }
-  if (statSync(real).mtimeMs !== before.mtimeMs) {
-    throw new Error(`test modified the real ~/.agentenv at ${real}`);
+/**
+ * Make the "real home" hermetic so a test can prove a command never wrote to an
+ * agentenv store outside the `AGENTENV_HOME` it was handed.
+ *
+ * There is exactly one way production code can reach a store other than the
+ * injected one: `resolvePaths()` falling back to `join(homedir(), '.agentenv')`
+ * because it was called without the test's env. So instead of inspecting the
+ * developer's real `~/.agentenv` after the fact — which reads state outside the
+ * sandbox, and therefore trips whenever anything else on the machine touches
+ * that directory concurrently — we point that fallback at a fresh empty temp
+ * dir and assert nothing appeared there.
+ *
+ * `AGENTENV_HOME` is unset in the process env for the same span, so the
+ * `homedir()` fallback is genuinely the path taken (a stray `AGENTENV_HOME` in
+ * the developer's shell would otherwise hide the leak). `USERPROFILE` is
+ * redirected too because `os.homedir()` consults it on Windows.
+ *
+ * Always pair with {@link expectRealHomeUntouched} (or call `restore()`
+ * yourself) — the redirect stays in place until one of them runs.
+ */
+export function guardRealHome(): RealHomeGuard {
+  const home = mkdtempSync(join(tmpdir(), 'agentenv-test-realhome-'));
+  const saved: Record<string, string | undefined> = {
+    HOME: process.env.HOME,
+    USERPROFILE: process.env.USERPROFILE,
+    AGENTENV_HOME: process.env.AGENTENV_HOME,
+  };
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  delete process.env.AGENTENV_HOME;
+
+  let restored = false;
+  return {
+    home,
+    trap: join(home, '.agentenv'),
+    restore: () => {
+      if (restored) return;
+      restored = true;
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(home, { recursive: true, force: true });
+    },
+  };
+}
+
+/**
+ * Assert the guarded home never grew an agentenv store, then tear the guard
+ * down. Fails as an assertion (with the leaked entries named), not as a bare
+ * throw whose stack is entirely inside vitest's hook machinery.
+ */
+export function expectRealHomeUntouched(guard: RealHomeGuard): void {
+  try {
+    const leaked = existsSync(guard.trap);
+    const entries = leaked ? readdirSync(guard.home).join(', ') : '';
+    expect(
+      leaked,
+      `production code resolved the agentenv store from os.homedir() instead of the ` +
+        `AGENTENV_HOME it was given: ${guard.trap} was created ` +
+        `(sandbox home now holds: ${entries})`,
+    ).toBe(false);
+  } finally {
+    guard.restore();
   }
 }
 

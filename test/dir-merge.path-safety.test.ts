@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { dematerialise, materialise } from '../src/dir-merge.js';
 import { resolvePaths } from '../src/paths.js';
-import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot, type TempHome } from './helpers.js';
+import { expectRealHomeUntouched, makeTempHome, guardRealHome, type TempHome } from './helpers.js';
 
 /**
  * Regression for review findings on 1.3: (Major) an unvalidated `itemName` was
@@ -14,9 +14,9 @@ import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot, type TempHome 
  */
 describe('dir-merge path-safety', () => {
   let tmp: TempHome;
-  let realBefore: ReturnType<typeof realHomeSnapshot>;
+  let realBefore: ReturnType<typeof guardRealHome>;
   beforeEach(() => {
-    realBefore = realHomeSnapshot();
+    realBefore = guardRealHome();
     tmp = makeTempHome();
   });
   afterEach(() => {

@@ -19,7 +19,7 @@ import {
 import { recoverState } from '../src/journal.js';
 import { resolvePaths } from '../src/paths.js';
 import { findOwner, readState } from '../src/state.js';
-import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot } from './helpers.js';
+import { expectRealHomeUntouched, makeTempHome, guardRealHome } from './helpers.js';
 
 /** Narrow a result to the materialised case, failing the test otherwise. */
 function materialised(result: MaterialiseResult) {
@@ -31,10 +31,10 @@ function materialised(result: MaterialiseResult) {
 
 describe('dir-merge surface', () => {
   let temp: ReturnType<typeof makeTempHome>;
-  let realBefore: ReturnType<typeof realHomeSnapshot>;
+  let realBefore: ReturnType<typeof guardRealHome>;
 
   beforeEach(() => {
-    realBefore = realHomeSnapshot();
+    realBefore = guardRealHome();
     temp = makeTempHome();
   });
 

@@ -5,16 +5,16 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { materialise, syncBack, type FileBlockSource } from '../src/file-block.js';
 import { resolvePaths } from '../src/paths.js';
 import { findOwners, readState } from '../src/state.js';
-import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot } from './helpers.js';
+import { expectRealHomeUntouched, makeTempHome, guardRealHome } from './helpers.js';
 
 const sha256 = (s: string) => createHash('sha256').update(s, 'utf8').digest('hex');
 
 describe('file-block surface — syncBack (drift)', () => {
   let temp: ReturnType<typeof makeTempHome>;
-  let realBefore: ReturnType<typeof realHomeSnapshot>;
+  let realBefore: ReturnType<typeof guardRealHome>;
 
   beforeEach(() => {
-    realBefore = realHomeSnapshot();
+    realBefore = guardRealHome();
     temp = makeTempHome();
   });
 

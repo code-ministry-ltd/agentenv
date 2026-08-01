@@ -3,16 +3,16 @@ import { hostname } from 'node:os';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { LockError, withLock } from '../src/lock.js';
 import { resolvePaths } from '../src/paths.js';
-import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot } from './helpers.js';
+import { expectRealHomeUntouched, makeTempHome, guardRealHome } from './helpers.js';
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 describe('withLock', () => {
   let temp: ReturnType<typeof makeTempHome>;
-  let realBefore: ReturnType<typeof realHomeSnapshot>;
+  let realBefore: ReturnType<typeof guardRealHome>;
 
   beforeEach(() => {
-    realBefore = realHomeSnapshot();
+    realBefore = guardRealHome();
     temp = makeTempHome();
   });
 

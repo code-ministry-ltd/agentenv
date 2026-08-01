@@ -13,14 +13,14 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { backup, restore } from '../src/backups.js';
 import { resolvePaths } from '../src/paths.js';
-import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot } from './helpers.js';
+import { expectRealHomeUntouched, makeTempHome, guardRealHome } from './helpers.js';
 
 describe('content-addressed backups', () => {
   let temp: ReturnType<typeof makeTempHome>;
-  let realBefore: ReturnType<typeof realHomeSnapshot>;
+  let realBefore: ReturnType<typeof guardRealHome>;
 
   beforeEach(() => {
-    realBefore = realHomeSnapshot();
+    realBefore = guardRealHome();
     temp = makeTempHome();
   });
 

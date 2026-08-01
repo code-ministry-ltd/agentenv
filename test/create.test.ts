@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { run } from '../src/cli.js';
 import { parseEnvConfig } from '../src/env-config.js';
-import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot, type TempHome } from './helpers.js';
+import { expectRealHomeUntouched, makeTempHome, guardRealHome, type TempHome } from './helpers.js';
 
 describe('create', () => {
   let tmp: TempHome;
@@ -19,7 +19,7 @@ describe('create', () => {
   }
 
   it('scaffolds a valid env.yaml and the store README', async () => {
-    const real = realHomeSnapshot();
+    const real = guardRealHome();
     const result = await run(['create', 'writing'], { env: tmp.env });
 
     expect(result.code).toBe(0);

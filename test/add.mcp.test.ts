@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { run } from '../src/cli.js';
-import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot, type TempHome } from './helpers.js';
+import { expectRealHomeUntouched, makeTempHome, guardRealHome, type TempHome } from './helpers.js';
 
 describe('add mcp', () => {
   let tmp: TempHome;
@@ -19,7 +19,7 @@ describe('add mcp', () => {
   const readServers = (): Record<string, unknown> => parseYaml(readFileSync(serversYaml(), 'utf8'));
 
   it('scaffolds a canonical stdio server with a ${VAR} placeholder', async () => {
-    const real = realHomeSnapshot();
+    const real = guardRealHome();
     const result = await run(['add', 'mcp', 'writing', 'github'], { env: tmp.env });
     expect(result.code).toBe(0);
 

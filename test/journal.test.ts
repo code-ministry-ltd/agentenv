@@ -5,7 +5,7 @@ import { backup } from '../src/backups.js';
 import { beginTransaction, recoverState, type PlannedMutation } from '../src/journal.js';
 import { resolvePaths } from '../src/paths.js';
 import { findOwner, readState, writeState, type ManifestItem } from '../src/state.js';
-import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot } from './helpers.js';
+import { expectRealHomeUntouched, makeTempHome, guardRealHome } from './helpers.js';
 
 function item(path: string, ownerEnv = 'work'): ManifestItem {
   return { action: 'symlink', surface: 'dir-merge', path, ownerEnv } as ManifestItem;
@@ -13,10 +13,10 @@ function item(path: string, ownerEnv = 'work'): ManifestItem {
 
 describe('write-ahead journal / transaction', () => {
   let temp: ReturnType<typeof makeTempHome>;
-  let realBefore: ReturnType<typeof realHomeSnapshot>;
+  let realBefore: ReturnType<typeof guardRealHome>;
 
   beforeEach(() => {
-    realBefore = realHomeSnapshot();
+    realBefore = guardRealHome();
     temp = makeTempHome();
   });
 

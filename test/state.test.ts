@@ -15,7 +15,7 @@ import {
   writeState,
   type ManifestItem,
 } from '../src/state.js';
-import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot } from './helpers.js';
+import { expectRealHomeUntouched, makeTempHome, guardRealHome } from './helpers.js';
 
 function symlinkItem(over: Partial<ManifestItem> = {}): ManifestItem {
   return {
@@ -30,10 +30,10 @@ function symlinkItem(over: Partial<ManifestItem> = {}): ManifestItem {
 
 describe('state manifest', () => {
   let temp: ReturnType<typeof makeTempHome>;
-  let realBefore: ReturnType<typeof realHomeSnapshot>;
+  let realBefore: ReturnType<typeof guardRealHome>;
 
   beforeEach(() => {
-    realBefore = realHomeSnapshot();
+    realBefore = guardRealHome();
     temp = makeTempHome();
   });
 
