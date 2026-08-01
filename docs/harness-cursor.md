@@ -111,6 +111,15 @@ writes the **canonical** shape, NEVER Cursor's `${env:}` shape. This keeps the s
 readable by every OTHER adapter and is round-trip stable — `compile(syncBack(v)) === v`
 (same strategy as Claude/Codex).
 
+Like Claude, Cursor records the http-vs-sse distinction NATIVELY in `type`, so a `type` the
+user edits in `mcp.json` PROPAGATES to canonical `transport`; only the harnesses whose shape
+cannot record it fall back to the prior canonical value. Cursor's *stdio* shape carries no
+`type` at all, so a hand-written canonical `transport` on a stdio entry has nothing to
+contradict it and is taken at face value — on a REMOTE entry the two disagree, and the
+write-back leaves `transport` alone and warns (F6). An `Authorization` header that no longer
+matches the compiled one likewise leaves `auth.bearer_env` unchanged and warns, and a value
+that looks like a resolved secret literal is never persisted into the store.
+
 ## Interface-freeze findings (reported to the owner — LOUD)
 
 - **`sessionSupported:false` + `validateConfigFile` expressed Cursor cleanly.** The two

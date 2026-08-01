@@ -156,7 +156,8 @@ server back via `unshapeOpenCodeServer` (`{env:VAR}`→`${VAR}`, the single `com
 array split back into `command`+`args`, `type:'local'|'remote'`→`transport`,
 `Authorization: Bearer {env:VAR}`→`auth.bearer_env`) and writes the **canonical** shape,
 NEVER OpenCode's `{env:}`/array shape. This keeps the shared store readable by every
-OTHER adapter and is round-trip stable — `compile(syncBack(v)) === v`.
+OTHER adapter and is round-trip stable — `compile(syncBack(v)) === v`, except where the
+write-back deliberately REFUSES a value (see "Ambiguity and refusal" below).
 
 **OVERLAY-AND-PRESERVE, not reconstruction.** The un-shape is applied as an overlay onto
 the PRIOR canonical def read from `servers.yaml`, never as a fresh reconstruction,
@@ -173,12 +174,41 @@ OpenCode shape cannot express (`timeout`, any field a future release adds) survi
 the prior def, and everything the user adds in `opencode.json` is carried over verbatim
 — there is no whitelist.
 
+**Preserve-the-prior-`transport` is SCOPED to the lossy shapes, not applied everywhere.**
+It is OpenCode's `type:"remote"` (and Codex's bare `url` table) that cannot record
+http-vs-sse. Claude and Cursor record it NATIVELY in their own `type`, so for them the
+drifted value IS the user's current answer and it propagates — preserving the prior one
+there would silently rewrite the user's `"type":"http"` edit back to `sse` on the next
+`use`. The write-back therefore carries an explicit per-branch `transportAuthority`
+(`native` | `inferred` | `verbatim` | `ambiguous`) rather than deciding from the
+transport family, which is not a sound discriminator for this.
+
 **Where NO prior canonical entry exists** (a server the user added straight into
 `opencode.json`), the `http`/`sse` ambiguity is **irreducible** — OpenCode's config
 simply does not record the difference — and the write-back infers `http`. Codex has the
 same irreducible gap (a bare `url` table). Claude and Cursor do not: they keep a native
 `type`, so they recover `sse` exactly. This is a property of OpenCode's schema, not a
 bug we can fix.
+
+**Ambiguity and refusal (F6).** Where a drift is genuinely ambiguous the write-back does
+NOT infer: it leaves the canonical field unchanged and warns through
+`ConfigKeysContext.onWarn`, naming the server and the field. Three cases reach that rule
+from OpenCode:
+
+- an `Authorization` header that no longer matches the one agentenv compiled from
+  `auth.bearer_env` — it could be a credential replacement or an unrelated header, and
+  the two have opposite consequences in a harness the user is not looking at, so
+  `auth.bearer_env` is left exactly as it was;
+- a hand-written canonical `transport` sitting beside OpenCode's own `type` — the two
+  discriminators disagree, so `transport` is left alone and the rest is read through the
+  `type` branch (carrying both shapes over verbatim used to duplicate an argument and
+  leak `type`/`enabled` into the store);
+- a value that looks like a RESOLVED SECRET LITERAL — never persisted into the
+  git-backed `servers.yaml`, whatever field it appears in.
+
+`enabled` follows the same principle: OpenCode's shape always carries one, so it is only
+written back when it DIFFERS from what the shaper emitted for the prior def — otherwise a
+hand-authored non-boolean `enabled` would be destroyed by the harness's own default.
 
 **Round-trip note (`use --global` → `drop`).** Keyed config-keys (this MCP surface)
 and file-block surfaces restore byte-identically. The **array-element** surface —

@@ -43,6 +43,22 @@ truth; the vault matrix is research and is not edited (per task).
    env vars are set (warns "Set the missing MCP env vars" when absent) — a `5.x`
    doctor hook could surface this, but it is out of scope here.
 
+   **`bearer_token_env_var` is NOT emitted when an `Authorization` header shadows it**
+   (F6/3, SECURITY). The header is what the server actually receives, so writing the
+   bearer beside it would have Codex go on authenticating with a credential the user may
+   believe they replaced — in a harness they were not looking at. The shaper refuses and
+   warns instead.
+
+   **`type` is honoured as the transport hint**, exactly as Claude/Cursor/OpenCode honour
+   it, so a hand-authored `{ type: websocket, url }` in `servers.yaml` passes through as
+   bespoke here too rather than being silently compiled to a plain HTTP table. And a
+   Codex table is just a `url`: `http` and `sse` are indistinguishable, so the write-back
+   NEVER writes its inferred `http` over a prior canonical `sse` — while superseding any
+   stale `type`, which would otherwise sit beside the inferred `transport` and contradict
+   it. Where a drift is genuinely ambiguous (an `Authorization` header that no longer
+   matches the compiled one, or a value that looks like a resolved secret literal), the
+   write-back leaves the canonical field unchanged and warns rather than guessing (F6).
+
 4. **Trust-gating — CONFIRMED** (spike #4 re-confirmed). A view config.toml carrying
    `[projects."/home/jim/some/repo"]  trust_level = "trusted"` parsed clean and did
    not perturb MCP resolution. The adapter emits this keyed injection when the launch

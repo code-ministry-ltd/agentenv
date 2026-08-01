@@ -89,6 +89,19 @@ This keeps the shared store readable by every OTHER adapter's `compileConfigKeys
 is round-trip stable — `compile(syncBack(v)) === v` — proving spec criterion 4. See
 the freeze note below.
 
+The un-shape is an OVERLAY onto the prior canonical def (see `mcp-canonical.ts`), so
+anything Claude cannot express survives. Two Claude-specific points:
+
+- **`type` is NATIVE here.** Claude records the http-vs-sse distinction itself, so a
+  `"type"` the user edits in `.claude.json` PROPAGATES to canonical `transport`. Only the
+  harnesses whose shape cannot record it (OpenCode `type:"remote"`, Codex's bare `url`
+  table) fall back to the prior canonical value.
+- **Ambiguity is warned, never guessed (F6).** An `Authorization` header that no longer
+  matches the one agentenv compiled from `auth.bearer_env` leaves `auth` UNCHANGED and
+  warns; so does a hand-written canonical `transport` sitting beside Claude's own `type`.
+  A value that looks like a resolved secret literal is never persisted into the
+  git-backed `servers.yaml` — the one deliberate exception to round-trip stability.
+
 ## Interface-freeze finding (reported to the owner)
 
 The frozen `Adapter` interface expressed Claude with **no missing field** — every
