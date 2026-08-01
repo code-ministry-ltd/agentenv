@@ -35,6 +35,9 @@ export interface RealHomeGuard {
   restore: () => void;
 }
 
+/** The guard currently redirecting this worker's HOME, if any. */
+let active: RealHomeGuard | null = null;
+
 /**
  * Make the "real home" hermetic so a test can prove a command never wrote to an
  * agentenv store outside the `AGENTENV_HOME` it was handed.
@@ -52,10 +55,14 @@ export interface RealHomeGuard {
  * the developer's shell would otherwise hide the leak). `USERPROFILE` is
  * redirected too because `os.homedir()` consults it on Windows.
  *
- * Always pair with {@link expectRealHomeUntouched} (or call `restore()`
- * yourself) — the redirect stays in place until one of them runs.
+ * Pair it with {@link expectRealHomeUntouched} (or call `restore()` yourself).
+ * If a test throws before either runs, the next `guardRealHome()` tears the
+ * abandoned guard down first — vitest reuses a worker process across files, so a
+ * redirect left dangling by a failed test would otherwise become exactly the
+ * kind of cross-file state that makes later failures unexplainable.
  */
 export function guardRealHome(): RealHomeGuard {
+  active?.restore(); // never stack redirects: the saved values must be the real ones
   const home = mkdtempSync(join(tmpdir(), 'agentenv-test-realhome-'));
   const saved: Record<string, string | undefined> = {
     HOME: process.env.HOME,
@@ -67,12 +74,13 @@ export function guardRealHome(): RealHomeGuard {
   delete process.env.AGENTENV_HOME;
 
   let restored = false;
-  return {
+  const guard: RealHomeGuard = {
     home,
     trap: join(home, '.agentenv'),
     restore: () => {
       if (restored) return;
       restored = true;
+      if (active === guard) active = null;
       for (const [key, value] of Object.entries(saved)) {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
@@ -80,6 +88,8 @@ export function guardRealHome(): RealHomeGuard {
       rmSync(home, { recursive: true, force: true });
     },
   };
+  active = guard;
+  return guard;
 }
 
 /**
