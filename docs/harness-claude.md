@@ -63,11 +63,11 @@ truth; the vault matrix is research and is not edited (per task).
 
 - **`.claude.json` is a mixed state+config file** (D15). The composer seeds it from
   the real file (carrying `context7`, `oauthAccount`, onboarding flags, host state)
-  and injects the env's `mcpServers`; env-owned keys follow drift write-back, other
-  drift is discarded at session end. `.credentials.json` is the single bucket-1
-  pass-through that keeps the view logged in.
+  and injects the env's `mcpServers`. A later edit to an env-owned key is REPORTED, not
+  folded back (see below); other drift is discarded at session end. `.credentials.json`
+  is the single bucket-1 pass-through that keeps the view logged in.
 
-## MCP shape transform (`compileConfigKeys` / `syncBackConfigKeys`)
+## MCP shape transform (`compileConfigKeys`)
 
 Canonical `mcp/servers.yaml` (D6) → Claude `.claude.json` `mcpServers.<name>`:
 
@@ -78,44 +78,69 @@ Canonical `mcp/servers.yaml` (D6) → Claude `.claude.json` `mcpServers.<name>`:
 | `auth: { bearer_env: VAR }` | header `Authorization: "Bearer ${VAR}"` |
 
 `${VAR}` placeholders are KEPT (rung-1 passthrough — Claude interpolates them
-natively) and every `${VAR}`-bearing field is recorded in `secretFields` so
-write-back restores the placeholder, never a baked literal (D6).
+natively) and every `${VAR}`-bearing field is recorded in `secretFields` so the drift
+sweep sees the placeholder, never a baked literal (D6).
 
-`servers.yaml` is **always D6-canonical** (F1): `syncBackConfigKeys` reverse-maps a
-drifted server via `unshapeClaudeServer` (the inverse of the forward transform —
-`type`→`transport`, `Authorization: Bearer ${VAR}`→`auth.bearer_env`, placeholders
-restored) and writes the **canonical** shape, NEVER Claude's `type`/`headers` shape.
-This keeps the shared store readable by every OTHER adapter's `compileConfigKeys` and
-is round-trip stable — `compile(syncBack(v)) === v` — proving spec criterion 4. See
-the freeze note below.
+The flow is **one-way**: canonical → Claude. `mcp/servers.yaml` is the single source of
+truth and agentenv never writes it on your behalf.
 
-The un-shape is an OVERLAY onto the prior canonical def (see `mcp-canonical.ts`), so
-anything Claude cannot express survives. Two Claude-specific points:
+## MCP drift is REPORTED, not applied (`describeConfigKeysDrift`)
+
+If you edit a server in `.claude.json` — change a URL, add a header, delete `env` —
+agentenv does **not** fold that edit back into `mcp/servers.yaml`. On the next command it
+tells you, per server, which canonical fields differ and how:
+
+```
+agentenv: mcp drift — 'linear' differs between the claude-code config and env 'work':
+    harness config:  /home/you/.claude/.claude.json
+    canonical store: /home/you/.agentenv/store/environments/work/mcp/servers.yaml
+  changed url
+  added   headers.X-Api-Key
+  agentenv has NOT changed …/mcp/servers.yaml — edit it yourself to make the
+  harness-side change permanent.
+```
+
+**To make a harness-side change permanent, edit `mcp/servers.yaml` yourself** (in
+canonical D6 shape — `transport`/`command`/`url`/`auth`, not Claude's `type`/`headers`),
+then run any agentenv command to re-materialise. Until you do, the next `use` will put
+the canonical value back.
+
+The report names FIELDS and env-var NAMES only, never values, so a credential you pasted
+into `.claude.json` can never reach a terminal or a log through it.
+
+Why report rather than apply: the forward transform is not injective (`transport: http`
+and `transport: sse` both compile to shapes other harnesses cannot tell apart), so an
+inverse has to be *reconstructed* rather than computed. Three adversarial review rounds
+each fixed the reconstruction defects they were shown and introduced new ones at the next
+uncovered boundary, twice with a security consequence. Classification is good enough to
+DESCRIBE a difference and was never good enough to DECIDE what to do about one — so the
+decision is yours. See `src/adapters/mcp-canonical.ts`.
+
+Claude-specific classification points:
 
 - **`type` is NATIVE here.** Claude records the http-vs-sse distinction itself, so a
-  `"type"` the user edits in `.claude.json` PROPAGATES to canonical `transport`. Only the
-  harnesses whose shape cannot record it (OpenCode `type:"remote"`, Codex's bare `url`
-  table) fall back to the prior canonical value.
-- **Ambiguity is warned, never guessed (F6).** An `Authorization` header that no longer
-  matches the one agentenv compiled from `auth.bearer_env` leaves `auth` UNCHANGED and
-  warns; so does a hand-written canonical `transport` sitting beside Claude's own `type`.
-  A value that looks like a resolved secret literal is never persisted into the
-  git-backed `servers.yaml` — the one deliberate exception to round-trip stability.
+  `"type"` you edit in `.claude.json` is reported as a `transport` change. The harnesses
+  whose shape cannot record it (OpenCode `type:"remote"`, Codex's bare `url` table) do
+  not report a transport change for an unrelated edit.
+- **Ambiguity is flagged, never resolved.** An `Authorization` header that no longer
+  matches the one agentenv compiled from `auth.bearer_env` is reported against
+  `auth.bearer_env` with a note saying agentenv cannot tell whether you replaced the
+  credential or changed an unrelated header; so is a hand-written canonical `transport`
+  sitting beside Claude's own `type`.
 
 ## Interface-freeze finding (reported to the owner)
 
 The frozen `Adapter` interface expressed Claude with **no missing field** — every
-surface, the override, the two-bucket split, MCP compile + reverse-sync, and the
+surface, the override, the two-bucket split, MCP compile + drift classification, and the
 self-check all landed on existing shapes. Two points of friction worth recording:
 
-- **`syncBack` writes the D6-canonical shape (F1 decision).** Earlier this adapter
-  wrote the drifted server back in Claude's normalised (`type`/`headers`) shape, which
-  *poisoned* the shared `mcp/servers.yaml` for every OTHER harness (they read one
-  canonical store). The fix: `unshapeClaudeServer` reverse-maps back to
-  `transport`/`auth.bearer_env` (mirroring Codex's `unshapeCodexServer`), so
-  `servers.yaml` stays canonical and each adapter's `compileConfigKeys` only ever reads
-  canonical. The reverse transform is unambiguous here because the forward transform is
-  the only writer of the `Authorization: Bearer ${VAR}` header we recognise.
+- **The reverse hook was cut to a classifier (v1 decision).** It began as
+  `syncBackConfigKeys`, returning store mutations; that is gone. `describeConfigKeysDrift`
+  returns a report — an entry name, a store-relative location and named fields, with no
+  content and no writable path — so no adapter can write the shared `mcp/servers.yaml`.
+  `unshapeClaudeServer` survives as the classifier that maps Claude's `type`/`headers`
+  shape back onto canonical field NAMES, so the report tells you which canonical field to
+  edit rather than which Claude field you touched.
 
 - **Instructions-as-dir-merge routes store files by their RAW store name.** The
   composer/engine place `environments/<env>/instructions/*` into `rules/` by

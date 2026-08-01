@@ -85,7 +85,7 @@ adapter is **skills-only** for user-authored prompt bundles (the matrix's recomm
 `cli-config.json`, `hooks.json`, `commands`, sessions, worktrees, statsig caches, and any
 future entry → **state** (bucket-1 pass-through, the safe unknown, D15).
 
-## MCP shape transform (`compileConfigKeys` / `syncBackConfigKeys`)
+## MCP shape transform (`compileConfigKeys`)
 
 Canonical `mcp/servers.yaml` (D6) → Cursor `mcp.json` `mcpServers.<name>`:
 
@@ -100,25 +100,41 @@ Canonical `mcp/servers.yaml` (D6) → Cursor `mcp.json` `mcpServers.<name>`:
 natively, so the surface is **passthrough** (`substitutePlaceholders: false`) — the compiled
 `${env:VAR}` is written verbatim and Cursor resolves it; no secret value ever leaves the env.
 `secretFields` records the **Cursor-syntax** placeholder (e.g. `Bearer ${env:LINEAR_TOKEN}`),
-so a drift write-back keeps the secret as an INDIRECTION — never a baked literal — in both
-the store (as canonical `auth.bearer_env`, below) and the real `mcp.json` (as `${env:VAR}`,
-which Cursor interpolates), keeping the real file interpolatable even after a user edit.
+so the drift sweep sees the INDIRECTION and never a baked literal, and the real `mcp.json`
+keeps `${env:VAR}` (which Cursor interpolates) even after a user edit.
 
-`servers.yaml` is **always D6-canonical** (F1): `syncBackConfigKeys` reverse-maps a drifted
-server via `unshapeCursorServer` (the inverse of the forward transform — `${env:VAR}`→
-`${VAR}`, a bare `command`→stdio, `Authorization: Bearer ${VAR}`→`auth.bearer_env`) and
-writes the **canonical** shape, NEVER Cursor's `${env:}` shape. This keeps the shared store
-readable by every OTHER adapter and is round-trip stable — `compile(syncBack(v)) === v`
-(same strategy as Claude/Codex).
+The flow is **one-way**: canonical → Cursor. `mcp/servers.yaml` is the single source of
+truth and agentenv never writes it on your behalf.
 
-Like Claude, Cursor records the http-vs-sse distinction NATIVELY in `type`, so a `type` the
-user edits in `mcp.json` PROPAGATES to canonical `transport`; only the harnesses whose shape
-cannot record it fall back to the prior canonical value. Cursor's *stdio* shape carries no
-`type` at all, so a hand-written canonical `transport` on a stdio entry has nothing to
-contradict it and is taken at face value — on a REMOTE entry the two disagree, and the
-write-back leaves `transport` alone and warns (F6). An `Authorization` header that no longer
-matches the compiled one likewise leaves `auth.bearer_env` unchanged and warns, and a value
-that looks like a resolved secret literal is never persisted into the store.
+## MCP drift is REPORTED, not applied (`describeConfigKeysDrift`)
+
+If you edit a server in `~/.cursor/mcp.json`, agentenv does **not** fold that edit back
+into `mcp/servers.yaml`. On the next command it names the server and the canonical fields
+that differ (`url` changed, `auth.bearer_env` added, …), names both files, and says
+plainly that the canonical store was NOT changed.
+
+**To make a harness-side change permanent, edit `mcp/servers.yaml` yourself** — in
+canonical D6 shape (`transport`/`command`/`url`/`auth`, `${VAR}` placeholders), not
+Cursor's `${env:}` shape. Until you do, the next `use --global` puts the canonical value
+back. The report carries field names and env-var names only, never values.
+
+`unshapeCursorServer` still runs, but only to CLASSIFY: it maps `${env:VAR}`→`${VAR}`, a
+bare `command`→stdio and `Authorization: Bearer ${VAR}`→`auth.bearer_env`, so the report
+names the CANONICAL field you must edit rather than the Cursor field you touched.
+
+Like Claude, Cursor records the http-vs-sse distinction NATIVELY in `type`, so a `type`
+you edit in `mcp.json` is reported as a `transport` change; the harnesses whose shape
+cannot record it do not report one for an unrelated edit. Cursor's *stdio* shape carries
+no `type` at all, so a hand-written canonical `transport` on a stdio entry has nothing to
+contradict it and is reported plainly — on a REMOTE entry the two disagree, and the report
+flags `transport` with a note instead of resolving it. An `Authorization` header that no
+longer matches the compiled one is likewise flagged against `auth.bearer_env` with a note,
+because a credential replacement and an unrelated header edit have opposite consequences
+in a harness you are not looking at.
+
+Why report rather than apply: see the same section in `harness-claude.md` — the forward
+transform is not injective, so the inverse must be reconstructed, and three review rounds
+of that reconstruction each produced a fresh defect at the next uncovered boundary.
 
 ## Interface-freeze findings (reported to the owner — LOUD)
 

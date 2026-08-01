@@ -110,3 +110,12 @@ and file-block surfaces. For **array-element** surfaces — Pi's `settings.json`
 (e.g. `packages: [\n  "x"\n]` → `packages: ["x"]`). This is **design-sanctioned**
 (parsed-equal, no residue, ownership fully removed), not a bug — see the array-element
 detail above.
+
+## No config-keys drift classifier
+
+Pi declares no `describeConfigKeysDrift` hook, and this is the adapter that proves the
+hook really is optional. Array-element ownership is **by value**, so `config-keys.syncBack`
+reports drift for `keyed` ownership only — a changed element reads as ABSENT, never as a
+mutated value. Pi's one config-keys surface (`settings`) is array-element, and its MCP
+surface is unsupported, so there is no drift here to classify. (An earlier version carried
+a settings write-back hook that the sweep could never reach; it has been removed.)
