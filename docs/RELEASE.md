@@ -14,8 +14,13 @@ Two guards in `package.json` enforce this:
 - a `prepublishOnly` script that prints the reason and exits 1.
 
 `npm publish` therefore fails; `npm pack`, `npm install -g <tgz>` and
-`npm install -g github:…` are all unaffected. Do not remove either guard to
-"just try it".
+`npm install -g .` from a checkout are all unaffected. Do not remove either
+guard to "just try it".
+
+Note that `npm install -g github:code-ministry-ltd/agentenv` does **not** work
+— npm runs the `prepare` build without the dev dependencies and fails with
+`tsc: not found`. The two supported install paths are the release tarball and a
+built checkout, and the README says so.
 
 ---
 

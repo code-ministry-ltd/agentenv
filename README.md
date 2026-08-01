@@ -83,12 +83,10 @@ npm install -g .
 agentenv --version
 ```
 
-Or straight from the repo URL — npm clones it and runs the `prepare` build for
-you:
-
-```sh
-npm install -g github:code-ministry-ltd/agentenv
-```
+> `npm install -g github:code-ministry-ltd/agentenv` — installing straight from
+> the repo URL without cloning first — does **not** work. npm runs the `prepare`
+> build without the dev dependencies it needs and fails with `tsc: not found`.
+> Clone and build, or use the release tarball.
 
 ### Uninstall
 
@@ -445,13 +443,16 @@ pre-mutation backup. `agentenv doctor --repair` deletes them and the next
 
 ## Supported harnesses
 
-| Harness         | id            | binary         | session | skills               | instructions         | MCP                  |
-|-----------------|---------------|----------------|---------|----------------------|----------------------|----------------------|
-| **Claude Code** | `claude-code` | `claude`       | yes     | `~/.claude/skills`   | `~/.claude/rules/`   | `.claude.json`       |
-| **Codex**       | `codex`       | `codex`        | yes     | `~/.codex/skills`    | `~/.codex/AGENTS.md` | `config.toml`        |
-| **OpenCode**    | `opencode`    | `opencode`     | yes     | agents dir           | `instructions[]`     | `opencode.json`      |
-| **Pi**          | `pi`          | `pi`           | yes     | `~/.pi/agent/skills` | `AGENTS.md`          | **unsupported**      |
-| **Cursor**      | `cursor`      | `cursor-agent` | **no**  | `~/.cursor/skills`   | **unsupported**      | `~/.cursor/mcp.json` |
+| Harness         | id            | binary         | session | config root           | skills   | instructions            | MCP              |
+|-----------------|---------------|----------------|---------|-----------------------|----------|-------------------------|------------------|
+| **Claude Code** | `claude-code` | `claude`       | yes     | `~/.claude`           | `skills/`| `rules/` (dir-merge)    | `.claude.json`   |
+| **Codex**       | `codex`       | `codex`        | yes     | `~/.codex`            | `skills/`| `AGENTS.md` (file-block)| `config.toml`    |
+| **OpenCode**    | `opencode`    | `opencode`     | yes     | `~/.config/opencode`  | `skills/`| `instructions[]` in `opencode.json` | `opencode.json` |
+| **Pi**          | `pi`          | `pi`           | yes     | `~/.pi/agent`         | `skills/`| `AGENTS.md` (file-block)| **unsupported**  |
+| **Cursor**      | `cursor`      | `cursor-agent` | **no**  | `~/.cursor`           | `skills/`| **unsupported**         | `mcp.json`       |
+
+Claude Code and OpenCode additionally manage `agents/` and `commands/`; Pi
+additionally manages `prompts/` and `settings.json`.
 
 Per-harness live-verification notes, including exactly which cells were probed
 against a real binary and when, are in
