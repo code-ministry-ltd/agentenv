@@ -434,6 +434,12 @@ second run reports clean.
 
 `--repair` and `--restore` are mutually exclusive.
 
+One thing that surprises people: after `agentenv drop … --global`, `doctor`
+exits 1 reporting `orphaned-backup` for each dropped item. That is housekeeping,
+not damage — dropping an item removes the manifest record that referenced its
+pre-mutation backup. `agentenv doctor --repair` deletes them and the next
+`doctor` is clean.
+
 **What `--repair` cannot do** is set out under
 [Known limitations](#known-limitations). Read it.
 

@@ -29,15 +29,11 @@ jobs:
       - name: Lint, typecheck and test
         run: npm run ci
 
-      - name: Package and global-install smoke test
+      # Packs the release artifact, installs it into a clean prefix, and drives the
+      # README's own instructions against the INSTALLED binary: build an env on a
+      # simulated machine A, push it to a bare remote, restore it on machine B with
+      # `init --remote`, and assert it materialised on two harnesses. Fully
+      # sandboxed (temp AGENTENV_HOME + temp HOME) and offline (file:// remote).
+      - name: Pack and install smoke test
         shell: bash
-        run: |
-          set -euo pipefail
-          npm run build
-          npm pack
-          tgz=$(ls code-ministry-agentenv-*.tgz)
-          prefix="$RUNNER_TEMP/agentenv-global"
-          npm i -g "./$tgz" --prefix "$prefix"
-          got=$("$prefix/bin/agentenv" --version)
-          echo "agentenv --version => $got"
-          test "$got" = "0.0.1"
+        run: npm run smoke:install

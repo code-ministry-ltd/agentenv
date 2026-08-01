@@ -21,7 +21,8 @@
     "lint": "eslint .",
     "test": "vitest run",
     "ci": "npm run lint && npm run typecheck && npm run test",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "smoke:install": "bash scripts/smoke-install.sh"
   },
   "repository": {
     "type": "git",
