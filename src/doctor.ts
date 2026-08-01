@@ -229,12 +229,6 @@ function fileBlockItems(manifest: StateManifest): FileBlockItem[] {
   return manifest.items.filter((i): i is FileBlockItem => i.surface === 'file-block');
 }
 
-/** A manifest-owned region that is no longer well-formed: `conflict` or `absent`. */
-async function isRegionBroken(paths: Paths, item: FileBlockItem): Promise<boolean> {
-  const insp = await inspectOwnedRegion(paths, { target: item.path, env: item.ownerEnv });
-  return insp.status === 'conflict' || insp.status === 'absent';
-}
-
 /** Manifest-owned file-block regions whose markers a harness broke (design D4). */
 async function detectMangledMarkers(
   paths: Paths,
@@ -244,15 +238,20 @@ async function detectMangledMarkers(
   for (const item of fileBlockItems(manifest)) {
     const insp = await inspectOwnedRegion(paths, { target: item.path, env: item.ownerEnv });
     if (insp.status !== 'conflict' && insp.status !== 'absent') continue;
-    const why =
-      insp.status === 'conflict'
-        ? `its markers were mangled (${insp.detail ?? 'no longer well-formed'})`
-        : 'its managed marker region is missing';
+    const conflict = insp.status === 'conflict';
+    const why = conflict
+      ? `its markers were mangled (${insp.detail ?? 'no longer well-formed'})`
+      : 'its managed marker region is missing';
     out.push({
       kind: 'mangled-markers',
       where: `${item.path} (env '${item.ownerEnv}')`,
       what: `the region env '${item.ownerEnv}' owns in ${item.path} is broken — ${why}`,
-      repair: 'restore the file to its pre-materialise backup and re-materialise a clean region',
+      // The two statuses need different — and differently destructive — fixes, so
+      // say which one this problem will get rather than promising a rollback the
+      // absent case does not (and must not) perform.
+      repair: conflict
+        ? 'restore the file to its pre-materialise backup and re-materialise a clean region'
+        : 're-insert the managed region from the manifest + store, leaving the rest of the file as it is',
     });
   }
   return out;
@@ -387,15 +386,28 @@ async function repairStoreDrift(
 }
 
 /**
- * Restore a broken file-block region. The mechanisms fail CLOSED on mangled
- * markers (they refuse to reclaim a guessed span), so repair goes back to the
- * item's preserved pre-materialise backup — removing the mangled markers as bytes,
- * not by trusting them — then re-materialises a clean region from the manifest's
- * recorded sub-blocks + store. The re-materialise is journalled and lock-guarded.
+ * Rebuild a broken file-block region, by HOW it is broken (Task 5.1):
  *
- * Scope: one region per file. Several envs owning regions in ONE file with mangled
- * markers is a hardening case (Task 5.1); here each broken region is repaired from
- * its own backup.
+ * - **conflict** — markers claim this env but do not match the record (duplicated,
+ *   relabelled, non-contiguous, CRLF-rewritten, wrapped in merge fences). The
+ *   mechanisms fail CLOSED on these (they refuse to reclaim a guessed span), so the
+ *   only way to remove the mangled text is to go back to the item's preserved
+ *   pre-materialise backup — removing the markers as bytes, not by trusting them —
+ *   and re-materialise from the manifest's recorded sub-blocks + store. This DOES
+ *   discard edits made to the file since activation; it is the fail-closed price of
+ *   not guessing a span, and the reported `repair` line says so.
+ * - **absent** — the region is simply gone (a harness rewrote the file without it).
+ *   Nothing mangled remains to remove, and `materialise` re-inserts into the file
+ *   exactly as it stands, so rolling the file back would destroy the user's later
+ *   edits for no reason at all. Re-materialise ONLY.
+ *
+ * Either way the re-materialise is journalled and lock-guarded.
+ *
+ * Several envs owning regions in ONE file are handled by re-inspecting each record
+ * against the file as it stands at its turn: a conflict repair that rolls the file
+ * back also removes a sibling env's region, which then reads as `absent` and is
+ * re-materialised in the same pass — so the pass converges with every env's region
+ * present (pinned by doctor.hardening's shared-file test).
  */
 async function repairMangledMarkers(
   paths: Paths,
@@ -403,16 +415,22 @@ async function repairMangledMarkers(
   actions: string[],
 ): Promise<void> {
   for (const item of fileBlockItems(manifest)) {
-    if (!(await isRegionBroken(paths, item))) continue;
-    // Back to the pre-materialise state (markers gone), then rebuild the region.
-    if (item.backupRef) await restore(paths, item.backupRef, item.path);
+    const insp = await inspectOwnedRegion(paths, { target: item.path, env: item.ownerEnv });
+    if (insp.status !== 'conflict' && insp.status !== 'absent') continue;
+    if (insp.status === 'conflict' && item.backupRef) {
+      await restore(paths, item.backupRef, item.path);
+    }
     await fbMaterialise(paths, {
       target: item.path,
       env: item.ownerEnv,
       mode: item.mode,
       sources: item.subBlocks.map((sb) => ({ source: sb.source, storePath: sb.storePath })),
     });
-    actions.push(`restored mangled marker region in ${item.path} (env '${item.ownerEnv}')`);
+    actions.push(
+      insp.status === 'conflict'
+        ? `restored mangled marker region in ${item.path} (env '${item.ownerEnv}')`
+        : `re-inserted the missing marker region in ${item.path} (env '${item.ownerEnv}')`,
+    );
   }
 }
 
