@@ -43,7 +43,7 @@ export function isJsonObject(v: unknown): v is Record<string, JsonValue> {
 }
 
 /** The transport families every adapter's shaper branches on. */
-export type TransportFamily = 'stdio' | 'remote' | 'bespoke';
+type TransportFamily = 'stdio' | 'remote' | 'bespoke';
 
 /** `stdio` → stdio; `http`/`sse` → remote; anything else → bespoke (shaper passthrough). */
 export function transportFamily(transport: unknown): TransportFamily {
@@ -68,7 +68,7 @@ export function transportFamily(transport: unknown): TransportFamily {
  * - `ambiguous` — the harness value carries CONTRADICTORY discriminators. Never write a
  *   transport from it: keep the prior one (or none) and warn.
  */
-export type TransportAuthority = 'native' | 'inferred' | 'verbatim' | 'ambiguous';
+type TransportAuthority = 'native' | 'inferred' | 'verbatim' | 'ambiguous';
 
 /** The canonical keys that belong to ONE transport family and go with it when it changes. */
 const FAMILY_KEYS: Readonly<Record<'stdio' | 'remote', readonly string[]>> = {
@@ -94,14 +94,14 @@ export function omitKeys(
  * harness shape — every shaper honours `type` as the transport hint, so the write-back
  * must read it the same way rather than treating the entry as transport-less).
  */
-export function priorTransport(prior: Record<string, JsonValue>): string | undefined {
+function priorTransport(prior: Record<string, JsonValue>): string | undefined {
   if (typeof prior.transport === 'string') return prior.transport;
   if (prior.type === 'stdio' || prior.type === 'http' || prior.type === 'sse') return prior.type;
   return undefined;
 }
 
 /** The prior canonical def's family, inferred from its shape when it names no transport. */
-export function priorFamily(prior: Record<string, JsonValue>): TransportFamily | undefined {
+function priorFamily(prior: Record<string, JsonValue>): TransportFamily | undefined {
   const t = priorTransport(prior);
   if (t !== undefined) return transportFamily(t);
   if (prior.command !== undefined) return 'stdio';
@@ -158,8 +158,13 @@ export function passthroughUnshape(
  * Overlay one un-shaped harness value onto the PRIOR canonical def (see the module
  * header). `prior` is the def currently in `servers.yaml`; anything other than an
  * object (or absent) means there is no prior def and the un-shaped fields stand alone.
+ *
+ * MODULE-PRIVATE on purpose. This is the only function that builds a would-be canonical
+ * def, and it exists solely so {@link describeCanonicalDrift} has something to diff
+ * against. No adapter can reach a rebuilt canonical value — only the named-field
+ * difference — so the write path cannot be reassembled from outside this file.
  */
-export function overlayCanonicalServer(prior: unknown, unshaped: UnshapedServer): JsonValue {
+function overlayCanonicalServer(prior: unknown, unshaped: UnshapedServer): JsonValue {
   const priorObj = isJsonObject(prior) ? prior : undefined;
   const out: Record<string, JsonValue> = priorObj ? { ...priorObj } : {};
 
@@ -244,7 +249,7 @@ export function noteConflictingTransport(
 }
 
 /** What a drifted `Authorization` header says about canonical `auth.bearer_env`. */
-export type AuthDrift =
+type AuthDrift =
   /** Write `auth: { bearer_env }` — an exact, unambiguous correspondence. */
   | { kind: 'set'; bearerEnv: string }
   /** The bearer really was removed — supersede `auth`. */
