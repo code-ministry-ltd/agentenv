@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
+import { link, mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { dirname } from 'node:path';
 import type { Paths } from './paths.js';
@@ -142,8 +142,59 @@ async function reclaim(lockPath: string, expectedToken: string | null): Promise<
   return 'superseded';
 }
 
-/** Attempt an atomic O_EXCL create carrying our holder record. */
+/**
+ * `link(2)` failures that mean "this filesystem cannot make hard links" rather
+ * than "the lock is taken". EPERM is the one Linux reports for a filesystem
+ * without hard-link support; the others cover the same refusal elsewhere.
+ */
+const LINK_UNSUPPORTED = new Set(['EPERM', 'ENOSYS', 'ENOTSUP', 'EOPNOTSUPP', 'EXDEV', 'EMLINK']);
+
+/**
+ * Publish our holder record at `lockPath` **atomically**, or report that
+ * someone else holds it.
+ *
+ * The record is written to a private temp file first and then hard-linked into
+ * place, because `link` is the one primitive that is both exclusive and
+ * all-at-once: it fails EEXIST if the target exists (the O_EXCL semantics the
+ * lock is built on) and, when it succeeds, the lock file carries its holder
+ * record from the very instant it becomes visible.
+ *
+ * The obvious alternative — `open(lockPath, 'wx')` then write — is exclusive
+ * but *not* all-at-once: it leaves the lock existing-but-empty across an await.
+ * A waiter reading it there cannot parse a holder, judges the lock ownerless,
+ * and reclaims it out from under us (see {@link withLock}'s malformed path,
+ * whose "still malformed" identity check the same empty bytes satisfy) —
+ * breaking mutual exclusion. A sub-millisecond window, but a real one: it
+ * failed the serialisation test intermittently under load.
+ *
+ * Fallback: on a filesystem with no hard links we have no atomic publish
+ * available, so we take the two-step create and its window rather than refuse
+ * to lock at all. In practice agentenv already needs symlinks elsewhere, so a
+ * store on such a filesystem is not a supported configuration.
+ */
 async function tryAcquire(lockPath: string, self: LockHolder): Promise<boolean> {
+  const record = JSON.stringify(self);
+  const temp = `${lockPath}.new-${process.pid}-${randomBytes(4).toString('hex')}`;
+  try {
+    await writeFile(temp, record, { flag: 'wx' });
+    try {
+      await link(temp, lockPath);
+      return true; // the lock is ours, fully formed, as of the link
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST') return false; // someone else holds it
+      if (!LINK_UNSUPPORTED.has(code ?? '')) throw err;
+      // else: no hard links here — fall through to the two-step create.
+    }
+  } finally {
+    // The link (or its failure) is the outcome; our copy is always disposable.
+    await rm(temp, { force: true });
+  }
+  return await createInPlace(lockPath, record);
+}
+
+/** Non-atomic publish, used only where {@link link} is unsupported. */
+async function createInPlace(lockPath: string, record: string): Promise<boolean> {
   let handle;
   try {
     handle = await open(lockPath, 'wx');
@@ -152,7 +203,7 @@ async function tryAcquire(lockPath: string, self: LockHolder): Promise<boolean> 
     throw err;
   }
   try {
-    await handle.writeFile(JSON.stringify(self));
+    await handle.writeFile(record);
   } finally {
     await handle.close();
   }
@@ -164,9 +215,12 @@ async function tryAcquire(lockPath: string, self: LockHolder): Promise<boolean> 
  * the tool's own store/global mutations; session-view builds need no lock).
  *
  * Contract:
- * - **Mutual exclusion** via an atomic O_EXCL create at `paths.lock` carrying
- *   `{pid, timestamp, host, token}`. A second acquirer never enters the
- *   critical section while the first holds the lock.
+ * - **Mutual exclusion** via an atomic, exclusive publish of `{pid, timestamp,
+ *   host, token}` at `paths.lock` (write-temp-then-`link`, see
+ *   {@link tryAcquire}). A second acquirer never enters the critical section
+ *   while the first holds the lock — and never observes the lock file without
+ *   its holder record, so an acquire in flight cannot be mistaken for an
+ *   ownerless one and reclaimed.
  * - **Blocks, then fails** — a contending caller polls every `pollMs` and
  *   proceeds the instant the lock frees; if it is still held after `timeoutMs`
  *   it throws {@link LockError} (deterministic, not an indefinite hang).

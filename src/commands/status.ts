@@ -90,6 +90,12 @@ async function globalSection(ctx: CommandContext): Promise<string[]> {
 
 function renderAdapter(adapter: AdapterStatus): string[] {
   const lines: string[] = [];
+  // Adapter-level session support (D11/D15): a global-only harness (Cursor) says so
+  // once, above its per-surface lines, so `status` never implies session mode works.
+  if (!adapter.sessionSupported) {
+    const reason = adapter.sessionUnsupportedReason ? `: ${adapter.sessionUnsupportedReason}` : '';
+    lines.push(`    session-unsupported (global only)${reason}`);
+  }
   const width = Math.max(...adapter.surfaces.map((s) => s.surfaceId.length), 1);
   for (const s of adapter.surfaces) {
     const support = s.supported ? 'supported' : `UNSUPPORTED${s.unsupportedReason ? ` (${s.unsupportedReason})` : ''}`;

@@ -82,7 +82,7 @@ describe('engine: drift sweep', () => {
     );
   });
 
-  it('criterion 4: a drifted config key is written back to the env store, ${VAR} placeholder preserved', async () => {
+  it('a drifted config key is REPORTED against the env store, never written into it', async () => {
     const th = home();
     const paths = resolvePaths(th.env);
     const realHome = join(th.home, 'real');
@@ -99,6 +99,9 @@ describe('engine: drift sweep', () => {
     const env: NodeJS.ProcessEnv = { ...th.env, [FIXTURE_CONFIG_ENV]: realHome };
     await run(['use', 'writing', '--global'], { env, adapters: [makeFixtureAdapter()] });
 
+    const storePath = join(envDir, 'mcp', 'servers.yaml');
+    const storeBefore = readFileSync(storePath);
+
     // The harness edits the real file: change the url AND bake a literal over the
     // secret placeholder (as a leaked token would).
     const cfgPath = join(realHome, 'config.json');
@@ -110,19 +113,22 @@ describe('engine: drift sweep', () => {
     const result = await driftSweep({ paths, adapters: [makeFixtureAdapter()], env });
     expect(result.configKeysDrifted).toBe(1);
 
-    const storePath = join(envDir, 'mcp', 'servers.yaml');
-    expect(result.storePathsChanged).toContain(storePath);
-    const written = readFileSync(storePath, 'utf8');
-    expect(written).toContain('https://EDITED'); // the real edit is persisted to the store
-    expect(written).toContain('${GH_TOKEN}'); // the secret placeholder is restored
-    expect(written).not.toContain('ghp_LEAKED_LITERAL'); // the baked literal never reaches the store (D6)
+    // The store is byte-identical: the edit is REPORTED, not applied.
+    expect(readFileSync(storePath).equals(storeBefore)).toBe(true);
+    expect(result.storePathsChanged).not.toContain(storePath);
+    const report = result.configKeysDriftReports.join('\n');
+    expect(report).toContain("'linear'");
+    expect(report).toMatch(/changed\s+url/);
+    // The baked literal is neither written nor printed.
+    expect(readFileSync(storePath, 'utf8')).toContain('${GH_TOKEN}');
+    expect(report).not.toContain('ghp_LEAKED_LITERAL');
   });
 
-  it('an adapter WITHOUT the reverse hook still reconciles config drift (no store write)', async () => {
+  it('an adapter WITHOUT the drift classifier still reconciles config drift (no store write)', async () => {
     const th = home();
     const { paths, realHome, env } = scenario(th);
-    // Strip the optional reverse hook: reconciliation must still be non-lossy.
-    const noHook: Adapter = { ...makeFixtureAdapter(), syncBackConfigKeys: undefined };
+    // Strip the optional classifier: reconciliation must still be non-lossy.
+    const noHook: Adapter = { ...makeFixtureAdapter(), describeConfigKeysDrift: undefined };
     await run(['use', 'writing', '--global'], { env, adapters: [noHook] });
 
     const storePath = join(paths.envDir('writing'), 'mcp', 'servers.yaml');
@@ -137,6 +143,7 @@ describe('engine: drift sweep', () => {
     expect(result.configKeysDrifted).toBe(1); // hash still reconciled
     expect(readFileSync(storePath, 'utf8')).toBe(storeBefore); // store untouched
     expect(result.storePathsChanged).not.toContain(storePath);
+    expect(result.configKeysDriftReports).toEqual([]); // nothing to say without a classifier
   });
 
   it('is a clean no-op when nothing has drifted', async () => {
@@ -147,6 +154,7 @@ describe('engine: drift sweep', () => {
     expect(result.configKeysDrifted).toBe(0);
     expect(result.fileBlockDrifted).toEqual([]);
     expect(result.storePathsChanged).toEqual([]);
+    expect(result.configKeysDriftReports).toEqual([]);
   });
 
   it('writes back drift from a session-generated instruction file on disk (D15)', async () => {

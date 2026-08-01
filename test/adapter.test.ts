@@ -5,6 +5,7 @@ import {
   surfaceRootRelativePath,
   validateAdapter,
   type Adapter,
+  type ConfigKeysSurface,
 } from '../src/adapter.js';
 import { adapters as realAdapters } from '../src/adapters/index.js';
 import { makeFixtureAdapter } from './fixtures/fixture-adapter.js';
@@ -89,14 +90,33 @@ describe('session adapter contract', () => {
     });
   });
 
-  it('criterion 4: syncBackConfigKeys is an OPTIONAL reverse hook adapters need not implement', () => {
+  it('describeConfigKeysDrift is an OPTIONAL classifier adapters need not implement', () => {
     const a = makeFixtureAdapter();
-    // The fixture DOES implement it (proves the frozen shape); an adapter MAY omit it.
-    expect(typeof a.syncBackConfigKeys).toBe('function');
+    // The fixture DOES implement it (proves the shape); an adapter MAY omit it.
+    expect(typeof a.describeConfigKeysDrift).toBe('function');
     expect(validateAdapter(a)).toBeNull();
 
-    const without: Adapter = { ...a, syncBackConfigKeys: undefined };
-    expect(without.syncBackConfigKeys).toBeUndefined(); // omitting it is still valid
+    const without: Adapter = { ...a, describeConfigKeysDrift: undefined };
+    expect(without.describeConfigKeysDrift).toBeUndefined(); // omitting it is still valid
     expect(validateAdapter(without)).toBeNull();
+  });
+
+  it('the drift hook cannot express a store write at all (structural, not conventional)', async () => {
+    // The v1 contract is "detect and report, never write". That is enforced by the RETURN
+    // TYPE: a report carries an entry name, a store-relative LOCATION and named fields —
+    // no bytes and no absolute path — so there is nothing for any caller to write. This
+    // pins it at runtime so a future round cannot quietly smuggle content back through.
+    const a = makeFixtureAdapter();
+    const surface = a.surfaces.find((s) => s.id === 'mcp') as ConfigKeysSurface;
+    const report = await a.describeConfigKeysDrift!(
+      surface,
+      { style: 'keyed', keyPath: ['mcpServers', 'srv'], canonicalValue: { url: 'https://x' } },
+      { envContentDir: '/nonexistent/env', projectRoot: null },
+    );
+    expect(report).not.toBeNull();
+    expect(Object.keys(report!).sort()).toEqual(['changes', 'entry', 'storeRelativePath']);
+    for (const change of report!.changes) {
+      expect(Object.keys(change).every((k) => ['field', 'kind', 'note'].includes(k))).toBe(true);
+    }
   });
 });

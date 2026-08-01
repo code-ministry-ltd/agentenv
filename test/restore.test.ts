@@ -19,7 +19,7 @@ import { storeIsRepo } from '../src/git.js';
 import { type Paths, resolvePaths } from '../src/paths.js';
 import type { ExecHarness, ExecSpec } from '../src/session/exec.js';
 import { FIXTURE_CONFIG_ENV, installFixtureHarness, makeFixtureAdapter } from './fixtures/fixture-adapter.js';
-import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot, type TempHome } from './helpers.js';
+import { expectRealHomeUntouched, makeTempHome, guardRealHome, type TempHome } from './helpers.js';
 
 /**
  * Spec criterion 5 — NEW-MACHINE RESTORE, end to end and fully hermetic (no network,
@@ -123,7 +123,7 @@ async function freshRestore(url: string): Promise<{ th: TempHome; paths: Paths; 
 
 describe('restore (criterion 5): init --remote clones a populated store', () => {
   it('clones the work env + its skills/instructions/mcp into the fresh store, from git', async () => {
-    const real = realHomeSnapshot();
+    const real = guardRealHome();
     const remote = bareRemote();
     await seedOriginAndPush(remote.url);
 
@@ -154,7 +154,7 @@ describe('restore (criterion 5): init --remote clones a populated store', () => 
   });
 
   it('falls back to an empty store + connected remote when the remote is empty', async () => {
-    const real = realHomeSnapshot();
+    const real = guardRealHome();
     const remote = bareRemote(); // initialised but EMPTY (no history pushed)
 
     const { paths, res } = await freshRestore(remote.url);
@@ -175,7 +175,7 @@ describe('restore (criterion 5): init --remote clones a populated store', () => 
 
 describe('restore (criterion 5) probe 1: use work --global reproduces the env + reports unresolved ${VAR}', () => {
   it('materialises every surface kind onto a fresh Claude home (skills/rules symlinks + .claude.json mcpServers)', async () => {
-    const real = realHomeSnapshot();
+    const real = guardRealHome();
     const remote = bareRemote();
     await seedOriginAndPush(remote.url);
     const { th, paths } = await freshRestore(remote.url);
@@ -208,7 +208,7 @@ describe('restore (criterion 5) probe 1: use work --global reproduces the env + 
   });
 
   it('reports the unresolved ${SOME_TOKEN} on a substitute-rung harness, skips only that server, materialises the rest', async () => {
-    const real = realHomeSnapshot();
+    const real = guardRealHome();
     const remote = bareRemote();
     await seedOriginAndPush(remote.url);
     // A fresh clone with NO secrets.env → ${SOME_TOKEN} cannot be resolved.
@@ -239,7 +239,7 @@ describe('restore (criterion 5) probe 1: use work --global reproduces the env + 
 
 describe('restore (criterion 5) probe 2: run builds a valid session view from the fresh clone', () => {
   it('composes the env stack and the fake harness observes the private root + composed skills/instructions/mcp', async () => {
-    const real = realHomeSnapshot();
+    const real = guardRealHome();
     const remote = bareRemote();
     await seedOriginAndPush(remote.url);
     const { th } = await freshRestore(remote.url);

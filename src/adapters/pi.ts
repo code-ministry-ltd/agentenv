@@ -6,9 +6,7 @@ import { join } from 'node:path';
 import type {
   Adapter,
   ConfigKeysContext,
-  ConfigKeysDrift,
   ConfigKeysInjection,
-  ConfigKeysStoreMutation,
   ConfigKeysSurface,
   EntryBucket,
   SelfCheckContext,
@@ -237,36 +235,12 @@ export const piAdapter: Adapter = {
     return out;
   },
 
-  async syncBackConfigKeys(
-    surface: ConfigKeysSurface,
-    drift: ConfigKeysDrift,
-    ctx: ConfigKeysContext,
-  ): Promise<ConfigKeysStoreMutation[]> {
-    // Reverse of compileConfigKeys for the settings surface (spec criterion 4). The
-    // settings surface is array-element: ownership is BY VALUE, so a drifted element
-    // reads as absent rather than as a mutated value — config-keys.syncBack never
-    // reports array-element drift, so the drift sweep does not invoke this in practice.
-    // Implemented (and directly tested) for completeness: fold the drifted value back
-    // into the env's canonical settings store at its recorded array path. The value is
-    // itself canonical (a store path, no secret, no lossy transform), so this is a
-    // plain, idempotent by-value merge — sibling arrays and elements untouched.
-    if (surface.id !== 'settings' || drift.style !== 'array-element') return [];
-    const arrName = drift.keyPath[0];
-    if (typeof arrName !== 'string') return [];
-    const settings = await readEnvSettings(ctx.envContentDir);
-    const existing = Array.isArray(settings[arrName]) ? (settings[arrName] as JsonValue[]) : [];
-    const already = existing.some(
-      (v) => JSON.stringify(v) === JSON.stringify(drift.canonicalValue),
-    );
-    const next = already ? existing : [...existing, drift.canonicalValue];
-    settings[arrName] = next;
-    return [
-      {
-        storeRelativePath: join('files', 'settings.json'),
-        content: `${JSON.stringify(settings, null, 2)}\n`,
-      },
-    ];
-  },
+  // NO `describeConfigKeysDrift`. Pi's only config-keys surface is `settings`, which is
+  // array-element: ownership is BY VALUE, so a drifted element reads as ABSENT rather
+  // than as a mutated value and `config-keys.syncBack` never reports drift for it (see
+  // its `mode === 'array-element'` branch). There is therefore no drift for this adapter
+  // to classify. Pi's MCP surface is declared unsupported (no native MCP), so the MCP
+  // report path does not apply either.
 
   async selfCheck(viewRoot: string, ctx: SelfCheckContext): Promise<SelfCheckResult> {
     const bin = await ctx.resolveBinary();

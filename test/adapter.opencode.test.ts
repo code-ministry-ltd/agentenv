@@ -1,11 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { parse as parseYaml } from 'yaml';
 import { afterEach, describe, expect, it } from 'vitest';
 import { validateAdapter, type ConfigKeysSurface, type SelfCheckContext } from '../src/adapter.js';
 import { opencodeAdapter } from '../src/adapters/opencode.js';
 import type { JsonValue } from '../src/config-keys.js';
+import { driftKinds } from './helpers.js';
 
 const tmps: string[] = [];
 function tmp(): string {
@@ -198,6 +198,47 @@ describe('adapter.opencode — compileConfigKeys: MCP (canonical → OpenCode mc
     if (inj.style !== 'keyed') throw new Error('unreachable');
     expect(inj.value).toEqual({ type: 'local', command: ['/bin/echo', 'hi'], enabled: true });
   });
+
+  it('honours a hand-authored `type: sse` rather than re-inferring from the url (F5/2)', async () => {
+    const dir = envWithServers('linear:\n  type: sse\n  url: https://mcp.linear.app/sse\n');
+    const out = await opencodeAdapter.compileConfigKeys(MCP_SURFACE, {
+      envContentDir: dir,
+      projectRoot: null,
+    });
+    const inj = out[0]!;
+    if (inj.style !== 'keyed') throw new Error('unreachable');
+    expect(inj.value).toEqual({
+      type: 'remote',
+      url: 'https://mcp.linear.app/sse',
+      enabled: true,
+    });
+  });
+
+  it('never re-enables a deliberately disabled server (F5/2)', async () => {
+    // Canonical form…
+    const canonical = envWithServers(
+      'echo:\n  transport: stdio\n  command: /bin/echo\n  enabled: false\n',
+    );
+    const fromCanonical = await opencodeAdapter.compileConfigKeys(MCP_SURFACE, {
+      envContentDir: canonical,
+      projectRoot: null,
+    });
+    const a = fromCanonical[0]!;
+    if (a.style !== 'keyed') throw new Error('unreachable');
+    expect(a.value).toEqual({ type: 'local', command: ['/bin/echo'], enabled: false });
+
+    // …and the hand-authored OpenCode form.
+    const authored = envWithServers(
+      'echo:\n  type: local\n  command: ["/bin/echo"]\n  enabled: false\n',
+    );
+    const fromAuthored = await opencodeAdapter.compileConfigKeys(MCP_SURFACE, {
+      envContentDir: authored,
+      projectRoot: null,
+    });
+    const b = fromAuthored[0]!;
+    if (b.style !== 'keyed') throw new Error('unreachable');
+    expect(b.value).toEqual({ type: 'local', command: ['/bin/echo'], enabled: false });
+  });
 });
 
 describe('adapter.opencode — compileConfigKeys: instructions (array-element, absolute store paths)', () => {
@@ -246,68 +287,66 @@ describe('adapter.opencode — compileConfigKeys: instructions (array-element, a
   });
 });
 
-describe('adapter.opencode — syncBackConfigKeys (criterion 4)', () => {
-  it('folds one drifted server back into servers.yaml, siblings intact', async () => {
+describe('adapter.opencode — describeConfigKeysDrift (report only, store untouched)', () => {
+  /** Classify one drifted OpenCode entry against the env's canonical servers.yaml. */
+  function report(dir: string, name: string, value: JsonValue) {
+    return opencodeAdapter.describeConfigKeysDrift!(
+      MCP_SURFACE,
+      { style: 'keyed', keyPath: ['mcp', name], canonicalValue: value },
+      { envContentDir: dir, projectRoot: null },
+    );
+  }
+
+  it('names the canonical fields that differ, translating OpenCode\'s shape away', async () => {
+    // servers.yaml is D6-canonical; the drift value is OpenCode's harness shape (F1). The
+    // report must speak CANONICAL (`auth.bearer_env`) and never mention `type`/`enabled`,
+    // which OpenCode's shaper always writes and which therefore say nothing.
     const dir = envWithServers(
-      'keep:\n  type: local\n  command: ["keep-cmd"]\nlinear:\n  type: remote\n  url: https://old\n',
+      'keep:\n  transport: stdio\n  command: keep-cmd\nlinear:\n  transport: http\n  url: https://old\n',
     );
-    const mutations = await opencodeAdapter.syncBackConfigKeys!(
-      MCP_SURFACE,
-      {
-        style: 'keyed',
-        keyPath: ['mcp', 'linear'],
-        canonicalValue: {
-          type: 'remote',
-          url: 'https://new',
-          enabled: true,
-          headers: { Authorization: 'Bearer {env:LINEAR_TOKEN}' },
-        },
-      },
-      { envContentDir: dir, projectRoot: null },
-    );
-    expect(mutations).toHaveLength(1);
-    expect(mutations[0]!.storeRelativePath).toBe(join('mcp', 'servers.yaml'));
-    const written = parseYaml(mutations[0]!.content) as Record<string, JsonValue>;
-    expect(written.keep).toEqual({ type: 'local', command: ['keep-cmd'] });
-    expect(written.linear).toEqual({
+    const before = readFileSync(join(dir, 'mcp', 'servers.yaml'));
+
+    const out = await report(dir, 'linear', {
       type: 'remote',
       url: 'https://new',
       enabled: true,
       headers: { Authorization: 'Bearer {env:LINEAR_TOKEN}' },
     });
+
+    expect(out!.entry).toBe('linear');
+    expect(out!.storeRelativePath).toBe(join('mcp', 'servers.yaml'));
+    // The canonical entry had no `auth` at all, so the whole subtree is the addition —
+    // a report names the parent when the parent itself is new, and the LEAF when only
+    // one key inside an existing object changed.
+    expect(driftKinds(out)).toEqual({ url: 'changed', auth: 'added' });
+    expect(JSON.stringify(out)).not.toContain('keep');
+    expect(readFileSync(join(dir, 'mcp', 'servers.yaml')).equals(before)).toBe(true);
   });
 
-  it('round-trips: compile(syncBack(drift)) reproduces the drifted value (stable)', async () => {
-    const dir = envWithServers('linear:\n  type: remote\n  url: https://old\n  enabled: true\n');
-    const drifted: JsonValue = {
-      type: 'remote',
-      url: 'https://new',
-      enabled: true,
-      headers: { Authorization: 'Bearer {env:LINEAR_TOKEN}' },
-    };
-    const mutations = await opencodeAdapter.syncBackConfigKeys!(
-      MCP_SURFACE,
-      { style: 'keyed', keyPath: ['mcp', 'linear'], canonicalValue: drifted },
-      { envContentDir: dir, projectRoot: null },
+  it("does not mistake Cursor's ${env:VAR} for one of its own placeholders (F5/9)", async () => {
+    // A `servers.yaml` may hold Cursor's `${env:VAR}` (another harness authored it).
+    // OpenCode's compile leaves it alone — its own syntax is `{env:VAR}` — so it reaches
+    // the classifier, where a `{env:…}` regex without a `$` guard also matched the INNER
+    // braces and produced `$${VAR}`, reporting a change the user never made.
+    const dir = envWithServers(
+      'gh:\n  transport: stdio\n  command: gh-mcp\n  env:\n    CURSOR_STYLE: "${env:GH_TOKEN}"\n',
     );
-    writeFileSync(join(dir, 'mcp', 'servers.yaml'), mutations[0]!.content);
-    const recompiled = await opencodeAdapter.compileConfigKeys(MCP_SURFACE, {
-      envContentDir: dir,
-      projectRoot: null,
+    const out = await report(dir, 'gh', {
+      type: 'local',
+      command: ['gh-mcp'],
+      enabled: true,
+      env: { CURSOR_STYLE: '${env:GH_TOKEN}' },
     });
-    const inj = recompiled.find((i) => i.style === 'keyed' && i.keyPath[1] === 'linear')!;
-    if (inj.style !== 'keyed') throw new Error('unreachable');
-    expect(inj.value).toEqual(drifted);
-    expect(inj.secretFields).toEqual({ 'headers.Authorization': 'Bearer {env:LINEAR_TOKEN}' });
+    expect(driftKinds(out)).toEqual({}); // nothing canonical differs
   });
 
-  it('ignores a non-mcp / non-keyed drift (instructions array-element carries no drift)', async () => {
-    const out = await opencodeAdapter.syncBackConfigKeys!(
+  it('returns null for a non-mcp / non-keyed drift (instructions carry no drift)', async () => {
+    const out = await opencodeAdapter.describeConfigKeysDrift!(
       INSTR_SURFACE,
       { style: 'array-element', keyPath: ['instructions'], canonicalValue: '/some/path.md' },
       { envContentDir: tmp(), projectRoot: null },
     );
-    expect(out).toEqual([]);
+    expect(out).toBeNull();
   });
 });
 

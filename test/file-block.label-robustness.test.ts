@@ -9,7 +9,7 @@ import {
   type FileBlockSource,
 } from '../src/file-block.js';
 import { resolvePaths } from '../src/paths.js';
-import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot } from './helpers.js';
+import { expectRealHomeUntouched, makeTempHome, guardRealHome } from './helpers.js';
 
 /**
  * Regression guards for the two LOW adversarial-review findings, both covered by
@@ -23,10 +23,10 @@ import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot } from './helpe
  */
 describe('file-block surface — label robustness (Findings 2 & 3)', () => {
   let temp: ReturnType<typeof makeTempHome>;
-  let realBefore: ReturnType<typeof realHomeSnapshot>;
+  let realBefore: ReturnType<typeof guardRealHome>;
 
   beforeEach(() => {
-    realBefore = realHomeSnapshot();
+    realBefore = guardRealHome();
     temp = makeTempHome();
   });
 

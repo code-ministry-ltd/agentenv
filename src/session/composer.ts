@@ -21,6 +21,8 @@ import {
   type ConfigKeysInjection,
   type SurfaceDeclaration,
 } from '../adapter.js';
+import type { JsonValue } from '../config-keys.js';
+import { renderConfigKeysDriftReport } from '../drift.js';
 import { appendRegion, closeMarker, openMarker } from '../file-block.js';
 import { writeFileAtomic } from '../fs-atomic.js';
 import type { Paths } from '../paths.js';
@@ -388,6 +390,7 @@ async function composeConfigKeysFile(
         injections = await adapter.compileConfigKeys(surface, {
           envContentDir: paths.envDir(env),
           projectRoot: req.projectRoot ?? null,
+          onWarn,
         });
       } catch (err) {
         onWarn(`agentenv: env '${env}' ${surface.id} compile failed: ${(err as Error).message}`);
@@ -400,10 +403,17 @@ async function composeConfigKeysFile(
         if (inj.style === 'keyed') {
           // A value the USER already had at this path wins (D7); an earlier env's is
           // overwritten by this (later) env (D5).
-          if (getAtPath(userSnapshot, inj.keyPath).found) {
+          const userValue = getAtPath(userSnapshot, inj.keyPath);
+          if (userValue.found) {
             const detail = `${surface.id} key '${inj.keyPath.join('.')}' — user value wins`;
             onWarn(`agentenv: skipping ${detail} (env '${env}')`);
             skipped.push({ surfaceId: surface.id, reason: 'collision', detail });
+            // The user's own entry and the canonical store DISAGREE — the session-mode
+            // form of the same drift the global sweep reports. Say exactly how, so a
+            // session user learns it from the launch rather than never (the private view
+            // is rebuilt from canonical every launch, so nothing else would surface it).
+            // Reporting only: `mcp/servers.yaml` is not touched here either.
+            await reportUserValueDrift(req, surface, env, inj.keyPath, userValue.value, onWarn);
             continue;
           }
           // Resolve substitute-rung placeholders; unresolved → fail closed per server.
@@ -440,6 +450,54 @@ async function composeConfigKeysFile(
   }
 
   await writeFileAtomic(join(buildDir, file), serializeConfigDoc(format, seed));
+}
+
+/**
+ * Report how a USER'S OWN value at an owned key path disagrees with the env's canonical
+ * store — the session-mode half of the "detect and report, never write" contract.
+ *
+ * In global mode agentenv owns keys in the real config, so the drift sweep sees an edit
+ * and reports it. In session mode it owns nothing there: the private view is rebuilt from
+ * canonical each launch and a pre-existing user entry simply WINS (D7). Without this the
+ * disagreement would never be surfaced at all — the user would keep getting their own
+ * entry with no hint that the store says something different.
+ *
+ * Reporting only. Nothing under `environments/<env>/` is written here (the classifier
+ * reads canonical to diff against), and a classifier failure is swallowed — a launch must
+ * never fail because a report could not be produced.
+ */
+async function reportUserValueDrift(
+  req: ComposeRequest,
+  surface: ConfigKeysSurfaceDecl,
+  env: string,
+  keyPath: readonly (string | number)[],
+  userValue: unknown,
+  onWarn: (m: string) => void,
+): Promise<void> {
+  const describe = req.adapter.describeConfigKeysDrift;
+  if (!describe) return;
+  const envContentDir = req.paths.envDir(env);
+  try {
+    const report = await describe.call(
+      req.adapter,
+      surface,
+      { style: 'keyed', keyPath, canonicalValue: userValue as JsonValue },
+      { envContentDir, projectRoot: req.projectRoot ?? null, onWarn },
+    );
+    if (!report || report.changes.length === 0) return;
+    onWarn(
+      renderConfigKeysDriftReport({
+        adapterId: req.adapter.id,
+        surfaceId: surface.id,
+        configFile: join(req.realConfigRoot, surface.rootRelativePath),
+        ownerEnv: env,
+        canonicalFile: join(envContentDir, report.storeRelativePath),
+        report,
+      }),
+    );
+  } catch {
+    // A report is a courtesy; never let one break a launch.
+  }
 }
 
 /** Parse a config-keys document by format; an empty/absent file is an empty object. */

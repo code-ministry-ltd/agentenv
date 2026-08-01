@@ -3,13 +3,13 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { parse as parseYaml } from 'yaml';
 import type {
   Adapter,
   ConfigKeysContext,
   ConfigKeysDrift,
   ConfigKeysInjection,
-  ConfigKeysStoreMutation,
+  ConfigKeysDriftReport,
   ConfigKeysSurface,
   EntryBucket,
   SelfCheckContext,
@@ -18,6 +18,16 @@ import type {
 } from '../adapter.js';
 import type { JsonValue } from '../config-keys.js';
 import { resolveBinaryOnPath } from '../session/resolve.js';
+import {
+  describeCanonicalDrift,
+  omitKeys,
+  hasConflictingDiscriminators,
+  passthroughUnshape,
+  resolveAuthDrift,
+  noteConflictingTransport,
+  type UnshapeContext,
+  type UnshapedServer,
+} from './mcp-canonical.js';
 
 /**
  * The Claude Code adapter — the first real implementation of the frozen
@@ -142,10 +152,14 @@ function collectPlaceholders(value: unknown, prefix: string, out: Record<string,
 
 /**
  * Shape one canonical `mcp/servers.yaml` server (D6) into Claude's `.claude.json`
- * `mcpServers.<name>` object. The transform is IDEMPOTENT: an entry already in
- * Claude's shape (`type` present, no canonical `transport`) passes through
- * unchanged — this is what makes {@link syncBackConfigKeys}'s verbatim write-back
- * round-trip stably (`compile(syncBack(v)) === v`), proving spec criterion 4.
+ * `mcpServers.<name>` object. `servers.yaml` is ALWAYS D6-canonical — agentenv never
+ * writes a harness shape into it, because drift is REPORTED rather than applied
+ * ({@link Adapter.describeConfigKeysDrift}) — so the input normally carries `transport`.
+ *
+ * A HAND-AUTHORED harness-shaped entry (no `transport`, a Claude `type`) is still
+ * honoured: `type` is the transport hint, so `{ type: sse, url }` compiles to an SSE
+ * server rather than being re-inferred to `http` from the bare `url` (F5/2A — calling
+ * an SSE endpoint as HTTP breaks it).
  *
  * Mappings from the canonical model:
  *   stdio → `{ type:'stdio', command, args?, env? }`
@@ -156,8 +170,6 @@ function collectPlaceholders(value: unknown, prefix: string, out: Record<string,
  */
 function shapeClaudeServer(def: unknown): JsonValue {
   if (!isObject(def)) return def as JsonValue;
-  // Already Claude-shaped (has `type`, not the canonical `transport`): idempotent.
-  if ('type' in def && !('transport' in def)) return def;
 
   const transport =
     typeof def.transport === 'string'
@@ -165,7 +177,9 @@ function shapeClaudeServer(def: unknown): JsonValue {
       : def.command !== undefined
         ? 'stdio'
         : def.url !== undefined
-          ? 'http'
+          ? typeof def.type === 'string'
+            ? def.type
+            : 'http'
           : undefined;
 
   if (transport === 'stdio') {
@@ -190,6 +204,108 @@ function shapeClaudeServer(def: unknown): JsonValue {
 
   // Unknown transport: pass the user's authored def through untouched.
   return def;
+}
+
+/**
+ * A header value shaped `Bearer ${VAR}` → the var name, else null. Tolerant of
+ * surrounding/inner whitespace (`Bearer  ${ X }`), which a user's hand-edit easily
+ * introduces and which must not silently cost them their `auth.bearer_env`.
+ */
+function bearerEnvFromHeader(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const m = /^\s*Bearer\s+\$\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\s*$/.exec(value);
+  return m ? m[1]! : null;
+}
+
+/**
+ * The canonical keys each {@link shapeClaudeServer} BRANCH emits, so their absence from a
+ * drifted entry is a real user deletion. The lists are FAMILY-AWARE (F6/6): the stdio
+ * branch never writes `url`/`headers`, so it may not delete them, and the remote branch
+ * never writes `command`/`args`/`env`, so it may not delete those. A genuine family change
+ * is handled by the overlay, which drops the departed family's keys wholesale. Every OTHER
+ * canonical field (`enabled`, `timeout`, anything a future release adds) is preserved from
+ * the prior def. `auth` is added conditionally (see below).
+ */
+const CLAUDE_STDIO_SUPERSEDES = ['type', 'command', 'args', 'env'] as const;
+
+/** The `type` values {@link shapeClaudeServer}'s non-passthrough branches emit. */
+const CLAUDE_SHAPER_TYPES = new Set(['stdio', 'http', 'sse']);
+const CLAUDE_REMOTE_SUPERSEDES = ['type', 'url', 'headers'] as const;
+
+/**
+ * The inverse of {@link shapeClaudeServer}, as an OVERLAY over the prior canonical def
+ * (see `mcp-canonical.ts`): translate Claude's `type`/`headers` shape back to canonical
+ * `transport`/`auth` and carry EVERY other field of the drifted entry over verbatim, so
+ * a field the user added in `.claude.json` reaches the store instead of being dropped by
+ * a whitelist (F5/3). What Claude cannot express is preserved from the prior def, and a
+ * bespoke `transport` the shaper passed through is never re-inferred (F5/1).
+ */
+function unshapeClaudeServer(
+  def: Record<string, JsonValue>,
+  prior: unknown,
+  ctx: UnshapeContext,
+): UnshapedServer {
+  // A `transport` in `.claude.json` can only have come from the shaper's bespoke
+  // passthrough, so the entry is already canonical — never re-infer over it (F5/1)…
+  const conflicting = hasConflictingDiscriminators(def, CLAUDE_SHAPER_TYPES);
+  if (typeof def.transport === 'string' && !conflicting) return passthroughUnshape(def, prior);
+  // …unless it sits beside a `type` the passthrough would never have written, in which
+  // case the two disagree and the transport is unknowable (F6/9).
+  if (conflicting) noteConflictingTransport(ctx, def.type as string);
+
+  // Claude records the http/sse distinction NATIVELY in `type`, so a `type` the user
+  // edited must PROPAGATE — preserving the prior canonical transport here would rewrite
+  // their edit back on the next `use` (F6/1). Only a `type`-less entry is a guess.
+  const nativeType = typeof def.type === 'string';
+  const type = nativeType
+    ? (def.type as string)
+    : def.command !== undefined
+      ? 'stdio'
+      : def.url !== undefined
+        ? 'http'
+        : undefined;
+
+  if (type === 'stdio') {
+    return {
+      fields: { transport: 'stdio', ...omitKeys(def, ['type', 'transport']) },
+      supersedes: CLAUDE_STDIO_SUPERSEDES,
+      family: 'stdio',
+      // `stdio` is unambiguous in every direction — nothing else compiles to a `command`.
+      transportAuthority: conflicting ? 'ambiguous' : 'native',
+    };
+  }
+  if (type === 'http' || type === 'sse') {
+    const fields: Record<string, JsonValue> = {
+      transport: type,
+      ...omitKeys(def, ['type', 'transport', 'headers']),
+    };
+    const headers = isObject(def.headers) ? { ...def.headers } : undefined;
+    // A credential is never guessed at: an `Authorization` header that does not map
+    // EXACTLY onto canonical `auth.bearer_env` leaves it alone and warns (F6/3+4).
+    const auth = resolveAuthDrift({
+      prior,
+      header: headers?.Authorization,
+      bearerEnvFromHeader,
+      foldsBearerIntoHeader: true,
+      ctx,
+    });
+    if (auth.kind === 'set') fields.auth = { bearer_env: auth.bearerEnv };
+    if (headers !== undefined) {
+      if (auth.kind === 'set') delete headers.Authorization; // now carried by `auth`
+      if (Object.keys(headers).length > 0) fields.headers = headers;
+    } else if (def.headers !== undefined) {
+      fields.headers = def.headers; // not an object — carry verbatim, never guess
+    }
+    return {
+      fields,
+      supersedes:
+        auth.kind === 'delete' ? [...CLAUDE_REMOTE_SUPERSEDES, 'auth'] : CLAUDE_REMOTE_SUPERSEDES,
+      family: 'remote',
+      transportAuthority: conflicting ? 'ambiguous' : nativeType ? 'native' : 'inferred',
+    };
+  }
+  // Neither a Claude discriminator nor an inferable one: carry the whole entry over.
+  return passthroughUnshape(def, prior);
 }
 
 /** Run `claude --version`, resolving `true` only on a clean exit 0. Never throws. */
@@ -280,28 +396,37 @@ export const claudeAdapter: Adapter = {
     });
   },
 
-  async syncBackConfigKeys(
+  async describeConfigKeysDrift(
     surface: ConfigKeysSurface,
     drift: ConfigKeysDrift,
     ctx: ConfigKeysContext,
-  ): Promise<ConfigKeysStoreMutation[]> {
-    // Inverse of compileConfigKeys (spec criterion 4): fold the one drifted server
-    // (keyPath ['mcpServers', <name>]) back into servers.yaml, siblings untouched.
-    // `canonicalValue` already has secret ${VAR} placeholders restored (D6). It is
-    // written in Claude's normalised shape; because shapeClaudeServer is idempotent
-    // on that shape, a subsequent compile reproduces it exactly — round-trip stable.
-    if (surface.id !== 'mcp' || drift.style !== 'keyed') return [];
+  ): Promise<ConfigKeysDriftReport | null> {
+    // Classify how one drifted `.claude.json` server (keyPath ['mcpServers', <name>])
+    // disagrees with the canonical D6 def in servers.yaml. `canonicalValue` already has
+    // secret ${VAR} placeholders restored (D6); `unshapeClaudeServer` + the OVERLAY map
+    // Claude's `type`/`headers` shape back onto canonical, so the report names CANONICAL
+    // fields — the ones the user will edit. servers.yaml is READ here and never written.
+    if (surface.id !== 'mcp' || drift.style !== 'keyed') return null;
     // A server injection is always keyPath ['mcpServers', <name>] (length 2); a
-    // length-1 keyPath would fold a bogus `mcpServers` "server" into the store.
-    if (drift.keyPath.length < 2) return [];
+    // length-1 keyPath would describe a bogus `mcpServers` "server".
+    if (drift.keyPath.length < 2) return null;
     const name = drift.keyPath[drift.keyPath.length - 1];
-    if (typeof name !== 'string') return [];
+    if (typeof name !== 'string') return null;
     const serversFile = join(ctx.envContentDir, 'mcp', 'servers.yaml');
     const existing = existsSync(serversFile)
       ? ((parseYaml(await readFile(serversFile, 'utf8')) as Record<string, unknown> | null) ?? {})
       : {};
-    existing[name] = drift.canonicalValue;
-    return [{ storeRelativePath: join('mcp', 'servers.yaml'), content: stringifyYaml(existing) }];
+    return {
+      entry: name,
+      storeRelativePath: join('mcp', 'servers.yaml'),
+      changes: describeCanonicalDrift({
+        prior: existing[name],
+        drifted: drift.canonicalValue,
+        unshape: unshapeClaudeServer,
+        server: name,
+        adapterId: 'claude-code',
+      }),
+    };
   },
 
   async selfCheck(viewRoot: string, ctx: SelfCheckContext): Promise<SelfCheckResult> {

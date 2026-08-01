@@ -43,6 +43,45 @@ truth; the vault matrix is research and is not edited (per task).
    env vars are set (warns "Set the missing MCP env vars" when absent) — a `5.x`
    doctor hook could surface this, but it is out of scope here.
 
+   **`bearer_token_env_var` is NOT emitted when an `Authorization` header shadows it**
+   (F6/3, SECURITY). The header is what the server actually receives, so writing the
+   bearer beside it would have Codex go on authenticating with a credential the user may
+   believe they replaced — in a harness they were not looking at. The shaper refuses and
+   warns instead.
+
+   **`type` is honoured as the transport hint**, exactly as Claude/Cursor/OpenCode honour
+   it, so a hand-authored `{ type: websocket, url }` in `servers.yaml` passes through as
+   bespoke here too rather than being silently compiled to a plain HTTP table. And a
+   Codex table is just a `url`: `http` and `sse` are indistinguishable, so an unrelated
+   edit to a Codex table is NEVER reported as a transport change — reporting one would
+   send the user to "fix" a canonical `sse` into `http`. Where a drift is genuinely
+   ambiguous (an `Authorization` header that no longer matches the compiled one), the
+   report flags the field with a note rather than claiming a resolved change.
+
+## MCP drift is REPORTED, not applied (`describeConfigKeysDrift`)
+
+The flow is **one-way**: canonical `mcp/servers.yaml` → `config.toml`. If you edit an
+`[mcp_servers.<name>]` table, agentenv does **not** fold that edit back into the canonical
+store. On the next command it names the server and the canonical fields that differ, names
+both files, and says plainly that `mcp/servers.yaml` was NOT changed.
+
+**To make a harness-side change permanent, edit `mcp/servers.yaml` yourself** — in
+canonical D6 shape. `unshapeCodexServer` still runs, but only to CLASSIFY: it translates
+Codex's native indirections (`env_vars`, `bearer_token_env_var`, `env_http_headers`) back
+to `env`/`auth`/`headers`, so the report names `env.GITHUB_TOKEN` rather than `env_vars` —
+the key path that actually exists in `servers.yaml`. The report carries field names and
+env-var names only, never values, which matters more here than anywhere else: Codex is the
+`substitutePlaceholders` surface, so its real `config.toml` legitimately holds resolved
+credentials.
+
+The trust entry (`[projects."<root>"]`) is launch-derived and has no canonical
+counterpart, so its drift is never reported.
+
+Why report rather than apply: see the same section in `harness-opencode.md` — the forward
+transform is not injective, so the inverse must be reconstructed, and three adversarial
+rounds of that reconstruction each produced a fresh defect at the next uncovered boundary,
+twice with a security consequence.
+
 4. **Trust-gating — CONFIRMED** (spike #4 re-confirmed). A view config.toml carrying
    `[projects."/home/jim/some/repo"]  trust_level = "trusted"` parsed clean and did
    not perturb MCP resolution. The adapter emits this keyed injection when the launch
@@ -69,7 +108,8 @@ truth; the vault matrix is research and is not edited (per task).
   Hence native indirections first, then the substitute rung (rung 3): the MCP surface
   declares `substitutePlaceholders: true`, so any placeholder the indirections could
   not remove is resolved to a literal in the EPHEMERAL view only; the manifest keeps
-  the placeholder, so drift write-back restores `${VAR}` and never bakes a secret.
+  the placeholder, so the drift sweep restores `${VAR}` before classifying and never
+  handles the literal — and it never writes the store in any case.
 
 - **`config.toml` reserialisation.** The engine's config-keys mechanism injects each
   MCP server as a whole **marked `[table]`** and removes it by marker-splice, so a

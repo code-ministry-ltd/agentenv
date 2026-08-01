@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { run } from '../src/cli.js';
 import { SKILL_NAME_RULE, validateSkillDir } from '../src/content-items.js';
-import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot, type TempHome } from './helpers.js';
+import { expectRealHomeUntouched, makeTempHome, guardRealHome, type TempHome } from './helpers.js';
 
 describe('add skill', () => {
   let tmp: TempHome;
@@ -20,7 +20,7 @@ describe('add skill', () => {
   }
 
   it('scaffolds a SKILL.md that passes the naming validator', async () => {
-    const real = realHomeSnapshot();
+    const real = guardRealHome();
     const result = await run(['add', 'skill', 'writing', 'sharpen-prose'], { env: tmp.env });
     expect(result.code).toBe(0);
 

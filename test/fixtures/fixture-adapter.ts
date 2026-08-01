@@ -2,19 +2,20 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'n
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { parse as parseYaml } from 'yaml';
 import type {
   Adapter,
   ConfigKeysContext,
   ConfigKeysDrift,
+  ConfigKeysDriftReport,
   ConfigKeysInjection,
-  ConfigKeysStoreMutation,
   ConfigKeysSurface,
   EntryBucket,
   SelfCheckContext,
   SelfCheckResult,
   SurfaceDeclaration,
 } from '../../src/adapter.js';
+import { describeCanonicalDrift, passthroughUnshape } from '../../src/adapters/mcp-canonical.js';
 import type { JsonValue } from '../../src/config-keys.js';
 import { resolveBinaryOnPath } from '../../src/session/resolve.js';
 
@@ -194,24 +195,32 @@ export function makeFixtureAdapter(opts: FixtureAdapterOptions = {}): Adapter {
       });
     },
 
-    async syncBackConfigKeys(
+    async describeConfigKeysDrift(
       surface: ConfigKeysSurface,
       drift: ConfigKeysDrift,
       ctx: ConfigKeysContext,
-    ): Promise<ConfigKeysStoreMutation[]> {
-      // The inverse of compileConfigKeys (spec criterion 4): fold the one drifted
-      // server (keyPath ['mcpServers', <name>]) back into the env's servers.yaml,
-      // leaving sibling servers untouched. `canonicalValue` already has secret
-      // ${VAR} placeholders restored, so the store never gains a baked literal (D6).
-      if (surface.id !== 'mcp' || drift.style !== 'keyed') return [];
+    ): Promise<ConfigKeysDriftReport | null> {
+      // Classify how one drifted server (keyPath ['mcpServers', <name>]) disagrees with
+      // the env's canonical servers.yaml — READ ONLY, exactly like a real adapter. The
+      // fixture's compile is the identity, so its un-shape is the passthrough.
+      if (surface.id !== 'mcp' || drift.style !== 'keyed') return null;
       const name = drift.keyPath[drift.keyPath.length - 1];
-      if (typeof name !== 'string') return [];
+      if (typeof name !== 'string') return null;
       const serversFile = join(ctx.envContentDir, 'mcp', 'servers.yaml');
       const existing = existsSync(serversFile)
         ? ((parseYaml(readFileSync(serversFile, 'utf8')) as Record<string, unknown> | null) ?? {})
         : {};
-      existing[name] = drift.canonicalValue;
-      return [{ storeRelativePath: join('mcp', 'servers.yaml'), content: stringifyYaml(existing) }];
+      return {
+        entry: name,
+        storeRelativePath: join('mcp', 'servers.yaml'),
+        changes: describeCanonicalDrift({
+          prior: existing[name],
+          drifted: drift.canonicalValue,
+          unshape: passthroughUnshape,
+          server: name,
+          adapterId: 'fixture',
+        }),
+      };
     },
 
     async selfCheck(viewRoot: string, ctx: SelfCheckContext): Promise<SelfCheckResult> {

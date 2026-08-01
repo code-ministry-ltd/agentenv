@@ -1,11 +1,10 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parse as parseYaml } from 'yaml';
 import { afterEach, describe, expect, it } from 'vitest';
 import { validateAdapter, type ConfigKeysSurface } from '../src/adapter.js';
 import { cursorAdapter } from '../src/adapters/cursor.js';
-import type { JsonValue } from '../src/config-keys.js';
+import { driftKinds } from './helpers.js';
 
 const tmps: string[] = [];
 function tmp(): string {
@@ -192,12 +191,16 @@ describe('adapter.cursor — compileConfigKeys (MCP → Cursor mcpServers, ${env
   });
 });
 
-describe('adapter.cursor — syncBackConfigKeys (criterion 4, round-trip stable)', () => {
-  it('folds one drifted server back into servers.yaml, siblings intact', async () => {
+describe('adapter.cursor — describeConfigKeysDrift (report only, store untouched)', () => {
+  it('names the canonical fields that differ, translating Cursor\'s ${env:} shape away', async () => {
+    // servers.yaml is D6-canonical; the drift value is Cursor's harness shape (F1). The
+    // report must speak CANONICAL (`auth.bearer_env`), not Cursor's `headers`/`${env:}`.
     const dir = envWithServers(
-      'keep:\n  command: keep-cmd\nlinear:\n  type: http\n  url: https://old\n',
+      'keep:\n  transport: stdio\n  command: keep-cmd\nlinear:\n  transport: http\n  url: https://old\n',
     );
-    const mutations = await cursorAdapter.syncBackConfigKeys!(
+    const before = readFileSync(join(dir, 'mcp', 'servers.yaml'));
+
+    const out = await cursorAdapter.describeConfigKeysDrift!(
       MCP_SURFACE,
       {
         style: 'keyed',
@@ -210,39 +213,26 @@ describe('adapter.cursor — syncBackConfigKeys (criterion 4, round-trip stable)
       },
       { envContentDir: dir, projectRoot: null },
     );
-    expect(mutations).toHaveLength(1);
-    expect(mutations[0]!.storeRelativePath).toBe(join('mcp', 'servers.yaml'));
-    const written = parseYaml(mutations[0]!.content) as Record<string, JsonValue>;
-    expect(written.keep).toEqual({ command: 'keep-cmd' });
-    expect(written.linear).toEqual({
-      type: 'http',
-      url: 'https://new',
-      headers: { Authorization: 'Bearer ${env:LINEAR_TOKEN}' },
-    });
+
+    expect(out!.entry).toBe('linear');
+    expect(out!.storeRelativePath).toBe(join('mcp', 'servers.yaml'));
+    // The canonical entry had no `auth` at all, so the whole subtree is the addition —
+    // a report names the parent when the parent itself is new, and the LEAF when only
+    // one key inside an existing object changed.
+    expect(driftKinds(out)).toEqual({ url: 'changed', auth: 'added' });
+    // The sibling is never mentioned, and the canonical file is byte-identical.
+    expect(JSON.stringify(out)).not.toContain('keep');
+    expect(readFileSync(join(dir, 'mcp', 'servers.yaml')).equals(before)).toBe(true);
   });
 
-  it('round-trips: compile(syncBack(drift)) reproduces the drifted value (stable)', async () => {
-    const dir = envWithServers('linear:\n  type: http\n  url: https://old\n');
-    const drifted: JsonValue = {
-      type: 'http',
-      url: 'https://new',
-      headers: { Authorization: 'Bearer ${env:LINEAR_TOKEN}' },
-    };
-    const mutations = await cursorAdapter.syncBackConfigKeys!(
+  it('reports a server with no canonical entry as a whole-entry addition', async () => {
+    const dir = envWithServers('other:\n  transport: stdio\n  command: x\n');
+    const out = await cursorAdapter.describeConfigKeysDrift!(
       MCP_SURFACE,
-      { style: 'keyed', keyPath: ['mcpServers', 'linear'], canonicalValue: drifted },
+      { style: 'keyed', keyPath: ['mcpServers', 'fresh'], canonicalValue: { type: 'sse', url: 'https://x/sse' } },
       { envContentDir: dir, projectRoot: null },
     );
-    writeFileSync(join(dir, 'mcp', 'servers.yaml'), mutations[0]!.content);
-    const recompiled = await cursorAdapter.compileConfigKeys(MCP_SURFACE, {
-      envContentDir: dir,
-      projectRoot: null,
-    });
-    const inj = recompiled.find((i) => i.style === 'keyed' && i.keyPath[1] === 'linear')!;
-    if (inj.style !== 'keyed') throw new Error('unreachable');
-    expect(inj.value).toEqual(drifted);
-    // The restored ${env:VAR} placeholder is re-flagged as a secret field.
-    expect(inj.secretFields).toEqual({ 'headers.Authorization': 'Bearer ${env:LINEAR_TOKEN}' });
+    expect(out!.changes).toEqual([{ field: '', kind: 'added' }]);
   });
 });
 

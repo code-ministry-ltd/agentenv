@@ -1,22 +1,116 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { dirname } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LockError, withLock } from '../src/lock.js';
 import { resolvePaths } from '../src/paths.js';
-import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot } from './helpers.js';
+import { expectRealHomeUntouched, makeTempHome, guardRealHome } from './helpers.js';
 
-const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/**
+ * A one-shot barrier that parks an acquirer at the instant the lock file
+ * becomes visible to everyone else.
+ *
+ * `withLock` publishes the lock through `node:fs/promises`, so wrapping that
+ * module is the only seam that can stop time inside the publish itself — and
+ * the publish window is precisely what the mid-publish test is about. Keeping
+ * the seam in the test rather than in {@link withLock} means production code
+ * carries no test-only hook. It is a straight pass-through unless a test arms
+ * it, so every other test in this file sees the real `node:fs/promises`.
+ */
+const publishBarrier = vi.hoisted(() => {
+  let armed: { path: string; parked: () => void; release: Promise<void> } | null = null;
+  return {
+    /** Park the next publish of `path`; `parked()` fires once it is stopped. */
+    arm(path: string, parked: () => void, release: Promise<void>) {
+      armed = { path, parked, release };
+    },
+    disarm() {
+      armed = null;
+    },
+    /** Called after each fs op that makes `path` appear. Parks at most once. */
+    async afterPublishing(path: string): Promise<void> {
+      if (armed === null || armed.path !== path) return;
+      const { parked, release } = armed;
+      armed = null; // one-shot: later publishes (including the waiter's) run free
+      parked();
+      await release;
+    },
+  };
+});
+
+/**
+ * Makes `link` fail with a chosen errno, so the tests can reach the code that
+ * only runs on a filesystem without hard links — unreachable on any filesystem
+ * a test could realistically be run on, and therefore otherwise unverified.
+ */
+const hardLinkFault = vi.hoisted(() => {
+  let errno: string | null = null;
+  return {
+    fail(code: string | null) {
+      errno = code;
+    },
+    pending: () => errno,
+  };
+});
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const real = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...real,
+    // The two ways a lock file can come into existence: an O_EXCL create, or a
+    // hard link from a fully-written temp file.
+    open: async (...args: Parameters<typeof real.open>) => {
+      const handle = await real.open(...args);
+      await publishBarrier.afterPublishing(String(args[0]));
+      return handle;
+    },
+    link: async (...args: Parameters<typeof real.link>) => {
+      const errno = hardLinkFault.pending();
+      if (errno !== null) {
+        throw Object.assign(new Error(`link: simulated ${errno}`), { code: errno });
+      }
+      await real.link(...args);
+      await publishBarrier.afterPublishing(String(args[1]));
+    },
+  };
+});
+
+/** A promise plus its resolver — the barrier these tests sequence on. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/**
+ * A logical clock for the two timeout tests.
+ *
+ * `withLock` reads time ONLY through `options.now`, so stepping it a fixed
+ * amount per read makes "the deadline expired" a function of how many times the
+ * poll loop went round rather than of how fast the machine is. The real
+ * `delay(pollMs)` between rounds still runs — the poll loop is genuinely
+ * exercised — but a starved process merely takes longer to reach the same
+ * outcome instead of reaching a different one.
+ */
+function steppingClock(stepMs: number): () => number {
+  let t = 0;
+  return () => (t += stepMs);
+}
 
 describe('withLock', () => {
   let temp: ReturnType<typeof makeTempHome>;
-  let realBefore: ReturnType<typeof realHomeSnapshot>;
+  let realBefore: ReturnType<typeof guardRealHome>;
 
   beforeEach(() => {
-    realBefore = realHomeSnapshot();
+    realBefore = guardRealHome();
     temp = makeTempHome();
   });
 
   afterEach(() => {
+    publishBarrier.disarm(); // a test that threw mid-park must not arm the next
+    hardLinkFault.fail(null);
     temp.cleanup();
     expectRealHomeUntouched(realBefore);
   });
@@ -48,28 +142,117 @@ describe('withLock', () => {
   it('serialises overlapping critical sections — they do not interleave', async () => {
     const p = paths();
     const events: string[] = [];
+    // A barrier, not a sleep. The winner stays inside its section until the
+    // loser has PROVABLY contended: `withLock` probes the holder's liveness on
+    // every failed acquire, so that probe is the loser announcing "I tried and
+    // was refused". If the lock did not serialise, the loser would slip in here
+    // and interleave the markers — and there is no wall-clock window to blow.
+    const contended = deferred();
+    let inside = 0;
+    let maxInside = 0;
     const critical = (tag: string) =>
       withLock(
         p,
         async () => {
+          inside += 1;
+          maxInside = Math.max(maxInside, inside);
           events.push(`${tag}:start`);
-          // Yield to the event loop: if the lock did NOT serialise, the other
-          // caller would slip in here and interleave the markers.
-          await delay(15);
+          // If mutual exclusion is broken the loser never contends, so nothing
+          // would ever resolve the barrier — release it here so the test fails
+          // on the interleaved markers rather than on a 15s timeout.
+          if (inside > 1) contended.resolve();
+          await contended.promise;
           events.push(`${tag}:end`);
+          inside -= 1;
         },
         // Generous acquire timeout: this asserts mutual exclusion, not a
         // deadline. Under parallel vitest workers the holder's release can be
         // scheduling-starved past the 10s default, spuriously throwing LockError.
-        { pollMs: 5, timeoutMs: 60_000 },
+        {
+          pollMs: 5,
+          timeoutMs: 60_000,
+          isProcessAlive: () => {
+            contended.resolve();
+            return true;
+          },
+        },
       );
 
     await Promise.all([critical('A'), critical('B')]);
 
     // Whichever ran first completed fully before the other started.
+    expect(maxInside).toBe(1);
     expect(events).toHaveLength(4);
     expect(events[0]!.split(':')[0]).toBe(events[1]!.split(':')[0]);
     expect(events[2]!.split(':')[0]).toBe(events[3]!.split(':')[0]);
+    expect(events[1]).toMatch(/:end$/);
+    expect(events[3]).toMatch(/:end$/);
+  });
+
+  it('never publishes a lock a waiter can read as malformed — no double-entry mid-acquire', async () => {
+    const p = paths();
+    // The window under test: between "the lock path exists" and "the lock path
+    // carries its holder record". A waiter that reads the lock inside that
+    // window sees bytes it cannot parse, judges the lock ownerless, reclaims it
+    // out from under a live acquirer and enters alongside it. The barrier stops
+    // the winner exactly there, so the overlap is forced rather than hoped for.
+    const aPublished = deferred(); // A has made p.lock visible and is parked in it
+    const mayFinish = deferred(); // ...until we let it complete the acquire
+    const bSettled = deferred(); // B is inside, or provably refused entry
+    const contended = deferred(); // frees whichever section is being held open
+    publishBarrier.arm(p.lock, aPublished.resolve, mayFinish.promise);
+
+    const warnings: string[] = [];
+    const events: string[] = [];
+    let inside = 0;
+    let maxInside = 0;
+    const critical = (tag: string) =>
+      withLock(
+        p,
+        async () => {
+          inside += 1;
+          maxInside = Math.max(maxInside, inside);
+          events.push(`${tag}:start`);
+          if (tag === 'B') bSettled.resolve();
+          // Both in at once => no one is left to contend and release the
+          // barrier; free it so this fails on the assertion, not on a timeout.
+          if (inside > 1) contended.resolve();
+          await contended.promise;
+          events.push(`${tag}:end`);
+          inside -= 1;
+        },
+        {
+          pollMs: 5,
+          timeoutMs: 60_000,
+          staleMs: 10_000_000, // age must play no part in this test
+          isProcessAlive: () => {
+            // A liveness probe is one failed acquire: B announcing "I tried and
+            // was refused". That, not a sleep, is what says B has settled.
+            bSettled.resolve();
+            contended.resolve();
+            return true;
+          },
+          onWarn: (m) => warnings.push(m),
+        },
+      );
+
+    const a = critical('A');
+    // Safety nets: a rejection must not park the test on a barrier forever.
+    void a.catch(() => {}).finally(() => aPublished.resolve());
+    await aPublished.promise; // A owns the lock path but has not finished acquiring
+
+    const b = critical('B');
+    void b.catch(() => {}).finally(() => bSettled.resolve());
+    await bSettled.promise; // B has met the half-published lock and reacted
+
+    mayFinish.resolve(); // A completes its acquire and enters its section
+    await Promise.all([a, b]);
+
+    expect(maxInside).toBe(1); // the sections never overlapped
+    expect(warnings).toEqual([]); // an in-flight lock was never judged malformed
+    expect(events).toHaveLength(4);
+    // Whichever ran first completed fully before the other started.
+    expect(events[0]!.split(':')[0]).toBe(events[1]!.split(':')[0]);
     expect(events[1]).toMatch(/:end$/);
     expect(events[3]).toMatch(/:end$/);
   });
@@ -90,7 +273,17 @@ describe('withLock', () => {
           ran = true;
           return 'nope';
         },
-        { timeoutMs: 60, pollMs: 10, staleMs: 10_000_000, isProcessAlive: () => true },
+        // Logical clock: the deadline expires after a fixed NUMBER of poll
+        // rounds (4), not after 60 real milliseconds — a 60ms wall-clock budget
+        // is routinely blown by a loaded box and fails for reasons that have
+        // nothing to do with the lock.
+        {
+          timeoutMs: 100,
+          pollMs: 5,
+          staleMs: 10_000_000,
+          isProcessAlive: () => true,
+          now: steppingClock(25),
+        },
       ),
     ).rejects.toBeInstanceOf(LockError);
 
@@ -163,7 +356,16 @@ describe('withLock', () => {
           ran = true;
           return 'nope';
         },
-        { timeoutMs: 60, pollMs: 10, staleMs: 1000, isProcessAlive: () => true },
+        // staleMs is deliberately far below the holder's age; the logical clock
+        // (see steppingClock) fixes the deadline at 4 poll rounds so the "waiter
+        // times out" half is machine-speed independent.
+        {
+          timeoutMs: 100,
+          pollMs: 5,
+          staleMs: 1000,
+          isProcessAlive: () => true,
+          now: steppingClock(25),
+        },
       ),
     ).rejects.toBeInstanceOf(LockError);
 
@@ -178,26 +380,49 @@ describe('withLock', () => {
     let maxConcurrent = 0;
     const events: string[] = [];
 
-    const run = (tag: string, staleMs: number) =>
+    // Three barriers replace what used to be three sleeps. Nothing here waits on
+    // wall-clock time, so load can make the test slower but never wrong.
+    const aEntered = deferred(); // A is provably inside its critical section
+    const bSettled = deferred(); // B has been refused (or, on the bug, got in)
+
+    const run = (tag: string, staleMs: number, isProcessAlive: (pid: number) => boolean) =>
       withLock(
         p,
         async () => {
           concurrent += 1;
           maxConcurrent = Math.max(maxConcurrent, concurrent);
           events.push(`${tag}:start`);
-          await delay(40);
+          if (tag === 'A') {
+            aEntered.resolve();
+            await bSettled.promise; // hold the section open across B's attempt
+          } else {
+            // On the buggy code B arrives here WHILE A is still inside; the
+            // overlap is already recorded in maxConcurrent above.
+            bSettled.resolve();
+          }
           events.push(`${tag}:end`);
           concurrent -= 1;
         },
-        { pollMs: 5, staleMs, timeoutMs: 60_000, isProcessAlive: () => true },
+        { pollMs: 5, staleMs, timeoutMs: 60_000, isProcessAlive },
       );
 
     // A takes the lock first and stays inside its section. B runs with an
     // aggressive staleMs: on the buggy code it reclaims A's still-held lock by
     // age and slips into the critical section alongside A (double-entry).
-    const a = run('A', 60_000);
-    await delay(8); // let A acquire and enter its section
-    const b = run('B', 1);
+    const a = run('A', 60_000, () => true);
+    await aEntered.promise; // A is IN — not "8ms have passed, it probably is"
+
+    // Each liveness probe is one failed acquire by B. After three of them B is
+    // demonstrably blocked rather than merely slow, so A may leave.
+    let refusals = 0;
+    const b = run('B', 1, () => {
+      if ((refusals += 1) >= 3) bSettled.resolve();
+      return true;
+    });
+    // Safety net: if B fails outright (e.g. LockError) it would otherwise leave
+    // A parked on bSettled forever, turning a clear failure into a test timeout.
+    void b.catch(() => {}).finally(() => bSettled.resolve());
+
     await Promise.all([a, b]);
 
     expect(maxConcurrent).toBe(1); // the sections never overlapped
@@ -219,8 +444,16 @@ describe('withLock', () => {
     let concurrent = 0;
     let maxConcurrent = 0;
     const events: string[] = [];
-    // Alive only for our own pid; the planted 999999 reads as dead.
-    const isProcessAlive = (pid: number) => pid === process.pid;
+    // Barrier, not a sleep: the winner holds its section open until the loser
+    // has probed it and been refused (see the serialisation test above).
+    const contended = deferred();
+    // Alive only for our own pid; the planted 999999 reads as dead. A probe of
+    // OUR pid means a waiter found the other acquirer holding the lock.
+    const isProcessAlive = (pid: number) => {
+      if (pid !== process.pid) return false;
+      contended.resolve();
+      return true;
+    };
     const critical = (tag: string) =>
       withLock(
         p,
@@ -228,7 +461,10 @@ describe('withLock', () => {
           concurrent += 1;
           maxConcurrent = Math.max(maxConcurrent, concurrent);
           events.push(`${tag}:start`);
-          await delay(20);
+          // Both in at once => nobody will ever contend and resolve the barrier;
+          // release it so the failure is the assertion, not a test timeout.
+          if (concurrent > 1) contended.resolve();
+          await contended.promise;
           events.push(`${tag}:end`);
           concurrent -= 1;
         },
@@ -256,6 +492,68 @@ describe('withLock', () => {
 
     expect(result).toBe('ran');
     expect(warnings.some((w) => /malformed lock file/.test(w))).toBe(true);
+  });
+
+  it('reclaims an EMPTY lock file left behind by a crashed process', async () => {
+    const p = paths();
+    // A zero-byte lock is exactly the state a half-finished publish used to
+    // leave visible, so it is tempting to close that hole by making empty locks
+    // un-reclaimable. That would trade a rare double-entry for a store wedged
+    // forever by one crash. The publish is atomic now, so an empty lock can
+    // only be debris — and debris must still be cleared.
+    writeFileSync(p.lock, '');
+    const warnings: string[] = [];
+
+    const result = await withLock(p, async () => 'ran', {
+      onWarn: (m) => warnings.push(m),
+    });
+
+    expect(result).toBe('ran');
+    expect(warnings.some((w) => /malformed lock file/.test(w))).toBe(true);
+    expect(existsSync(p.lock)).toBe(false);
+  });
+
+  it('still locks on a filesystem that cannot hard-link (falls back, EPERM)', async () => {
+    const p = paths();
+    // EPERM is what Linux reports for "this filesystem has no hard links". We
+    // would rather lock imperfectly there than not lock at all, so the acquire
+    // falls back to the plain exclusive create.
+    hardLinkFault.fail('EPERM');
+
+    const result = await withLock(p, async () => {
+      expect(JSON.parse(readFileSync(p.lock, 'utf8')).pid).toBe(process.pid);
+      return 'ran';
+    });
+
+    expect(result).toBe('ran');
+    expect(existsSync(p.lock)).toBe(false); // and it still releases
+    expect(readdirSync(dirname(p.lock)).filter((e) => e.startsWith('lock'))).toEqual([]);
+  });
+
+  it('propagates a link failure that is NOT "no hard links here"', async () => {
+    const p = paths();
+    // Only the specific "unsupported" errnos may downgrade to the weaker
+    // create; a genuine I/O fault must surface, not be silently worked around.
+    hardLinkFault.fail('EIO');
+
+    let ran = false;
+    await expect(
+      withLock(p, async () => {
+        ran = true;
+      }),
+    ).rejects.toThrow(/EIO/);
+
+    expect(ran).toBe(false);
+    expect(existsSync(p.lock)).toBe(false);
+    expect(readdirSync(dirname(p.lock)).filter((e) => e.startsWith('lock'))).toEqual([]);
+  });
+
+  it('leaves no scratch files beside the lock once it is released', async () => {
+    const p = paths();
+    await withLock(p, async () => 'ran');
+    // The atomic publish stages the holder record in a temp file next to the
+    // lock; a leaked one would accumulate in the user's ~/.agentenv forever.
+    expect(readdirSync(dirname(p.lock)).filter((e) => e.startsWith('lock'))).toEqual([]);
   });
 
   it('writes pid + timestamp into the lock while held', async () => {

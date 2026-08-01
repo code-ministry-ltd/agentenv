@@ -127,31 +127,103 @@ adapter's isolation breaks silently (harness would read a non-existent
 `dirname/opencode`). This is the one place OpenCode does not fit the "override var
 points at the root" assumption baked into the frozen `validateAdapter`.
 
-## MCP shape transform (`compileConfigKeys` / `syncBackConfigKeys`)
+## MCP shape transform (`compileConfigKeys`)
 
 Canonical `mcp/servers.yaml` (D6) → OpenCode `opencode.json` `mcp.<name>`:
 
 | canonical | OpenCode |
 |---|---|
-| `transport: stdio` + `command`/`args`/`env` | `{ type:"local", command:[command, ...args], enabled:true, env? }` |
-| `transport: http`\|`sse` + `url`/`headers` | `{ type:"remote", url, enabled:true, headers? }` |
+| `transport: stdio` + `command`/`args`/`env` | `{ type:"local", command:[command, ...args], enabled, env? }` |
+| `transport: http`\|`sse` + `url`/`headers` | `{ type:"remote", url, enabled, headers? }` |
 | `auth: { bearer_env: VAR }` | header `Authorization: "Bearer {env:VAR}"` |
+| `enabled: false` | `enabled: false` (defaults to `true` when canonical says nothing) |
 | `${VAR}` (any string) | `{env:VAR}` (OpenCode's native syntax) |
+
+A canonical `enabled: false` is **carried through**: a deliberately disabled server must
+never be silently switched back on. A HAND-AUTHORED harness-shaped entry (no
+`transport`, an OpenCode/Claude-style `type`) keeps its `type` as the transport hint
+rather than being re-inferred from the bare `url` — otherwise `{ type: sse, url }` would
+compile to an HTTP server and the SSE endpoint would break.
 
 Canonical `${VAR}` placeholders are **compiled to OpenCode's `{env:VAR}` form and
 KEPT** (rung-1 passthrough — OpenCode interpolates `{env:VAR}` natively,
 `substitutePlaceholders:false`); every `{env:VAR}`-bearing field is recorded in
-`secretFields` so drift write-back restores the placeholder, never a baked literal
-(D6).
+`secretFields` so the drift sweep sees the placeholder, never a baked literal (D6).
 
-The forward transform is **idempotent** on an already-OpenCode-shaped entry
-(`type` present, no `transport`; `{env:VAR}` already in place). `syncBackConfigKeys`
-writes the drifted server back into `servers.yaml` **verbatim** (OpenCode's
-normalised shape, placeholders restored), which is round-trip stable —
-`compile(syncBack(v)) === v` — matching the Claude D6 decision (a superset
-canonical model every forward transform tolerates, rather than a lossy reverse
-transform). `http` vs `sse` is not distinguishable in OpenCode's single `remote`
-type; an `sse` canonical entry round-trips as `remote`→`http` (documented, rare).
+The flow is **one-way**: canonical → OpenCode. `mcp/servers.yaml` is the single source of
+truth and agentenv never writes it on your behalf.
+
+## MCP drift is REPORTED, not applied (`describeConfigKeysDrift`)
+
+If you edit a server in `opencode.json`, agentenv does **not** fold that edit back into
+`mcp/servers.yaml`. On the next command it names the server and the canonical fields that
+differ, names both files, and says plainly that the canonical store was NOT changed.
+
+**To make a harness-side change permanent, edit `mcp/servers.yaml` yourself** — in
+canonical D6 shape (`transport`/`command`/`args`/`url`/`auth`, `${VAR}` placeholders), not
+OpenCode's `{env:}`/`type:"local"`/command-array shape. Until you do, the next launch
+composes the canonical value again. The report carries field names and env-var names only,
+never values.
+
+**Why report rather than apply.** The forward shape is **not injective**:
+
+- `type:"remote"` maps from BOTH `transport: http` and `transport: sse`;
+- `command:[cmd, ...args]` maps from BOTH `{command:"a", args:["b"]}` and
+  `{command:["a","b"]}`.
+
+So an inverse cannot be computed; it has to be RECONSTRUCTED from (harness value, prior
+canonical def, branch identity). agentenv did exactly that for three review rounds, and
+each round fixed the reconstruction defects it was shown and introduced new ones at the
+next boundary the reconstruction lattice did not cover — twice with a security
+consequence. The lattice is adequate to DESCRIBE a difference and was never adequate to
+DECIDE what to do about one, so the decision is now yours.
+
+**The lattice survives as CLASSIFICATION.** `unshapeOpenCodeServer` still runs
+(`{env:VAR}`→`${VAR}`, the single `command` array split back into `command`+`args`,
+`type:'local'|'remote'`→`transport`, `Authorization: Bearer {env:VAR}`→`auth.bearer_env`)
+so the report names the CANONICAL field you must edit rather than the OpenCode field you
+touched. What it produces is diffed against the prior canonical def and thrown away; only
+the field NAMES and change kinds reach you. In particular:
+
+- Everything the OpenCode shape cannot express (`timeout`, any field a future release
+  adds) is simply not mentioned — an edit to `url` reports `url` and nothing else.
+- The prior `command`/`args` split is recognised when the flattened array is unchanged, so
+  a URL edit does not falsely report a command-line change.
+
+**`transportAuthority` scopes the transport claim to the shapes that can make it.** It is
+OpenCode's `type:"remote"` (and Codex's bare `url` table) that cannot record http-vs-sse,
+so an unrelated edit there reports NO transport change — claiming one would send you to
+"fix" an SSE endpoint into HTTP. Claude and Cursor record the distinction NATIVELY in
+their own `type`, so for them a `type` edit IS reported as a `transport` change. Each
+branch declares `native` | `inferred` | `verbatim` | `ambiguous` explicitly, rather than
+deciding from the transport family, which is not a sound discriminator for this.
+
+**Where NO prior canonical entry exists** (a server you added straight into
+`opencode.json`), there is nothing to diff against and the `http`/`sse` ambiguity is
+irreducible — so the report says the entry is missing from `mcp/servers.yaml` and stops,
+rather than guessing its canonical fields. That is exactly the action you must take.
+
+**Ambiguity is flagged, never resolved.** Two cases reach that rule from OpenCode, and
+both are reported as a NOTE against the field rather than as a resolved change:
+
+- an `Authorization` header that no longer matches the one agentenv compiled from
+  `auth.bearer_env` — it could be a credential replacement or an unrelated header, and the
+  two have opposite consequences in a harness you are not looking at;
+- a hand-written canonical `transport` sitting beside OpenCode's own `type` — the two
+  discriminators disagree, so neither is claimed (reading both shapes at once used to
+  duplicate an argument and leak `type`/`enabled` into the store).
+
+`enabled` follows the same principle: OpenCode's shape always carries one, so it is only
+reported when it DIFFERS from what the shaper emitted for the prior def — otherwise a
+hand-authored non-boolean `enabled` would look like a change you never made.
+
+**Round-trip note (`use --global` → `drop`).** Keyed config-keys (this MCP surface)
+and file-block surfaces restore byte-identically. The **array-element** surface —
+OpenCode's `instructions` array — is **data-identical, not byte-identical**: the
+shared `config-keys.ts` rewrites the touched array literal compactly, so a user's
+multi-line `instructions: [\n  "…"\n]` returns single-line `instructions: ["…"]`
+after an inject→remove cycle. This reflow is design-sanctioned (parsed-equal, no
+residue, ownership fully removed), not a bug.
 
 ## selfCheck
 

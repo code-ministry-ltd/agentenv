@@ -4,13 +4,13 @@ import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
-import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { parse as parseYaml } from 'yaml';
 import type {
   Adapter,
   ConfigKeysContext,
   ConfigKeysDrift,
   ConfigKeysInjection,
-  ConfigKeysStoreMutation,
+  ConfigKeysDriftReport,
   ConfigKeysSurface,
   EntryBucket,
   SelfCheckContext,
@@ -19,6 +19,15 @@ import type {
 } from '../adapter.js';
 import type { JsonValue } from '../config-keys.js';
 import { resolveBinaryOnPath } from '../session/resolve.js';
+import {
+  describeCanonicalDrift,
+  omitKeys,
+  passthroughUnshape,
+  resolveAuthDrift,
+  transportFamily,
+  type UnshapeContext,
+  type UnshapedServer,
+} from './mcp-canonical.js';
 
 /**
  * The Codex CLI adapter — the Phase-4 implementation of the frozen {@link Adapter}
@@ -171,16 +180,26 @@ function collectPlaceholders(value: unknown, prefix: string, out: Record<string,
  * A bespoke/unknown transport is passed through unchanged (fail-soft — never
  * corrupt a user's authored entry).
  */
-function shapeCodexServer(def: unknown): JsonValue {
+function shapeCodexServer(
+  def: unknown,
+  name: string,
+  warn: (message: string) => void,
+): JsonValue {
   if (!isObject(def)) return def as JsonValue;
 
+  // A HAND-AUTHORED harness-shaped entry (no `transport`, a `type`) is honoured exactly
+  // as the other three adapters honour it: `type` IS the transport hint. Without this,
+  // `{ type: websocket, url }` — which Claude/Cursor/OpenCode all pass through as bespoke
+  // — would silently compile to a plain Codex HTTP table here (F5/2, F6/2).
   const transport =
     typeof def.transport === 'string'
       ? def.transport
       : def.command !== undefined
         ? 'stdio'
         : def.url !== undefined
-          ? 'http'
+          ? typeof def.type === 'string'
+            ? def.type
+            : 'http'
           : undefined;
 
   if (transport === 'stdio') {
@@ -206,8 +225,23 @@ function shapeCodexServer(def: unknown): JsonValue {
     const out: Record<string, JsonValue> = {};
     if (def.url !== undefined) out.url = def.url;
     const auth = def.auth;
+    // SECURITY (F6/3): an `Authorization` header SHADOWS the bearer — it is what the
+    // server will actually receive. Emitting `bearer_token_env_var` beside it would have
+    // Codex keep authenticating with a credential the user may believe they replaced, in
+    // a harness they were not looking at. Refuse, and say why.
+    const shadowedBy =
+      isObject(def.headers) && def.headers.Authorization !== undefined ? 'headers' : null;
     if (isObject(auth) && typeof auth.bearer_env === 'string') {
-      out.bearer_token_env_var = auth.bearer_env;
+      if (shadowedBy !== null) {
+        warn(
+          `agentenv: MCP server '${name}' — canonical auth.bearer_env (${auth.bearer_env}) is ` +
+            `SHADOWED by an Authorization header, so codex's bearer_token_env_var was NOT ` +
+            `written; the header is what codex will send. Remove one of the two in ` +
+            `mcp/servers.yaml to settle it.`,
+        );
+      } else {
+        out.bearer_token_env_var = auth.bearer_env;
+      }
     }
     if (isObject(def.headers)) {
       const httpHeaders: Record<string, JsonValue> = {};
@@ -227,32 +261,71 @@ function shapeCodexServer(def: unknown): JsonValue {
   return def as JsonValue;
 }
 
+/** Codex-only keys the un-shape TRANSLATES away (they have canonical counterparts). */
+const CODEX_NATIVE_KEYS = [
+  'env_vars',
+  'bearer_token_env_var',
+  'http_headers',
+  'env_http_headers',
+] as const;
+
 /**
- * The inverse of {@link shapeCodexServer}: one drifted Codex `[mcp_servers.<name>]`
- * table back to the canonical `servers.yaml` D6 shape (`transport` + `auth`/`env`
- * with `${VAR}` restored). Keeping `servers.yaml` in the pure canonical form — the
- * shape `add mcp` authors and Claude's compile also reads — is the Phase-4
- * decision that servers.yaml is D6-canonical across adapters.
+ * The canonical keys each {@link shapeCodexServer} branch emits (FAMILY-AWARE, see the
+ * Claude adapter's note): the stdio branch never writes `url`/`headers`, so it may not
+ * delete them, and vice versa. Unlike the other adapters, `auth` is unconditional on the
+ * remote branch: Codex's `bearer_token_env_var` is an EXACT bidirectional mapping with no
+ * header shadowing it, so its absence really does mean the bearer was removed.
  */
-function unshapeCodexServer(def: unknown): JsonValue {
-  if (!isObject(def)) return def as JsonValue;
+const CODEX_STDIO_SUPERSEDES = ['type', 'command', 'args', 'env'] as const;
+const CODEX_REMOTE_SUPERSEDES = ['type', 'url', 'headers'] as const;
+
+/**
+ * The inverse of {@link shapeCodexServer}, as an OVERLAY over the prior canonical def
+ * (see `mcp-canonical.ts`): the native indirections (`env_vars`, `bearer_token_env_var`,
+ * `env_http_headers`) translated back to canonical `env`/`auth`/`headers` with `${VAR}`
+ * restored, and every OTHER field of the drifted table carried over verbatim, so a field
+ * the user added in `config.toml` reaches the store rather than being dropped by a
+ * whitelist (F5/3). Codex's table cannot distinguish `http` from `sse` (both are just a
+ * `url`), so the prior canonical `transport` is kept verbatim by the overlay (F5/4); a
+ * bespoke `transport` the shaper passed through is never re-inferred (F5/1).
+ */
+function unshapeCodexServer(
+  def: Record<string, JsonValue>,
+  prior: unknown,
+  ctx: UnshapeContext,
+): UnshapedServer {
+  // A `transport` — or a `type` naming a transport Codex has no table shape for — can
+  // only have come from the shaper's bespoke passthrough, so the entry is already
+  // canonical; never re-infer over it (F5/1, F6/2, symmetric with {@link shapeCodexServer}).
+  if (typeof def.transport === 'string') return passthroughUnshape(def, prior);
+  if (typeof def.type === 'string' && transportFamily(def.type) === 'bespoke') {
+    return passthroughUnshape(def, prior);
+  }
 
   if (def.command !== undefined) {
-    const out: Record<string, JsonValue> = { transport: 'stdio', command: def.command };
-    if (def.args !== undefined) out.args = def.args;
+    const fields: Record<string, JsonValue> = {
+      transport: 'stdio',
+      ...omitKeys(def, [...CODEX_NATIVE_KEYS, 'env']),
+    };
     const env: Record<string, JsonValue> = isObject(def.env) ? { ...def.env } : {};
     if (Array.isArray(def.env_vars)) {
       for (const v of def.env_vars) if (typeof v === 'string') env[v] = `\${${v}}`;
     }
-    if (Object.keys(env).length > 0) out.env = env;
-    return out;
+    if (Object.keys(env).length > 0) fields.env = env;
+    else if (def.env !== undefined && !isObject(def.env)) fields.env = def.env;
+    return {
+      fields,
+      supersedes: CODEX_STDIO_SUPERSEDES,
+      family: 'stdio',
+      transportAuthority: 'native', // `stdio` is unambiguous — only a command compiles to one
+    };
   }
 
   if (def.url !== undefined) {
-    const out: Record<string, JsonValue> = { transport: 'http', url: def.url };
-    if (typeof def.bearer_token_env_var === 'string') {
-      out.auth = { bearer_env: def.bearer_token_env_var };
-    }
+    const fields: Record<string, JsonValue> = {
+      transport: 'http',
+      ...omitKeys(def, [...CODEX_NATIVE_KEYS, 'headers']),
+    };
     const headers: Record<string, JsonValue> = isObject(def.http_headers)
       ? { ...def.http_headers }
       : {};
@@ -261,13 +334,33 @@ function unshapeCodexServer(def: unknown): JsonValue {
         if (typeof varName === 'string') headers[name] = `\${${varName}}`;
       }
     }
-    if (Object.keys(headers).length > 0) out.headers = headers;
-    return out;
+    if (Object.keys(headers).length > 0) fields.headers = headers;
+    // `bearer_token_env_var` is EXACT, so it settles `auth` outright. Without one, the
+    // question falls to the shared rule: a table whose Authorization header no longer
+    // matches what agentenv compiled says nothing reliable about the bearer (F6/3+4).
+    const auth = resolveAuthDrift({
+      prior,
+      header: headers.Authorization,
+      bearerEnvFromHeader: () => null, // Codex has no Bearer-header convention
+      nativeBearer: typeof def.bearer_token_env_var === 'string' ? def.bearer_token_env_var : null,
+      foldsBearerIntoHeader: false,
+      ctx,
+    });
+    if (auth.kind === 'set') fields.auth = { bearer_env: auth.bearerEnv };
+    return {
+      fields,
+      supersedes:
+        auth.kind === 'delete' ? [...CODEX_REMOTE_SUPERSEDES, 'auth'] : CODEX_REMOTE_SUPERSEDES,
+      family: 'remote',
+      // A Codex table is just a `url`: `http` and `sse` are indistinguishable, so the
+      // `http` above is a GUESS the prior canonical transport overrides (F5/4).
+      transportAuthority: 'inferred',
+    };
   }
 
-  // Unknown/bespoke Codex entry: pass through so a user's hand-authored table is
-  // never corrupted on write-back.
-  return def as JsonValue;
+  // Unknown/bespoke Codex entry: carry the whole table over so a user's hand-authored
+  // one is never corrupted on write-back.
+  return passthroughUnshape(def, prior);
 }
 
 /** Run `codex --version`, resolving `true` only on a clean exit 0. Never throws. */
@@ -339,6 +432,8 @@ export const codexAdapter: Adapter = {
   ): Promise<ConfigKeysInjection[]> {
     if (surface.id !== 'mcp') return [];
     const injections: ConfigKeysInjection[] = [];
+    // The shaper refuses to emit a SHADOWED bearer (F6/3) and must say so out loud.
+    const warn = ctx.onWarn ?? ((m: string) => console.warn(m));
 
     const serversFile = join(ctx.envContentDir, 'mcp', 'servers.yaml');
     if (existsSync(serversFile)) {
@@ -348,7 +443,7 @@ export const codexAdapter: Adapter = {
         | undefined;
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
         for (const [name, def] of Object.entries(parsed)) {
-          const value = shapeCodexServer(def);
+          const value = shapeCodexServer(def, name, warn);
           const secretFields: Record<string, string> = {};
           collectPlaceholders(value, '', secretFields);
           injections.push({
@@ -375,28 +470,38 @@ export const codexAdapter: Adapter = {
     return injections;
   },
 
-  async syncBackConfigKeys(
+  async describeConfigKeysDrift(
     surface: ConfigKeysSurface,
     drift: ConfigKeysDrift,
     ctx: ConfigKeysContext,
-  ): Promise<ConfigKeysStoreMutation[]> {
-    // Inverse of compileConfigKeys (spec criterion 4): fold one drifted Codex
-    // `[mcp_servers.<name>]` table back into servers.yaml, siblings untouched, in
-    // the pure canonical D6 shape (`transport`/`auth`/`env` with `${VAR}` restored),
-    // so a later compile reproduces the drift exactly — round-trip stable.
-    if (surface.id !== 'mcp' || drift.style !== 'keyed') return [];
-    // The trust entry (`['projects', <root>]`) is launch-derived, not stored — its
-    // drift is discarded, never written to servers.yaml.
-    if (drift.keyPath.length < 2 || drift.keyPath[0] !== 'mcp_servers') return [];
+  ): Promise<ConfigKeysDriftReport | null> {
+    // Classify how one drifted Codex `[mcp_servers.<name>]` table disagrees with the
+    // canonical D6 def in servers.yaml. `unshapeCodexServer` + the OVERLAY translate the
+    // native indirections (`env_vars`, `bearer_token_env_var`, `env_http_headers`) back
+    // to canonical `env`/`auth`/`headers`, so the report names CANONICAL fields — the
+    // ones the user will edit. servers.yaml is READ here and never written.
+    if (surface.id !== 'mcp' || drift.style !== 'keyed') return null;
+    // The trust entry (`['projects', <root>]`) is launch-derived, not stored — it has no
+    // canonical counterpart to disagree with, so there is nothing to report.
+    if (drift.keyPath.length < 2 || drift.keyPath[0] !== 'mcp_servers') return null;
     const name = drift.keyPath[drift.keyPath.length - 1];
-    if (typeof name !== 'string') return [];
+    if (typeof name !== 'string') return null;
 
     const serversFile = join(ctx.envContentDir, 'mcp', 'servers.yaml');
     const existing = existsSync(serversFile)
       ? ((parseYaml(await readFile(serversFile, 'utf8')) as Record<string, unknown> | null) ?? {})
       : {};
-    existing[name] = unshapeCodexServer(drift.canonicalValue);
-    return [{ storeRelativePath: join('mcp', 'servers.yaml'), content: stringifyYaml(existing) }];
+    return {
+      entry: name,
+      storeRelativePath: join('mcp', 'servers.yaml'),
+      changes: describeCanonicalDrift({
+        prior: existing[name],
+        drifted: drift.canonicalValue,
+        unshape: unshapeCodexServer,
+        server: name,
+        adapterId: 'codex',
+      }),
+    };
   },
 
   async selfCheck(viewRoot: string, ctx: SelfCheckContext): Promise<SelfCheckResult> {

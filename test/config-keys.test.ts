@@ -13,14 +13,14 @@ import {
 import { beginTransaction } from '../src/journal.js';
 import { resolvePaths } from '../src/paths.js';
 import { findOwners, readState } from '../src/state.js';
-import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot } from './helpers.js';
+import { expectRealHomeUntouched, makeTempHome, guardRealHome } from './helpers.js';
 
 describe('config-keys', () => {
   let temp: ReturnType<typeof makeTempHome>;
-  let realBefore: ReturnType<typeof realHomeSnapshot>;
+  let realBefore: ReturnType<typeof guardRealHome>;
 
   beforeEach(() => {
-    realBefore = realHomeSnapshot();
+    realBefore = guardRealHome();
     temp = makeTempHome();
   });
 
@@ -189,6 +189,92 @@ describe('config-keys', () => {
       expect(removed.removed).toBe(true);
       // Created-and-now-empty parent pruned → byte-for-byte the user's original.
       expect(readFileSync(f, 'utf8')).toBe(original);
+    });
+
+    // The byte-identity claim was only ever proven for ONE 2-space plain-JSON file.
+    // `pruneCreatedParents` re-parses and re-modifies the text a SECOND time, which is a
+    // second chance to diverge — and JSONC is where a re-serialising editor shows itself.
+    it('is byte-identical on JSONC with comments, trailing commas and tab indentation', async () => {
+      const p = paths();
+      const f = file('mcp.jsonc');
+      const original =
+        '{\n' +
+        "\t// the user's own MCP set — comments MUST survive\n" +
+        '\t"servers": {\n' +
+        '\t\t/* block comment */\n' +
+        '\t\t"mine": { "command": "x" },\n' +
+        '\t},\n' +
+        '\t"theme": "dark",\n' +
+        '}\n';
+      writeFileSync(f, original);
+
+      const item = await inTx(p, (tx) =>
+        injectKeyed(p, tx, {
+          file: f,
+          format: 'jsonc',
+          keyPath: ['servers', 'ours'],
+          value: { command: 'y' },
+          ownerEnv: 'writing',
+        }),
+      );
+      const afterInject = readFileSync(f, 'utf8');
+      expect(afterInject).toContain('comments MUST survive');
+      expect(afterInject).toContain('/* block comment */');
+
+      const removed = await inTx(p, (tx) => removeKey(p, tx, item));
+      expect(removed.removed).toBe(true);
+      expect(readFileSync(f, 'utf8')).toBe(original);
+    });
+
+    // Same, but through the created-parent PRUNE path (the second re-modify).
+    it('is byte-identical on JSONC when the inject had to CREATE the parent', async () => {
+      const p = paths();
+      const f = file('mcp2.jsonc');
+      const original = '{\n  // keep me\n  "theme": "dark",\n}\n'; // no `servers` parent
+      writeFileSync(f, original);
+
+      const item = await inTx(p, (tx) =>
+        injectKeyed(p, tx, {
+          file: f,
+          format: 'jsonc',
+          keyPath: ['servers', 'ours'],
+          value: { command: 'y' },
+          ownerEnv: 'writing',
+        }),
+      );
+      expect(item.createdParents).toBe(1);
+
+      const removed = await inTx(p, (tx) => removeKey(p, tx, item));
+      expect(removed.removed).toBe(true);
+      expect(readFileSync(f, 'utf8')).toBe(original);
+    });
+
+    // F5/10: the byte-identity guarantee is about a file that EXISTS. When the target
+    // file was absent, inject CREATES it and removal cannot un-create it — an empty `{}`
+    // is left where the user had no file. Pinned here so the limitation stays visible
+    // rather than being implied away by the "byte-identical" wording.
+    it('leaves an empty {} behind when the target file did not exist (documented gap)', async () => {
+      const p = paths();
+      const f = file('created-by-us.json');
+      expect(existsSync(f)).toBe(false);
+
+      const item = await inTx(p, (tx) =>
+        injectKeyed(p, tx, {
+          file: f,
+          format: 'json',
+          keyPath: ['mcpServers', 'ours'],
+          value: { command: 'y' },
+          ownerEnv: 'writing',
+        }),
+      );
+      const removed = await inTx(p, (tx) => removeKey(p, tx, item));
+      expect(removed.removed).toBe(true);
+
+      // The file still exists, holding an empty object — NOT the pre-inject state (no
+      // file at all). Harmless for every current adapter (their config files all exist
+      // already), but it is not "byte-identical", and the docstrings must not say so.
+      expect(existsSync(f)).toBe(true);
+      expect(JSON.parse(readFileSync(f, 'utf8'))).toEqual({});
     });
 
     it('does NOT prune a parent the user already owned as an empty {}', async () => {

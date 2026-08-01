@@ -3,13 +3,13 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { parse as parseYaml } from 'yaml';
 import type {
   Adapter,
   ConfigKeysContext,
   ConfigKeysDrift,
   ConfigKeysInjection,
-  ConfigKeysStoreMutation,
+  ConfigKeysDriftReport,
   ConfigKeysSurface,
   EntryBucket,
   OverrideEnv,
@@ -19,6 +19,17 @@ import type {
 } from '../adapter.js';
 import type { JsonValue } from '../config-keys.js';
 import { resolveBinaryOnPath } from '../session/resolve.js';
+import {
+  describeCanonicalDrift,
+  isJsonObject,
+  hasConflictingDiscriminators,
+  omitKeys,
+  passthroughUnshape,
+  resolveAuthDrift,
+  noteConflictingTransport,
+  type UnshapeContext,
+  type UnshapedServer,
+} from './mcp-canonical.js';
 
 /**
  * The OpenCode adapter (Task 4.2). Every declaration below is re-verified LIVE
@@ -189,23 +200,26 @@ function toCommandArray(command: JsonValue | undefined, args: JsonValue | undefi
 
 /**
  * Shape one canonical `mcp/servers.yaml` server (D6) into OpenCode's `opencode.json`
- * `mcp.<name>` object. IDEMPOTENT: an entry already in OpenCode's shape (`type`
- * present, no canonical `transport`) passes through unchanged — this is what makes
- * {@link syncBackConfigKeys}'s verbatim write-back round-trip stably
- * (`compile(syncBack(v)) === v`).
+ * `mcp.<name>` object. `servers.yaml` is ALWAYS D6-canonical — agentenv never writes a
+ * harness shape into it, because drift is REPORTED rather than applied
+ * ({@link Adapter.describeConfigKeysDrift}) — so the input normally carries `transport`.
+ *
+ * A HAND-AUTHORED harness-shaped entry is still honoured: `type` is the transport hint
+ * when there is no `transport` (so `{ type: sse, url }` compiles to a remote server
+ * rather than being re-inferred), and an explicit `enabled: false` is CARRIED THROUGH —
+ * a deliberately disabled server must never be silently switched back on (F5/2).
  *
  * Mappings from the canonical model:
- *   stdio → `{ type:'local', command:[command, ...args], enabled:true, env? }`
+ *   stdio → `{ type:'local', command:[command, ...args], enabled, env? }`
  *     (OpenCode's `command` is a SINGLE array combining command + args).
- *   http/sse → `{ type:'remote', url, enabled:true, headers? }`, with
+ *   http/sse → `{ type:'remote', url, enabled, headers? }`, with
  *     `auth.bearer_env: VAR` folded into `Authorization: 'Bearer {env:VAR}'`.
+ * `enabled` defaults to `true` (OpenCode's own default) when canonical says nothing.
  * `${VAR}` in any string becomes `{env:VAR}` (OpenCode's native passthrough form).
  * A bespoke/unknown transport is passed through (fail-soft), still var-converted.
  */
 function shapeOpenCodeServer(def: unknown): JsonValue {
   if (!isObject(def)) return def as JsonValue;
-  // Already OpenCode-shaped (has `type`, not the canonical `transport`): idempotent.
-  if ('type' in def && !('transport' in def)) return def;
 
   const transport =
     typeof def.transport === 'string'
@@ -213,14 +227,19 @@ function shapeOpenCodeServer(def: unknown): JsonValue {
       : def.command !== undefined
         ? 'stdio'
         : def.url !== undefined
-          ? 'http'
+          ? typeof def.type === 'string'
+            ? def.type
+            : 'http'
           : undefined;
+  // Canonical `enabled` wins over the default; anything non-boolean is ignored rather
+  // than written into OpenCode's schema-checked `enabled` field.
+  const enabled = typeof def.enabled === 'boolean' ? def.enabled : true;
 
   if (transport === 'stdio') {
     const out: Record<string, JsonValue> = { type: 'local' };
     const command = toCommandArray(def.command, def.args);
     if (command.length > 0) out.command = command;
-    out.enabled = true;
+    out.enabled = enabled;
     if (def.env !== undefined) out.env = def.env;
     return convertVarsDeep(out);
   }
@@ -237,13 +256,190 @@ function shapeOpenCodeServer(def: unknown): JsonValue {
     ) {
       headers.Authorization = `Bearer {env:${auth.bearer_env}}`;
     }
-    out.enabled = true;
+    out.enabled = enabled;
     if (Object.keys(headers).length > 0) out.headers = headers;
     return convertVarsDeep(out);
   }
 
   // Unknown transport: pass the user's authored def through (var-converted only).
   return convertVarsDeep(def);
+}
+
+/**
+ * Inverse of {@link convertVarsDeep}: rewrite OpenCode `{env:VAR}` back to canonical
+ * `${VAR}`. The `(?<!\$)` guard is load-bearing: without it the inner braces of
+ * CURSOR's `${env:VAR}` also match, turning `"${env:FOO}"` into `"$${FOO}"` — a value
+ * no harness interpolates (F5/9). A Cursor-shaped placeholder reaches OpenCode whenever
+ * `servers.yaml` still carries one (e.g. written by a pre-F1 version).
+ */
+function convertVarsBack(value: JsonValue): JsonValue {
+  if (typeof value === 'string') {
+    return value.replace(/(?<!\$)\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g, '${$1}');
+  }
+  if (Array.isArray(value)) return value.map(convertVarsBack);
+  if (isObject(value)) {
+    const out: Record<string, JsonValue> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = convertVarsBack(v);
+    return out;
+  }
+  return value;
+}
+
+/**
+ * A header value shaped `Bearer ${VAR}` → the var name, else null. Tolerant of
+ * surrounding/inner whitespace, which a user's hand-edit easily introduces and which
+ * must not silently cost them their `auth.bearer_env`.
+ */
+function bearerEnvFromHeader(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const m = /^\s*Bearer\s+\$\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\s*$/.exec(value);
+  return m ? m[1]! : null;
+}
+
+/** Deep JSON equality by canonical serialisation (key order is irrelevant here — both sides are arrays). */
+function sameJson(a: JsonValue, b: JsonValue): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * The canonical keys each {@link shapeOpenCodeServer} branch emits (FAMILY-AWARE, see the
+ * Claude adapter's note). `enabled` is deliberately ABSENT from both: OpenCode's shape
+ * always carries an `enabled`, so its value is only a user statement when it DIFFERS from
+ * what the shaper emitted — see {@link enabledDrift}.
+ */
+const OPENCODE_LOCAL_SUPERSEDES = ['type', 'command', 'args', 'env'] as const;
+
+/** The `type` values {@link shapeOpenCodeServer}'s non-passthrough branches emit. */
+const OPENCODE_SHAPER_TYPES = new Set(['local', 'remote']);
+const OPENCODE_REMOTE_SUPERSEDES = ['type', 'url', 'headers'] as const;
+
+/**
+ * What the drifted `enabled` says about canonical `enabled`. The shaper ALWAYS writes one
+ * (defaulting to `true`), so a value equal to what it wrote carries no information — the
+ * prior canonical `enabled` must survive untouched, including a non-boolean one a user
+ * hand-authored (`enabled: maybe` would otherwise be destroyed, F5/12). Only a value that
+ * DIFFERS from the compiled one is the user toggling the server.
+ */
+function enabledDrift(
+  drifted: JsonValue | undefined,
+  prior: Record<string, JsonValue> | undefined,
+): { changed: false } | { changed: true; value: JsonValue } {
+  // OpenCode treats an absent `enabled` as `true`, and so does the shaper's default.
+  const current: JsonValue = drifted === undefined ? true : drifted;
+  const compiled: JsonValue = typeof prior?.enabled === 'boolean' ? prior.enabled : true;
+  return sameJson(current, compiled) ? { changed: false } : { changed: true, value: current };
+}
+
+/**
+ * The inverse of {@link shapeOpenCodeServer}, as an OVERLAY over the prior canonical def
+ * (see `mcp-canonical.ts`): `{env:VAR}` → `${VAR}`, `type:'local'|'remote'` translated to
+ * `transport`, the single `command` array split back into `command` + `args` — and every
+ * OTHER field of the drifted entry carried over verbatim, so a field the user added in
+ * `opencode.json` reaches the store rather than being dropped by a whitelist (F5/3).
+ *
+ * Two places where OpenCode's shape is NOT injective are resolved from the prior def:
+ *   - `type:'remote'` maps from BOTH `http` and `sse` — the overlay keeps the prior
+ *     `transport` verbatim (F5/4);
+ *   - `command:[cmd, ...args]` maps from BOTH `{command:'a', args:['b']}` and
+ *     `{command:['a','b']}` — when the flattened array is UNCHANGED from what the prior
+ *     def would produce, the prior split is kept verbatim rather than re-guessed.
+ */
+function unshapeOpenCodeServer(
+  def: Record<string, JsonValue>,
+  prior: unknown,
+  ctx: UnshapeContext,
+): UnshapedServer {
+  const raw = convertVarsBack(def);
+  const canon: Record<string, JsonValue> = isObject(raw) ? raw : {};
+  // A `transport` in `opencode.json` can only have come from the shaper's bespoke
+  // passthrough, so the entry is already canonical — never re-infer over it (F5/1) —
+  // unless it sits beside a `type` the passthrough would never have written. Then the two
+  // disagree, the transport is unknowable, and carrying the whole value over verbatim
+  // would poison the store with BOTH shapes (a duplicated arg, a harness `type`) (F6/9).
+  const conflicting = hasConflictingDiscriminators(canon, OPENCODE_SHAPER_TYPES);
+  if (typeof canon.transport === 'string' && !conflicting) return passthroughUnshape(canon, prior);
+  if (conflicting) noteConflictingTransport(ctx, canon.type as string);
+
+  const priorDef = isJsonObject(prior) ? prior : undefined;
+  const enabled = enabledDrift(canon.enabled, priorDef);
+
+  const type =
+    typeof canon.type === 'string'
+      ? canon.type
+      : canon.command !== undefined
+        ? 'local'
+        : canon.url !== undefined
+          ? 'remote'
+          : undefined;
+
+  if (type === 'local') {
+    const fields: Record<string, JsonValue> = {
+      transport: 'stdio',
+      ...omitKeys(canon, ['type', 'transport', 'enabled', 'command', 'args']),
+    };
+    const cmd = canon.command;
+    if (
+      Array.isArray(cmd) &&
+      priorDef !== undefined &&
+      sameJson(toCommandArray(priorDef.command, priorDef.args), cmd)
+    ) {
+      // The user did not touch the command line — keep the prior canonical split.
+      if (priorDef.command !== undefined) fields.command = priorDef.command;
+      if (priorDef.args !== undefined) fields.args = priorDef.args;
+    } else if (Array.isArray(cmd)) {
+      if (cmd.length > 0) fields.command = cmd[0]!;
+      if (cmd.length > 1) fields.args = cmd.slice(1);
+    } else if (cmd !== undefined) {
+      fields.command = cmd;
+    }
+    if (enabled.changed) fields.enabled = enabled.value;
+    return {
+      fields,
+      supersedes: OPENCODE_LOCAL_SUPERSEDES,
+      family: 'stdio',
+      // `type:'local'` means exactly `transport: stdio` — unless a hand-written
+      // `transport` contradicts it, when nothing may be written (F6/9).
+      transportAuthority: conflicting ? 'ambiguous' : 'native',
+    };
+  }
+
+  if (type === 'remote') {
+    const fields: Record<string, JsonValue> = {
+      transport: 'http',
+      ...omitKeys(canon, ['type', 'transport', 'enabled', 'headers']),
+    };
+    const headers = isObject(canon.headers) ? { ...canon.headers } : undefined;
+    // A credential is never guessed at: an `Authorization` header that does not map
+    // EXACTLY onto canonical `auth.bearer_env` leaves it alone and warns (F6/3+4).
+    const auth = resolveAuthDrift({
+      prior,
+      header: headers?.Authorization,
+      bearerEnvFromHeader,
+      foldsBearerIntoHeader: true,
+      ctx,
+    });
+    if (auth.kind === 'set') fields.auth = { bearer_env: auth.bearerEnv };
+    if (headers !== undefined) {
+      if (auth.kind === 'set') delete headers.Authorization; // now carried by `auth`
+      if (Object.keys(headers).length > 0) fields.headers = headers;
+    } else if (canon.headers !== undefined) {
+      fields.headers = canon.headers; // not an object — carry verbatim, never guess
+    }
+    if (enabled.changed) fields.enabled = enabled.value;
+    return {
+      fields,
+      supersedes:
+        auth.kind === 'delete'
+          ? [...OPENCODE_REMOTE_SUPERSEDES, 'auth']
+          : OPENCODE_REMOTE_SUPERSEDES,
+      family: 'remote',
+      // `type:'remote'` maps from BOTH `http` and `sse`, so the `http` above is a GUESS
+      // the prior canonical transport overrides (F5/4).
+      transportAuthority: conflicting ? 'ambiguous' : 'inferred',
+    };
+  }
+  // Unknown/bespoke OpenCode entry: carry the whole (var-converted) entry over.
+  return passthroughUnshape(canon, prior);
 }
 
 /** Run `opencode --version`, resolving `true` only on a clean exit 0. Never throws. */
@@ -363,30 +559,39 @@ export const opencodeAdapter: Adapter = {
     return [];
   },
 
-  async syncBackConfigKeys(
+  async describeConfigKeysDrift(
     surface: ConfigKeysSurface,
     drift: ConfigKeysDrift,
     ctx: ConfigKeysContext,
-  ): Promise<ConfigKeysStoreMutation[]> {
-    // Inverse of compileConfigKeys (spec criterion 4), consistent with Claude's D6
-    // decision: fold the one drifted server (keyPath ['mcp', <name>]) back into
-    // servers.yaml, siblings untouched. `canonicalValue` already has secret
-    // {env:VAR} placeholders restored (D6). It is written in OpenCode's normalised
-    // shape; because shapeOpenCodeServer is idempotent on that shape, a subsequent
-    // compile reproduces it exactly — round-trip stable. Instructions are
-    // array-element (identity IS the value), so they carry no drift to sync back.
-    if (surface.id !== 'mcp' || drift.style !== 'keyed') return [];
+  ): Promise<ConfigKeysDriftReport | null> {
+    // Classify how one drifted `opencode.json` server (keyPath ['mcp', <name>])
+    // disagrees with the canonical D6 def in servers.yaml. `canonicalValue` already has
+    // secret {env:VAR} placeholders restored (D6); `unshapeOpenCodeServer` + the OVERLAY
+    // map OpenCode's `{env:}`/`type:'local'`/command-array shape back onto canonical, so
+    // the report names CANONICAL fields — the ones the user will edit. servers.yaml is
+    // READ here and never written. Instructions are array-element (identity IS the
+    // value), so that surface never drifts and has nothing to describe.
+    if (surface.id !== 'mcp' || drift.style !== 'keyed') return null;
     // A server injection is always keyPath ['mcp', <name>] (length 2); a length-1
-    // keyPath would fold a bogus `mcp` "server" into the store.
-    if (drift.keyPath.length < 2) return [];
+    // keyPath would describe a bogus `mcp` "server".
+    if (drift.keyPath.length < 2) return null;
     const name = drift.keyPath[drift.keyPath.length - 1];
-    if (typeof name !== 'string') return [];
+    if (typeof name !== 'string') return null;
     const serversFile = join(ctx.envContentDir, 'mcp', 'servers.yaml');
     const existing = existsSync(serversFile)
       ? ((parseYaml(await readFile(serversFile, 'utf8')) as Record<string, unknown> | null) ?? {})
       : {};
-    existing[name] = drift.canonicalValue;
-    return [{ storeRelativePath: join('mcp', 'servers.yaml'), content: stringifyYaml(existing) }];
+    return {
+      entry: name,
+      storeRelativePath: join('mcp', 'servers.yaml'),
+      changes: describeCanonicalDrift({
+        prior: existing[name],
+        drifted: drift.canonicalValue,
+        unshape: unshapeOpenCodeServer,
+        server: name,
+        adapterId: 'opencode',
+      }),
+    };
   },
 
   async selfCheck(viewRoot: string, ctx: SelfCheckContext): Promise<SelfCheckResult> {

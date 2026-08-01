@@ -1,6 +1,6 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { Adapter, ConfigKeysSurface } from './adapter.js';
+import type { Adapter, ConfigKeysDriftReport, ConfigKeysSurface } from './adapter.js';
 import {
   syncBack as cfgSyncBack,
   type ConfigKeysItem,
@@ -25,18 +25,20 @@ import { readState } from './state.js';
  *   region back to its store instruction file, then refreshes the block.
  * - **injected config keys** → `config-keys.syncBack` reconciles the manifest hash
  *   with the current file value and restores secret placeholders (D6). When the
- *   owning adapter implements the OPTIONAL `syncBackConfigKeys` reverse hook, the
- *   placeholder-restored `canonicalValue` is ALSO written back to the env's
- *   canonical store (e.g. `mcp/servers.yaml`), completing spec criterion 4. An
- *   adapter that omits the hook degrades to non-lossy hash reconciliation, which
- *   still keeps the edit and unblocks `drop`.
+ *   owning adapter implements the OPTIONAL `describeConfigKeysDrift` hook, the
+ *   difference against the env's CANONICAL store (e.g. `mcp/servers.yaml`) is also
+ *   REPORTED to the user, field by field. The canonical store is never written: the
+ *   sweep tells you what disagrees and you reconcile it (see
+ *   {@link reportConfigKeysDrift}). An adapter without the hook degrades to non-lossy
+ *   hash reconciliation, which still keeps the edit and unblocks `drop`.
  * - **session-generated instruction files on disk** (D15) → an edited inline
  *   sub-block in any `live/<session>/<harness>/<instr>` view (including dead
  *   sessions') is written back to its store file, so a change made moments before
  *   a terminal closed survives.
  *
- * DETECTION + WRITE-BACK ONLY. See the {@link driftSweep} 2.1 hook point:
- * committing the swept store changes + queuing a push is Task 2.1 (no git here).
+ * DETECTION + WRITE-BACK ONLY, and for the canonical MCP model, DETECTION ONLY. See the
+ * {@link driftSweep} 2.1 hook point: committing the swept store changes + queuing a push
+ * is Task 2.1 (no git here).
  */
 
 export interface DriftSweepRequest {
@@ -54,6 +56,13 @@ export interface DriftSweepResult {
   fileBlockDrifted: string[];
   /** config-keys whose manifest hash was reconciled to a drifted file value. */
   configKeysDrifted: number;
+  /**
+   * Rendered, user-facing reports for every drifted config key whose adapter could say
+   * how it disagrees with the canonical store. Each was ALSO sent to `onWarn`; they are
+   * returned so a caller can present them its own way. Reporting is all that happens —
+   * no canonical store file is written for any of them.
+   */
+  configKeysDriftReports: string[];
   /** session-generated instruction sub-blocks written back to the store. */
   sessionInstructionsSynced: number;
   /**
@@ -76,6 +85,7 @@ export async function driftSweep(req: DriftSweepRequest): Promise<DriftSweepResu
     dirMergeSynced: 0,
     fileBlockDrifted: [],
     configKeysDrifted: 0,
+    configKeysDriftReports: [],
     sessionInstructionsSynced: 0,
     storePathsChanged: [],
   };
@@ -113,11 +123,10 @@ export async function driftSweep(req: DriftSweepRequest): Promise<DriftSweepResu
     }
   }
 
-  // C) config-keys → reconcile the manifest hash with drifted file values, under
-  // one transaction. When the owning adapter implements the optional reverse hook,
-  // the placeholder-restored value is ALSO written back to the env's canonical store
-  // (spec criterion 4); an adapter without the hook keeps today's non-lossy hash
-  // reconciliation.
+  // C) config-keys → reconcile the manifest hash with drifted file values, under one
+  // transaction. When the owning adapter implements the optional classifier, the drift
+  // is also REPORTED against the env's canonical store. No canonical store file is
+  // written; an adapter without the hook keeps the non-lossy hash reconciliation alone.
   const configItems = manifest.items.filter((i): i is ConfigKeysItem => i.surface === 'config-keys');
   if (configItems.length > 0) {
     await withLock(paths, async () => {
@@ -127,7 +136,7 @@ export async function driftSweep(req: DriftSweepRequest): Promise<DriftSweepResu
           const sync = await cfgSyncBack(paths, tx, item);
           if (!sync.drifted) continue;
           result.configKeysDrifted += 1;
-          await writeBackConfigDrift(req, item, sync.canonicalValue, result, onWarn);
+          await reportConfigKeysDrift(req, item, sync.canonicalValue, result, onWarn);
         }
         await tx.commit();
       } catch (err) {
@@ -149,19 +158,78 @@ export async function driftSweep(req: DriftSweepRequest): Promise<DriftSweepResu
 }
 
 // ---------------------------------------------------------------------------
-// C') config-keys reverse write-back (spec criterion 4) — optional adapter hook
+// C') config-keys drift REPORT — detect and tell the user; never write canonical
 // ---------------------------------------------------------------------------
 
 /**
- * When the adapter owning a drifted config-keys item implements the optional
- * {@link Adapter.syncBackConfigKeys} reverse hook, reverse-compile the drifted
- * (placeholder-restored) value into the env's canonical store and write the returned
- * mutation(s) atomically (spec criterion 4). Best-effort: a hook or store-write
- * failure is warned, never fatal — the manifest hash was already reconciled by
- * {@link cfgSyncBack}, so the edit stays non-lossy regardless. An adapter without
- * the hook (or a non-drift/absent value) is a no-op.
+ * Render one {@link ConfigKeysDriftReport} as the user-facing notice.
+ *
+ * Everything interpolated here is a NAME or a PATH — the harness id, the two file paths,
+ * the env name, the entry name, the dotted field paths, the change kinds, and the
+ * adapter's own prose notes. {@link ConfigKeysDriftReport} has no slot for a value, so a
+ * credential sitting in the drifted harness config cannot reach this string (see the type
+ * for why that is deliberate).
+ *
+ * Exported because BOTH paths that can observe the disagreement render it identically:
+ * the drift sweep (global/engine mode, where agentenv owns keys in the real config) and
+ * the session composer (session mode, where a user's own entry at an owned key path wins
+ * and the two therefore disagree).
  */
-async function writeBackConfigDrift(
+export function renderConfigKeysDriftReport(opts: {
+  /** The harness whose config drifted. */
+  adapterId: string;
+  /** The surface id, e.g. `mcp` — what KIND of thing disagrees. */
+  surfaceId: string;
+  /** Absolute path to the harness config file holding the drifted value. */
+  configFile: string;
+  /** The env whose canonical content the entry belongs to. */
+  ownerEnv: string;
+  /** Absolute path to the canonical store file the user must edit themselves. */
+  canonicalFile: string;
+  report: ConfigKeysDriftReport;
+}): string {
+  const { report } = opts;
+  const lines = [
+    `agentenv: ${opts.surfaceId} drift — '${report.entry}' differs between the ` +
+      `${opts.adapterId} config and env '${opts.ownerEnv}':`,
+    `    harness config:  ${opts.configFile}`,
+    `    canonical store: ${opts.canonicalFile}`,
+  ];
+  // Bound the field list so one pathological entry cannot flood a terminal; the user
+  // has the two file paths and the first differences, which is enough to act on.
+  const shown = report.changes.slice(0, MAX_REPORTED_FIELDS);
+  for (const change of shown) {
+    const where = change.field === '' ? '(the whole entry)' : change.field;
+    lines.push(`  ${change.kind.padEnd(8)}${where}`);
+    if (change.note) lines.push(`            note: ${change.note}`);
+  }
+  const hidden = report.changes.length - shown.length;
+  if (hidden > 0) lines.push(`  … and ${hidden} more field(s)`);
+  lines.push(
+    `  agentenv has NOT changed ${opts.canonicalFile} — edit it yourself to make the ` +
+      'harness-side change permanent.',
+  );
+  return lines.join('\n');
+}
+
+/** How many differing fields one report lists before it truncates. */
+const MAX_REPORTED_FIELDS = 12;
+
+/**
+ * When the adapter owning a drifted config-keys item implements the optional
+ * {@link Adapter.describeConfigKeysDrift} classifier, ask it which canonical fields
+ * disagree and report them.
+ *
+ * This is the whole of the v1 MCP drift contract on the sweep side. The canonical store
+ * is READ (by the adapter, to diff against) and never written — `result.storePathsChanged`
+ * gains nothing here, so the sweep's `agentenv: sync drift` commit cannot pick up a
+ * canonical change agentenv invented.
+ *
+ * Best-effort: a classifier failure is warned, never fatal — the manifest hash was
+ * already reconciled by {@link cfgSyncBack}, so the edit stays non-lossy regardless. An
+ * adapter without the hook (or a report with nothing canonical to say) is a no-op.
+ */
+async function reportConfigKeysDrift(
   req: DriftSweepRequest,
   item: ConfigKeysItem,
   canonicalValue: JsonValue | undefined,
@@ -170,22 +238,30 @@ async function writeBackConfigDrift(
 ): Promise<void> {
   if (canonicalValue === undefined) return;
   const match = findConfigSurface(req.adapters, req.env, item);
-  if (!match || !match.adapter.syncBackConfigKeys) return;
+  if (!match || !match.adapter.describeConfigKeysDrift) return;
   const envContentDir = req.paths.envDir(item.ownerEnv);
   try {
-    const mutations = await match.adapter.syncBackConfigKeys(
+    const report = await match.adapter.describeConfigKeysDrift(
       match.surface,
       { style: item.mode, keyPath: item.keyPath, canonicalValue },
-      { envContentDir, projectRoot: null },
+      { envContentDir, projectRoot: null, onWarn },
     );
-    for (const mutation of mutations) {
-      const abs = join(envContentDir, mutation.storeRelativePath);
-      await writeFileAtomic(abs, mutation.content);
-      result.storePathsChanged.push(abs);
-    }
+    // Nothing canonical differs (a pure harness-shape reserialisation): the hash was
+    // reconciled and there is nothing for the user to reconcile. Stay quiet.
+    if (!report || report.changes.length === 0) return;
+    const rendered = renderConfigKeysDriftReport({
+      adapterId: match.adapter.id,
+      surfaceId: match.surface.id,
+      configFile: item.path,
+      ownerEnv: item.ownerEnv,
+      canonicalFile: join(envContentDir, report.storeRelativePath),
+      report,
+    });
+    result.configKeysDriftReports.push(rendered);
+    onWarn(rendered);
   } catch (err) {
     onWarn(
-      `agentenv: config-keys write-back for env '${item.ownerEnv}' failed (${(err as Error).message})`,
+      `agentenv: could not describe config-keys drift for env '${item.ownerEnv}' (${(err as Error).message})`,
     );
   }
 }

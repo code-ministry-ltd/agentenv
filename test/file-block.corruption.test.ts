@@ -10,7 +10,7 @@ import {
   type FileBlockSource,
 } from '../src/file-block.js';
 import { resolvePaths } from '../src/paths.js';
-import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot } from './helpers.js';
+import { expectRealHomeUntouched, makeTempHome, guardRealHome } from './helpers.js';
 
 /**
  * Adversarial-review regression suite: the marker parser must NOT trust arbitrary
@@ -21,10 +21,10 @@ import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot } from './helpe
  */
 describe('file-block surface — corruption / fail-closed', () => {
   let temp: ReturnType<typeof makeTempHome>;
-  let realBefore: ReturnType<typeof realHomeSnapshot>;
+  let realBefore: ReturnType<typeof guardRealHome>;
 
   beforeEach(() => {
-    realBefore = realHomeSnapshot();
+    realBefore = guardRealHome();
     temp = makeTempHome();
   });
 

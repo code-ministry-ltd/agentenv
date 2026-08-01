@@ -144,43 +144,16 @@ describe('adapter.pi — compileConfigKeys (settings resource arrays, array-elem
   });
 });
 
-describe('adapter.pi — syncBackConfigKeys (reverse to canonical, array-element by value)', () => {
-  it('folds a drifted settings value into the env store array without a secret transform', async () => {
-    const envDir = freshDir();
-    mkdirSync(join(envDir, 'files'), { recursive: true });
-    writeFileSync(join(envDir, 'files', 'settings.json'), JSON.stringify({ packages: ['existing'] }));
-
-    const mutations = await piAdapter.syncBackConfigKeys!(
-      settingsSurface(),
-      { style: 'array-element', keyPath: ['packages'], canonicalValue: 'newly-added' },
-      { envContentDir: envDir, projectRoot: null },
-    );
-
-    expect(mutations).toHaveLength(1);
-    expect(mutations[0]!.storeRelativePath).toBe(join('files', 'settings.json'));
-    expect(JSON.parse(mutations[0]!.content)).toEqual({ packages: ['existing', 'newly-added'] });
-  });
-
-  it('is idempotent: a value already present is not duplicated', async () => {
-    const envDir = freshDir();
-    mkdirSync(join(envDir, 'files'), { recursive: true });
-    writeFileSync(join(envDir, 'files', 'settings.json'), JSON.stringify({ packages: ['keep'] }));
-
-    const mutations = await piAdapter.syncBackConfigKeys!(
-      settingsSurface(),
-      { style: 'array-element', keyPath: ['packages'], canonicalValue: 'keep' },
-      { envContentDir: envDir, projectRoot: null },
-    );
-    expect(JSON.parse(mutations[0]!.content)).toEqual({ packages: ['keep'] });
-  });
-
-  it('returns no mutation for a keyed drift (settings is array-element only)', async () => {
-    const mutations = await piAdapter.syncBackConfigKeys!(
-      settingsSurface(),
-      { style: 'keyed', keyPath: ['packages', 0], canonicalValue: 'x' },
-      { envContentDir: freshDir(), projectRoot: null },
-    );
-    expect(mutations).toEqual([]);
+describe('adapter.pi — no config-keys drift hook (its only surface cannot drift)', () => {
+  it('declares no drift classifier: array-element ownership is BY VALUE, so it never drifts', () => {
+    // `config-keys.syncBack` reports drift only in `keyed` mode; an array-element whose
+    // value changed reads as ABSENT, never as a mutated value. Pi's only config-keys
+    // surface is array-element (`settings`), and its MCP surface is unsupported — so
+    // there is no drift for Pi to classify and no hook to implement. This pins Pi as the
+    // adapter that proves the hook really is optional end to end.
+    expect(piAdapter.describeConfigKeysDrift).toBeUndefined();
+    expect(settingsSurface().style).toBe('array-element');
+    expect(piAdapter.surfaces.find((s) => s.id === 'mcp')?.supported).toBe(false);
   });
 });
 

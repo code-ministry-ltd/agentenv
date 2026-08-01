@@ -14,7 +14,7 @@ import {
 } from '../src/git.js';
 import { resolvePaths } from '../src/paths.js';
 import { ensureStore } from '../src/store.js';
-import { expectRealHomeUntouched, makeTempHome, realHomeSnapshot, type TempHome } from './helpers.js';
+import { expectRealHomeUntouched, makeTempHome, guardRealHome, type TempHome } from './helpers.js';
 
 const homes: TempHome[] = [];
 function home(): TempHome {
@@ -32,7 +32,7 @@ function gitIn(dir: string, ...args: string[]): string {
 
 describe('sync: store-as-repo init (D9)', () => {
   it('agentenv init makes the store a git repo with a baseline commit', async () => {
-    const before = realHomeSnapshot();
+    const before = guardRealHome();
     const th = home();
     const paths = resolvePaths(th.env);
 

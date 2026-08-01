@@ -140,8 +140,8 @@ export interface ConfigKeysSurface extends SurfaceBase {
    * - **`true` → literal substitution (rung 3)**: the harness cannot interpolate
    *   `${VAR}` in this config file, so at materialisation the engine/composer resolve
    *   each `secretFields` placeholder from `secrets.env`/the shell and write the
-   *   LITERAL into the real config. The manifest still records the placeholder, so
-   *   drift write-back restores `${VAR}` and never carries the literal to the store.
+   *   LITERAL into the real config. The manifest still records the placeholder, so the
+   *   drift sweep restores `${VAR}` before classifying and never sees the literal.
    *
    * Native indirection (rung 2, e.g. Codex `env_vars`) needs no flag: the adapter
    * compiles the placeholder away in {@link Adapter.compileConfigKeys}, so no `${VAR}`
@@ -170,8 +170,8 @@ export type ConfigKeysInjection =
       value: JsonValue;
       /**
        * Subpaths within `value` that carried a `${VAR}` placeholder → the
-       * placeholder text, so drift write-back restores the placeholder, never a
-       * baked literal (D6). Secret VALUES are Task 2.4 — here just the flag.
+       * placeholder text, so the drift sweep restores the placeholder before
+       * classifying and never handles a baked literal (D6).
        */
       secretFields?: Record<string, string>;
     }
@@ -185,8 +185,8 @@ export type ConfigKeysInjection =
 
 /**
  * The inverse of one {@link ConfigKeysInjection}: a config-keys value that DRIFTED
- * in the real file, handed to {@link Adapter.syncBackConfigKeys} so the adapter can
- * persist it into the env's canonical store (spec criterion 4). Carries the
+ * in the real file, handed to {@link Adapter.describeConfigKeysDrift} so the adapter
+ * can say how it disagrees with the env's canonical store. Carries the
  * placeholder-restored value — secret `${VAR}` subfields already reset, never a
  * baked literal (D6).
  */
@@ -203,17 +203,54 @@ export interface ConfigKeysDrift {
   canonicalValue: JsonValue;
 }
 
+/** How one canonical field differs between a harness config and the canonical store. */
+export type ConfigKeysDriftKind = 'added' | 'removed' | 'changed';
+
 /**
- * One store-file mutation {@link Adapter.syncBackConfigKeys} asks the drift sweep to
- * apply: a store-RELATIVE path under `environments/<env>/` plus its full new content.
- * Declarative (path + bytes) so the sweep writes it atomically without the adapter
- * touching the filesystem — mirroring how {@link ConfigKeysInjection} is data, not I/O.
+ * ONE canonical field that differs, named but NEVER valued.
+ *
+ * The absence of a value slot is the security property, not a convention: a harness
+ * config legitimately holds resolved credentials (a `substitutePlaceholders` surface
+ * writes literals there by design, and a user may paste a token into any field), so a
+ * report that could carry a value would eventually carry a secret to stderr, a CI log
+ * or a scrollback buffer. Field NAMES, env-var names, paths and server names are enough
+ * to point the user at the exact line to reconcile, and none of them can be a secret.
  */
-export interface ConfigKeysStoreMutation {
-  /** Path relative to the env's content dir (`environments/<env>/`), e.g. `mcp/servers.yaml`. */
+export interface ConfigKeysDriftChange {
+  /**
+   * The dotted canonical field path inside the entry (`args`, `env.TOKEN`,
+   * `auth.bearer_env`), or `''` for the entry as a whole.
+   */
+  field: string;
+  kind: ConfigKeysDriftKind;
+  /**
+   * Why agentenv cannot state this difference precisely — a lossy harness shape,
+   * contradictory discriminators, a shadowed bearer. Prose plus field/server/harness
+   * names only; NEVER a value.
+   */
+  note?: string;
+}
+
+/**
+ * How one drifted config-keys entry disagrees with the env's canonical store — what
+ * {@link Adapter.describeConfigKeysDrift} returns.
+ *
+ * This type is the STRUCTURAL half of the v1 "detect and report, never write" contract:
+ * it carries no file content and no writable path, so the drift sweep has nothing it
+ * could write even if it wanted to. Reinstating automatic write-back would mean
+ * reopening the frozen adapter contract, not just changing a call site.
+ */
+export interface ConfigKeysDriftReport {
+  /** The entry the difference concerns — for an MCP surface, the server name. */
+  entry: string;
+  /**
+   * The canonical store file the user edits to make the change permanent, relative to
+   * the env's content dir (`environments/<env>/`), e.g. `mcp/servers.yaml`. A LOCATION
+   * to name in the report — never a write target.
+   */
   storeRelativePath: string;
-  /** The full new file content to write at {@link storeRelativePath}. */
-  content: string;
+  /** The canonical fields that differ. Empty means canonical is unaffected. */
+  changes: ConfigKeysDriftChange[];
 }
 
 /** The set of environment variables that point a harness at a private root. */
@@ -234,6 +271,14 @@ export interface ConfigKeysContext {
    * project context (e.g. a probe). An adapter keys project-scoped config by it.
    */
   projectRoot: string | null;
+  /**
+   * OPTIONAL user-visible warning channel. A compile that refuses to emit something
+   * unsafe (a SHADOWED bearer) says so here, naming the server and the field (F6).
+   * Absent, the adapter falls back to `console.warn`, so a warning is never silently
+   * swallowed. Drift REPORTS do not travel this channel — they are returned as data
+   * from {@link Adapter.describeConfigKeysDrift} and rendered by the caller.
+   */
+  onWarn?: (message: string) => void;
 }
 
 /** Outcome of an adapter's launch self-check (D15 fail-closed probe). */
@@ -363,28 +408,39 @@ export interface Adapter {
   ): Promise<ConfigKeysInjection[]>;
 
   /**
-   * OPTIONAL inverse of {@link compileConfigKeys} (spec criterion 4): given a
-   * config-keys value that drifted in the REAL file, produce the mutation(s) that
-   * persist it into the env's CANONICAL store content (`environments/<env>/…`, e.g.
-   * `mcp/servers.yaml`), so a config key edited mid-session is written back to the
-   * store on the next invocation. The drift sweep calls this with the drifted
-   * {@link ConfigKeysDrift.canonicalValue} (secret `${VAR}` placeholders already
-   * restored — never a literal, D6), writes each returned mutation atomically, and
-   * reports the store path in `storePathsChanged`.
+   * OPTIONAL classifier for a config-keys value that drifted in the REAL file: say how
+   * it disagrees with the env's CANONICAL store content (`environments/<env>/…`, e.g.
+   * `mcp/servers.yaml`) — WITHOUT changing it. agentenv reports the difference and the
+   * user reconciles it by editing the canonical file themselves.
    *
-   * The {@link ConfigKeysContext} mirrors {@link compileConfigKeys} so the hook can
-   * read sibling store content (e.g. merge one changed MCP server without clobbering
-   * the rest) and key project-scoped stores by `projectRoot`.
+   * **Why this is a classifier and not an inverse of {@link compileConfigKeys}.** The
+   * shapers are not injective (canonical `transport: http` and `transport: sse` both
+   * compile to one OpenCode `type:'remote'` / one bare Codex `url` table), so an inverse
+   * must be RECONSTRUCTED from (harness value, prior canonical, branch identity). That
+   * reconstruction is a fixed lattice over a user-authored JSON/TOML input space, and
+   * every defect three review rounds found lived at a boundary the lattice did not
+   * cover — twice with a security consequence (a revoked credential left live in another
+   * harness; a secret guard that passed real secrets). The classification is adequate to
+   * DESCRIBE a difference; it was never adequate to DECIDE what to do about one. So the
+   * decision goes back to the user, and the return type carries no bytes and no writable
+   * path — a store write is not expressible here (see {@link ConfigKeysDriftReport}).
    *
-   * OPTIONAL: an adapter that omits it degrades to today's non-lossy hash
-   * reconciliation (blocks nothing), exactly like {@link validateConfigFile}.
-   * Declared now so the frozen contract need not be reopened for a real adapter.
+   * Called with the drifted {@link ConfigKeysDrift.canonicalValue} (secret `${VAR}`
+   * placeholders already restored — never a literal, D6). Return `null` when the surface
+   * or key path is not one this adapter models canonically.
+   *
+   * The {@link ConfigKeysContext} mirrors {@link compileConfigKeys} so the hook can read
+   * the env's canonical content to diff against, and key project-scoped stores by
+   * `projectRoot`.
+   *
+   * OPTIONAL: an adapter that omits it degrades to non-lossy hash reconciliation with no
+   * field-level report (blocks nothing), exactly like {@link validateConfigFile}.
    */
-  syncBackConfigKeys?(
+  describeConfigKeysDrift?(
     surface: ConfigKeysSurface,
     drift: ConfigKeysDrift,
     ctx: ConfigKeysContext,
-  ): Promise<ConfigKeysStoreMutation[]>;
+  ): Promise<ConfigKeysDriftReport | null>;
 
   // — launch self-check (D15 fail-closed) —
 

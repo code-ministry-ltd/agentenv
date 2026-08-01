@@ -7,7 +7,7 @@ import { parseEnvConfig } from '../src/env-config.js';
 import {
   expectRealHomeUntouched,
   makeFixtureRepo,
-  realHomeSnapshot,
+  guardRealHome,
   makeTempHome,
   type FixtureRepo,
   type TempHome,
@@ -43,7 +43,7 @@ describe('add.source: add skill <env> <gitSource> (single)', () => {
     repo.writeSkill('skills/other');
     const head = repo.commit('init');
 
-    const real = realHomeSnapshot();
+    const real = guardRealHome();
     const res = await run(
       ['add', 'skill', 'writing', repo.fileUrl('skills/thinking-partner')],
       { env: tmp.env },
@@ -116,7 +116,7 @@ describe('add.source: add skill <env> <gitSource> (single)', () => {
   });
 
   it('fails cleanly and writes nothing when the source is unreachable (offline)', async () => {
-    const real = realHomeSnapshot();
+    const real = guardRealHome();
     const res = await run(
       ['add', 'skill', 'writing', 'file:///no/such/repo/skills/x'],
       { env: tmp.env },
