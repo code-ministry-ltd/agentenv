@@ -8,6 +8,15 @@ parked placeholder at `0.0.1` and is deliberately left that way. Do not run
 `npm publish`. `npm pack` — which only builds a tarball locally — is the whole
 of the packaging step.
 
+Two guards in `package.json` enforce this:
+
+- `"private": true`;
+- a `prepublishOnly` script that prints the reason and exits 1.
+
+`npm publish` therefore fails; `npm pack`, `npm install -g <tgz>` and
+`npm install -g github:…` are all unaffected. Do not remove either guard to
+"just try it".
+
 ---
 
 ## Versioning
@@ -69,11 +78,11 @@ npm run build
 node dist/bin.js --version   # must print the new version
 ```
 
-CI asserts the installed binary reports exactly this string
-(`.github/workflows/ci.yml`, "Package and global-install smoke test"), so the
-workflow's expected version must be bumped in the same commit.
+Nothing else hardcodes the version: `agentenv --version` reads `package.json`
+at runtime, and the smoke test compares the installed binary against
+`package.json` rather than a literal. So the bump is a one-line change.
 
-Commit the bump on a branch and merge it through a PR like any other change.
+Commit it on a branch and merge it through a PR like any other change.
 
 ### 4. Tag
 
@@ -143,9 +152,10 @@ The CLI is a stateless binary; downgrading is just reinstalling an older
 artifact.
 
 ```sh
+PREV=v1.0.0   # the tag you want back; `gh release list` shows them
 npm uninstall -g @code-ministry/agentenv
-gh release download v0.9.0 --repo code-ministry-ltd/agentenv --pattern '*.tgz'
-npm install -g ./code-ministry-agentenv-0.9.0.tgz
+gh release download "$PREV" --repo code-ministry-ltd/agentenv --pattern '*.tgz'
+npm install -g ./code-ministry-agentenv-*.tgz
 agentenv --version
 ```
 
@@ -273,7 +283,6 @@ them) and in `state.json`.
 [ ] main is green: lint, typecheck, vitest — bare, exit codes checked
 [ ] npm run smoke:install passes
 [ ] package.json version bumped
-[ ] .github/workflows/ci.yml expected version bumped to match
 [ ] README limitations still accurate for this build
 [ ] annotated tag v<semver> pushed
 [ ] npm pack contents = dist/, README.md, LICENSE, package.json only

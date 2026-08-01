@@ -1,7 +1,8 @@
 {
   "name": "@code-ministry/agentenv",
-  "version": "0.0.1",
-  "description": "Virtual environments for AI agents - switch between specialised context, skill & plugin bundles",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Virtual environments for AI agents - switchable bundles of skills, instructions, MCP servers, subagents and slash commands, applied across any AI coding harness",
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
@@ -22,7 +23,8 @@
     "test": "vitest run",
     "ci": "npm run lint && npm run typecheck && npm run test",
     "prepare": "npm run build",
-    "smoke:install": "bash scripts/smoke-install.sh"
+    "smoke:install": "bash scripts/smoke-install.sh",
+    "prepublishOnly": "node -e \"console.error('agentenv is distributed from GitHub only (see docs/RELEASE.md). npm publish is not supported: the npm name is a parked placeholder.'); process.exit(1)\""
   },
   "repository": {
     "type": "git",

@@ -454,10 +454,13 @@ pre-mutation backup. `agentenv doctor --repair` deletes them and the next
 | **Cursor**      | `cursor`      | `cursor-agent` | **no**  | `~/.cursor/skills`   | **unsupported**      | `~/.cursor/mcp.json` |
 
 Per-harness live-verification notes, including exactly which cells were probed
-against a real binary and when, are in [`docs/`](docs/):
-[Claude Code](docs/harness-claude.md), [Codex](docs/harness-codex.md),
-[OpenCode](docs/harness-opencode.md), [Pi](docs/harness-pi.md),
-[Cursor](docs/harness-cursor.md).
+against a real binary and when, are in
+[`docs/`](https://github.com/code-ministry-ltd/agentenv/tree/main/docs):
+[Claude Code](https://github.com/code-ministry-ltd/agentenv/blob/main/docs/harness-claude.md),
+[Codex](https://github.com/code-ministry-ltd/agentenv/blob/main/docs/harness-codex.md),
+[OpenCode](https://github.com/code-ministry-ltd/agentenv/blob/main/docs/harness-opencode.md),
+[Pi](https://github.com/code-ministry-ltd/agentenv/blob/main/docs/harness-pi.md),
+[Cursor](https://github.com/code-ministry-ltd/agentenv/blob/main/docs/harness-cursor.md).
 
 `agentenv status` prints this matrix for your machine, including which surfaces
 are unsupported and *why*.
@@ -603,7 +606,12 @@ second simulated machine, and asserts it materialised on two harnesses — is:
 npm run smoke:install
 ```
 
-Release and rollback procedure: [`docs/RELEASE.md`](docs/RELEASE.md).
+Release and rollback procedure:
+[`docs/RELEASE.md`](https://github.com/code-ministry-ltd/agentenv/blob/main/docs/RELEASE.md).
+
+`package.json` carries `"private": true` and a `prepublishOnly` guard that fails
+loudly. That is deliberate: `agentenv` is GitHub-distributed and the npm name is
+a parked placeholder. `npm pack` is unaffected.
 
 ## License
 
