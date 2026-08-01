@@ -462,7 +462,7 @@ async function materialiseConfigKeys(
     // the culprit: we write, the whole file is rejected, we roll back, and we blame
     // ourselves — forever, with nothing pointing at the real offender. So a file that is
     // already invalid is left completely alone and reported under its own reason.
-    const blocked = await baselineRejectedFiles(planned, skips, onWarn);
+    const blocked = await baselineRejectedFiles(paths, planned, skips, onWarn);
     const writable = blocked.size === 0 ? planned : planned.filter((p) => !blocked.has(p.file));
     if (writable.length === 0) return 0;
 
@@ -615,14 +615,32 @@ async function validateConfigFileSafely(
   }
 }
 
+/** The keyed config-keys paths agentenv's manifest still claims to own in `file`. */
+function ownedConfigKeysIn(manifest: StateManifest, file: string): string[] {
+  const out: string[] = [];
+  for (const item of manifest.items) {
+    if (item.surface !== 'config-keys' || item.path !== file) continue;
+    const cfg = item as ConfigKeysItem;
+    out.push(cfg.key ?? cfg.keyPath.join('.'));
+  }
+  return out;
+}
+
 /**
  * BASELINE whole-file validation (F5/7), run under the lock BEFORE anything is written.
- * A file that the harness ALREADY rejects — because of a pre-existing user entry — must
- * not be written to: our injection would be rolled back and blamed for a breakage it did
- * not cause, leaving the real offender undiagnosed. Returns the set of files to leave
- * alone, recording one `validation-baseline` skip per losing (surface, env).
+ * A file the harness ALREADY rejects must not be written to: our injection would be rolled
+ * back and blamed for a breakage it did not cause, leaving the real offender undiagnosed.
+ * Returns the set of files to leave alone, recording one `validation-baseline` skip per
+ * losing (surface, env).
+ *
+ * The rejection is NOT automatically the user's fault (F6/8). {@link
+ * validateWrittenConfigFiles} explicitly contemplates leaving OUR own rejecting key behind
+ * when `removeKey` cannot take it out, and the manifest records that ownership — so the
+ * manifest is consulted and the skip says which it is, instead of asserting "a pre-existing
+ * entry, not ours" and sending the user after an offender that may be agentenv's.
  */
 async function baselineRejectedFiles(
+  paths: Paths,
   planned: readonly Planned[],
   skips: GlobalSkip[],
   onWarn: (m: string) => void,
@@ -630,6 +648,7 @@ async function baselineRejectedFiles(
   const blocked = new Set<string>();
   const checked = new Map<string, boolean>();
   const seen = new Set<string>();
+  const manifest = await readState(paths);
   for (const p of planned) {
     if (!p.adapter.validateConfigFile) continue;
     let bad = checked.get(p.file);
@@ -649,14 +668,21 @@ async function baselineRejectedFiles(
     const k = JSON.stringify([p.surface.id, p.env]);
     if (seen.has(k)) continue;
     seen.add(k);
+    const ours = ownedConfigKeysIn(manifest, p.file);
+    const provenance =
+      ours.length > 0
+        ? `agentenv still owns ${ours.length === 1 ? 'a key' : 'keys'} in this file ` +
+          `(${ours.join(', ')}), so the offending entry may well be OURS — a previous ` +
+          `invocation's rollback may have failed to remove it`
+        : 'agentenv owns nothing in this file, so the offending entry is a pre-existing one';
     skips.push({
       adapterId: p.adapterId,
       surfaceId: p.surface.id,
       reason: 'validation-baseline',
       detail:
         `env '${p.env}': ${p.file} was already rejected by ${p.adapter.id} whole-file ` +
-        `validation BEFORE this invocation (a pre-existing entry, not ours) — nothing was ` +
-        `written. Fix the file, then re-run.`,
+        `validation BEFORE this invocation — ${provenance}. Nothing was written. Fix the ` +
+        `file, then re-run.`,
     });
   }
   return blocked;
@@ -691,15 +717,20 @@ async function validateWrittenConfigFiles(
     // parents the inject created, so the file returns to its pre-injection bytes.
     const tx = await beginTransaction(paths);
     let removed = 0;
+    let gone = 0;
     const stuck: string[] = [];
     try {
       for (const { item } of items) {
         // `removeKey` returns `{removed:false, reason:'absent'|'hash-mismatch'}` WITHOUT
         // touching the file. Counting the attempt instead of the result would report a
         // clean rollback while the bad key is still in the harness's config and the
-        // manifest still claims ownership of it (F5/5) — so check every result.
+        // manifest still claims ownership of it (F5/5) — so check every result. The two
+        // reasons are NOT the same outcome (F6/10): `hash-mismatch` means our key is
+        // still in the file and only a human can take it out, while `absent` means it is
+        // already gone — telling the user to remove it by hand sends them after nothing.
         const res = await removeKey(paths, tx, item);
         if (res.removed) removed += 1;
+        else if (res.reason === 'absent') gone += 1;
         else stuck.push(`${item.key ?? item.keyPath.join('.')} (${res.reason ?? 'unknown'})`);
       }
       await tx.commit();
@@ -707,7 +738,9 @@ async function validateWrittenConfigFiles(
       await tx.rollback();
       throw err;
     }
-    rolledBack += removed;
+    // An `absent` key is discounted from `applied` too (F6/11): it is not in the file, so
+    // counting it as applied claims a server the harness will never see.
+    rolledBack += removed + gone;
 
     const outcome =
       stuck.length === 0

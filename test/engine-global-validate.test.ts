@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { Adapter, SelfCheckResult } from '../src/adapter.js';
 import { cursorAdapter } from '../src/adapters/cursor.js';
 import { run } from '../src/cli.js';
+import { materialiseGlobal } from '../src/engine.js';
 import type { ConfigKeysItem } from '../src/config-keys.js';
 import { resolvePaths } from '../src/paths.js';
 import { readState } from '../src/state.js';
@@ -171,6 +172,120 @@ describe('engine: config-keys validation is fail-CLOSED and honest (F5/5,6,7)', 
     // …and it really is still there (which is exactly why we must not claim success).
     const cfg = JSON.parse(readFileSync(join(realHome, 'mcp.json'), 'utf8'));
     expect(cfg.mcpServers.good).toEqual({ command: 'edited-by-someone-else' });
+  });
+});
+
+describe('engine: rollback reporting is honest about WHAT happened (F6/8,10,11)', () => {
+  it('records our ownership in the manifest when the key really is stuck (F6/8)', async () => {
+    const th = home();
+    let calls = 0;
+    const racy: Adapter = {
+      ...cursorAdapter,
+      validateConfigFile(absPath, content): SelfCheckResult {
+        calls += 1;
+        if (calls === 1) return { ok: true };
+        const cfg = JSON.parse(content) as { mcpServers: Record<string, JsonLike> };
+        cfg.mcpServers.good = { command: 'edited-by-someone-else' };
+        writeFileSync(absPath, `${JSON.stringify(cfg, null, 2)}\n`);
+        return { ok: false, detail: `${absPath}: rejected by the test validator` };
+      },
+    };
+    const { paths, realHome, env } = scenario(th, 'good:\n  transport: stdio\n  command: y\n');
+    await run(['use', 'writing', '--global'], { env, adapters: [racy] });
+
+    // The key could not be removed, so the MANIFEST must still record that we own it —
+    // that record is what the next invocation has to consult before blaming the user.
+    const mcpFile = join(realHome, 'mcp.json');
+    const owned = (await readState(paths)).items.filter(
+      (i): i is ConfigKeysItem => i.surface === 'config-keys' && i.path === mcpFile,
+    );
+    expect(owned.map((i) => i.keyPath.join('.'))).toEqual(['mcpServers.good']);
+  });
+
+  it('does not blame a PRE-EXISTING entry when the stuck key is ours (F6/8)', async () => {
+    const th = home();
+    let calls = 0;
+    const racy: Adapter = {
+      ...cursorAdapter,
+      validateConfigFile(absPath, content): SelfCheckResult {
+        calls += 1;
+        if (calls === 1) return { ok: true };
+        const cfg = JSON.parse(content) as { mcpServers: Record<string, JsonLike> };
+        cfg.mcpServers.good = { command: 'edited-by-someone-else' };
+        writeFileSync(absPath, `${JSON.stringify(cfg, null, 2)}\n`);
+        return { ok: false, detail: `${absPath}: rejected by the test validator` };
+      },
+    };
+    const { env } = scenario(th, 'good:\n  transport: stdio\n  command: y\n');
+    await run(['use', 'writing', '--global'], { env, adapters: [racy] });
+
+    // Second invocation: the file is STILL rejected, and the manifest says the key in it
+    // is ours. Blaming "a pre-existing entry, not ours" would send the user hunting for
+    // an offender that does not exist.
+    const stubborn: Adapter = {
+      ...cursorAdapter,
+      validateConfigFile(absPath): SelfCheckResult {
+        return { ok: false, detail: `${absPath}: rejected by the test validator` };
+      },
+    };
+    const res = await run(['use', 'writing', '--global'], { env, adapters: [stubborn] });
+    const stderr = res.stderr ?? '';
+    expect(stderr).toContain('validation-baseline');
+    expect(stderr).not.toContain('not ours');
+    expect(stderr).toMatch(/agentenv still owns/i);
+    expect(stderr).toContain('mcpServers.good');
+  });
+
+  it('an ALREADY-ABSENT key is not reported as stuck (F6/10)', async () => {
+    const th = home();
+    let calls = 0;
+    // The validator DELETES our key and then rejects: `removeKey` finds nothing to
+    // remove. Nothing is left behind, so telling the user to "remove it by hand" sends
+    // them after a key that is not there.
+    const deleter: Adapter = {
+      ...cursorAdapter,
+      validateConfigFile(absPath, content): SelfCheckResult {
+        calls += 1;
+        if (calls === 1) return { ok: true };
+        const cfg = JSON.parse(content) as { mcpServers: Record<string, JsonLike> };
+        delete cfg.mcpServers.good;
+        writeFileSync(absPath, `${JSON.stringify(cfg, null, 2)}\n`);
+        return { ok: false, detail: `${absPath}: rejected by the test validator` };
+      },
+    };
+    const { env } = scenario(th, 'good:\n  transport: stdio\n  command: y\n');
+    const res = await run(['use', 'writing', '--global'], { env, adapters: [deleter] });
+    const stderr = res.stderr ?? '';
+    expect(stderr).toContain('validation-failed');
+    expect(stderr).not.toMatch(/could not (be )?remove/i);
+    expect(stderr).not.toMatch(/by hand/i);
+  });
+
+  it('does not count an ALREADY-ABSENT key as still applied (F6/11)', async () => {
+    const th = home();
+    let calls = 0;
+    const deleter: Adapter = {
+      ...cursorAdapter,
+      validateConfigFile(absPath, content): SelfCheckResult {
+        calls += 1;
+        if (calls === 1) return { ok: true };
+        const cfg = JSON.parse(content) as { mcpServers: Record<string, JsonLike> };
+        delete cfg.mcpServers.good;
+        writeFileSync(absPath, `${JSON.stringify(cfg, null, 2)}\n`);
+        return { ok: false, detail: `${absPath}: rejected by the test validator` };
+      },
+    };
+    const { paths, env } = scenario(th, 'good:\n  transport: stdio\n  command: y\n');
+    const result = await materialiseGlobal({
+      paths,
+      adapters: [deleter],
+      envs: ['writing'],
+      env,
+      onWarn: () => {},
+    });
+    // The key is not in the file. Counting it as applied claims a server the harness
+    // will never see.
+    expect(result.applied).toBe(0);
   });
 });
 
