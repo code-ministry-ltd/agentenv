@@ -14,6 +14,7 @@ import {
   type DirMergeItem,
 } from './dir-merge.js';
 import {
+  dematerialise as fbDematerialise,
   inspectOwnedRegion,
   materialise as fbMaterialise,
   type FileBlockItem,
@@ -203,7 +204,22 @@ async function detectDanglingSymlinks(manifest: StateManifest): Promise<DoctorPr
   return out;
 }
 
-/** Manifest dir-merge items whose store source is gone (design D4). */
+/**
+ * Whether EVERY store file a file-block record renders is gone — the env's store
+ * contribution to this region has vanished (the store was deleted under a live
+ * activation, Task 5.1). Deliberately all-or-nothing: repair drops the whole
+ * region, so a PARTIAL loss (one of several sources) must not qualify, or a
+ * still-good sub-block would be thrown away with the missing one.
+ */
+async function isRegionSourceGone(item: FileBlockItem): Promise<boolean> {
+  if (item.subBlocks.length === 0) return false;
+  for (const sb of item.subBlocks) {
+    if (await exists(sb.storePath)) return false;
+  }
+  return true;
+}
+
+/** Manifest items whose store source is gone — dir-merge or file-block (design D4). */
 async function detectStoreDrift(manifest: StateManifest): Promise<DoctorProblem[]> {
   const out: DoctorProblem[] = [];
   for (const item of manifest.items) {
@@ -215,6 +231,17 @@ async function detectStoreDrift(manifest: StateManifest): Promise<DoctorProblem[
       where: dm.path,
       what: `owned item '${dm.path}' has no store source — '${dm.target}' is gone`,
       repair: 'remove the orphaned materialisation and drop its ownership record',
+    });
+  }
+  for (const item of fileBlockItems(manifest)) {
+    if (!(await isRegionSourceGone(item))) continue;
+    out.push({
+      kind: 'store-drift',
+      where: `${item.path} (env '${item.ownerEnv}')`,
+      what:
+        `the region env '${item.ownerEnv}' owns in ${item.path} has no store source — ` +
+        `every store file it renders is gone`,
+      repair: "remove the managed region and drop its ownership record (the user's content stays)",
     });
   }
   return out;
@@ -435,6 +462,35 @@ async function repairMangledMarkers(
 }
 
 /**
+ * Drop every managed region whose whole store contribution is gone: strip the
+ * region and its ownership record via the manifest-driven, journalled
+ * `file-block.dematerialise`, which restores the surrounding user content
+ * byte-for-byte (and deletes a file agentenv itself created).
+ *
+ * Runs AFTER {@link repairMangledMarkers} on purpose. `dematerialise` fails closed
+ * on a `conflict` region — it will not reclaim a guessed span — so a region that is
+ * BOTH sourceless and mangled must be made well-formed first; otherwise the throw
+ * would escape `repair()` as a stack trace. A region still in conflict at this
+ * point is skipped rather than forced, and `diagnose` reports it again with the
+ * mangled-marker guidance.
+ */
+async function repairRegionStoreDrift(
+  paths: Paths,
+  manifest: StateManifest,
+  actions: string[],
+): Promise<void> {
+  for (const item of fileBlockItems(manifest)) {
+    if (!(await isRegionSourceGone(item))) continue;
+    const insp = await inspectOwnedRegion(paths, { target: item.path, env: item.ownerEnv });
+    if (insp.status === 'conflict') continue;
+    await fbDematerialise(paths, { target: item.path, env: item.ownerEnv });
+    actions.push(
+      `dropped orphaned managed region in ${item.path} (env '${item.ownerEnv}', store source gone)`,
+    );
+  }
+}
+
+/**
  * Reconcile every drifted config key with the file a harness reserialised, under
  * ONE lock + transaction (the config-keys contract). `config-keys.syncBack` re-hashes
  * the owned value and, on drift, writes it back with secret-flagged fields restored
@@ -471,7 +527,8 @@ async function repairReserialisedConfig(
  * 1. `recoverState` first — roll back any pending journal so the manifest is
  *    consistent before any surface is re-driven (design D4).
  * 2. re-drive broken owned surfaces: drop sourceless materialisations, re-link
- *    dangling symlinks, restore mangled marker regions, reconcile drifted config.
+ *    dangling symlinks, restore mangled marker regions, drop sourceless regions
+ *    (only once their markers are well-formed again), reconcile drifted config.
  * 3. garbage-collect orphaned backups LAST — repairs above legitimately create
  *    fresh transaction backups that de-reference on commit, so GC runs against the
  *    FINAL manifest to leave `backups/` clean and the next run idempotent.
@@ -494,6 +551,7 @@ export async function repair(paths: Paths): Promise<RepairResult> {
   await repairStoreDrift(paths, await readState(paths), actions);
   await repairDanglingSymlinks(paths, await readState(paths), actions);
   await repairMangledMarkers(paths, await readState(paths), actions);
+  await repairRegionStoreDrift(paths, await readState(paths), actions);
   await repairReserialisedConfig(paths, await readState(paths), actions);
 
   // 3. Orphaned backups: GC against the final manifest.
