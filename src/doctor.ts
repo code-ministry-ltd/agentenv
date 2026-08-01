@@ -4,6 +4,7 @@ import { basename, dirname, join } from 'node:path';
 import type { BackupRef } from './backups.js';
 import { restore } from './backups.js';
 import {
+  ConfigKeysError,
   inspectOwnedKey,
   syncBack as cfgSyncBack,
   type ConfigKeysItem,
@@ -451,6 +452,18 @@ async function repairMangledMarkers(
     const insp = await inspectOwnedRegion(paths, { target: item.path, env: item.ownerEnv });
     if (insp.status !== 'conflict' && insp.status !== 'absent') continue;
     if (insp.status === 'conflict' && item.backupRef) {
+      // KNOWN GAP (data loss, unfixed): this rolls the file back to its activation-time
+      // bytes, discarding any edits the user made outside the region since — and those
+      // bytes are captured NOWHERE, so `--restore` cannot offer them back. `restore`
+      // overwrites without capturing, and the `fbMaterialise` below backs up the
+      // ALREADY-restored content.
+      //
+      // A plain `await backup(paths, item.path)` here does NOT fix it: backups are
+      // content-addressed and reachable only via a manifest item's `backupRef`, so a
+      // rescue copy is referenced by nothing, reads as an orphan, and is deleted by
+      // this same `repair()` run's orphaned-backup GC. Closing it properly needs a
+      // manifest-level "rescue" concept (a retained, GC-exempt ref surfaced by
+      // `--restore`), which is a design change, not a patch.
       await restore(paths, item.backupRef, item.path);
     }
     await fbMaterialise(paths, {
@@ -525,7 +538,14 @@ async function repairReserialisedConfig(
         let sync;
         try {
           sync = await cfgSyncBack(paths, tx, item);
-        } catch {
+        } catch (err) {
+          // ONLY a parse/read failure is safe to skip: `syncBack` parses before it
+          // journals, so nothing was mutated. A write failure (EROFS, ENOSPC, a
+          // root-owned config) happens AFTER `tx.apply` has persisted the journal
+          // entry — swallowing that would fall through to `tx.commit()`, which clears
+          // the undo record and leaves the manifest disagreeing with the disk. Let it
+          // reach the outer `catch` and roll back.
+          if (!(err instanceof ConfigKeysError)) throw err;
           continue;
         }
         if (sync.drifted) {

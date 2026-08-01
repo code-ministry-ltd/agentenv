@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { run } from '../src/cli.js';
@@ -239,6 +239,46 @@ describe('doctor.hardening: mangled markers (editor / merge / harness damage)', 
     ).toBe(1);
     expect(fixed).toContain('writing base');
     expect(fixed).toContain('research base');
+
+    expect((await run(['doctor'], { env: th.env })).code).toBe(0);
+  });
+
+  // KNOWN GAP, pinned deliberately: a `conflict` rollback discards post-activation user
+  // edits AND leaves no way back. This test asserts the CURRENT behaviour so the loss is
+  // visible in the suite rather than buried in a notes file — flip the final expectation
+  // when the manifest-level rescue concept lands (see `repairMangledMarkers`).
+  it('a conflict rollback discards post-activation edits with no backup to recover them', async () => {
+    const th = home();
+    const f = seed(th);
+    await materialiseRegion(f, 'writing', [{ name: 'base.md', body: 'writing base\n' }]);
+
+    // The user writes real work into the file AFTER activation, outside the region.
+    const POST_ACTIVATION = 'three months of notes\n';
+    writeFileSync(f.target, `${readFileSync(f.target, 'utf8')}\n${POST_ACTIVATION}`);
+
+    // A harness duplicates the open marker: the region reads `conflict`, and repair is
+    // deliberately fail-closed — it rolls the file back to its activation-time bytes
+    // rather than guess the region's span. That discards the notes above.
+    const open = openMarker('writing', 'base.md');
+    writeFileSync(f.target, readFileSync(f.target, 'utf8').replace(open, `${open}\n${open}`));
+
+    const repaired = await run(['doctor', '--repair'], { env: th.env });
+    expect(repaired.code, `${repaired.stdout}${repaired.stderr ?? ''}`).toBe(0);
+
+    // The rollback itself is the accepted fail-closed trade: agentenv will not guess a
+    // mangled region's span. The part that is NOT acceptable — and is unfixed — is that
+    // the discarded bytes are recoverable from nowhere.
+    expect(readFileSync(f.target, 'utf8')).not.toContain(POST_ACTIVATION);
+
+    // Naively adding `backup(paths, item.path)` before the rollback does not help: a
+    // content-addressed backup that no manifest item references reads as an orphan and
+    // this same `--repair` run's GC deletes it. Hence the gap, and hence this pin.
+    const rescued = readdirSync(f.paths.backups).some((b) =>
+      readFileSync(join(f.paths.backups, b), 'utf8').includes(POST_ACTIVATION),
+    );
+    expect(rescued, 'a rescue backup now survives — flip this pin and close the gap').toBe(
+      false,
+    );
 
     expect((await run(['doctor'], { env: th.env })).code).toBe(0);
   });
