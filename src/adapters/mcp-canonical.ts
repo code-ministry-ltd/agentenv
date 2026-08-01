@@ -1,4 +1,5 @@
 import type { JsonValue } from '../config-keys.js';
+import { secretLiteralReason } from '../git.js';
 
 /**
  * Shared machinery for the canonical (D6) `mcp/servers.yaml` ⇄ harness-shape round
@@ -346,10 +347,79 @@ export function resolveAuthDrift(opts: {
   return { kind: 'keep' };
 }
 
+// ---------------------------------------------------------------------------
+// The secret guard on the write-back path
+// ---------------------------------------------------------------------------
+
+/** Deep JSON equality by serialisation — enough for the canonical MCP shapes. */
+function sameJson(a: JsonValue | undefined, b: JsonValue | undefined): boolean {
+  return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+}
+
+/** The first secret-looking literal in a leaf (or in any element of a leaf array). */
+function secretLiteralIn(keyName: string, value: JsonValue): string | null {
+  if (typeof value === 'string') return secretLiteralReason(keyName, value);
+  if (Array.isArray(value)) {
+    for (const element of value) {
+      const reason = secretLiteralIn(keyName, element);
+      if (reason !== null) return reason;
+    }
+  }
+  return null;
+}
+
 /**
- * The whole write-back fold for one drifted server: un-shape `drifted` and overlay it
- * onto `prior`. A non-object drift value (a harness entry the user replaced with a
- * scalar) has nothing to overlay and is written through verbatim.
+ * Refuse to persist a value that looks like a RESOLVED SECRET LITERAL (F6/7, SECURITY).
+ *
+ * `restoreSecrets` (config-keys) restores the `${VAR}` placeholder in every field agentenv
+ * itself flagged at compile time. It cannot know about a field the user hand-created in the
+ * harness config, nor — on a `substitutePlaceholders` surface, where the real file
+ * legitimately holds literals — about a literal the user copied into another field. Since
+ * the write-back carries every field over verbatim, both would flow into the git-backed
+ * `servers.yaml`. The pre-commit scan is only a backstop: it misses innocuously-named
+ * fields, and when it does fire it wedges every later store sync instead of sanitising.
+ *
+ * So the refusal happens HERE, before the value is ever written: the canonical field is
+ * left exactly as it was (or omitted, when it is new) and the user is told which field —
+ * never the value.
+ *
+ * Only CHANGED leaves are examined: a value already in the store is not made safer by
+ * dropping it now, and re-reporting it every sweep would be noise.
+ */
+function refuseSecretLiterals(
+  node: Record<string, JsonValue>,
+  prior: unknown,
+  path: readonly string[],
+  ctx: UnshapeContext,
+): void {
+  const priorObj = isJsonObject(prior) ? prior : undefined;
+  for (const [key, value] of Object.entries(node)) {
+    const before = priorObj === undefined ? undefined : priorObj[key];
+    if (before !== undefined && sameJson(before, value)) continue; // already in the store
+    if (isJsonObject(value)) {
+      refuseSecretLiterals(value, before, [...path, key], ctx);
+      continue;
+    }
+    const reason = secretLiteralIn(key, value);
+    if (reason === null) continue;
+    const where = [...path, key].join('.');
+    ctx.warn(
+      `agentenv: MCP server '${ctx.server}' — the value at '${where}' in the ` +
+        `${ctx.adapterId} config looks like a resolved secret (${reason}). agentenv will ` +
+        `not commit a secret to mcp/servers.yaml, so that field was ` +
+        `${before === undefined ? 'NOT written' : 'left UNCHANGED'} — use a \${VAR} ` +
+        `placeholder in the harness config instead.`,
+    );
+    if (before === undefined) delete node[key];
+    else node[key] = before;
+  }
+}
+
+/**
+ * The whole write-back fold for one drifted server: un-shape `drifted`, overlay it onto
+ * `prior`, and refuse to persist anything that looks like a resolved secret. A non-object
+ * drift value (a harness entry the user replaced with a scalar) has nothing to overlay and
+ * is written through verbatim.
  */
 export function foldDriftIntoCanonical(
   prior: unknown,
@@ -362,5 +432,7 @@ export function foldDriftIntoCanonical(
   ctx: UnshapeContext,
 ): JsonValue {
   if (!isJsonObject(drifted)) return drifted;
-  return overlayCanonicalServer(prior, unshape(drifted, prior, ctx));
+  const out = overlayCanonicalServer(prior, unshape(drifted, prior, ctx));
+  if (isJsonObject(out)) refuseSecretLiterals(out, prior, [], ctx);
+  return out;
 }

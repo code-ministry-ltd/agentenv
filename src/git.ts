@@ -425,6 +425,35 @@ export function scanTextForSecrets(text: string): { line: number; reason: string
   return out;
 }
 
+/**
+ * Whether one VALUE looks like a resolved secret literal, and WHY — the value-level form
+ * of {@link scanTextForSecrets}'s rules, for a caller holding a parsed field rather than a
+ * line of text (the MCP drift write-back, which must refuse to persist a secret into the
+ * git-backed store BEFORE it is ever staged). Shares the same patterns, the same
+ * placeholder/fixture exemptions and the same conservative entropy test, so the two agree.
+ *
+ * `keyName` is the field's own name: a `secret|token|password|api_key…` name lowers the
+ * bar, exactly as it does for an assignment line.
+ */
+export function secretLiteralReason(keyName: string, value: string): string | null {
+  if (ALLOW_SECRET_RE.test(value)) return null;
+  if (PLACEHOLDER_RE.test(value) || FIXTURE_WORD_RE.test(value)) return null;
+  for (const { re, reason } of TOKEN_PATTERNS) {
+    const m = re.exec(value);
+    if (m && !FIXTURE_MARKER_IN_TOKEN_RE.test(m[0])) return reason;
+  }
+  if (
+    SECRET_KEY_RE.test(keyName) &&
+    value.length >= 16 &&
+    /[A-Za-z]/.test(value) &&
+    /[0-9]/.test(value)
+  ) {
+    return `secret-named field '${keyName}' with a literal value`;
+  }
+  if (looksHighEntropyToken(value)) return 'high-entropy value';
+  return null;
+}
+
 /** Whether a filename looks like text we should scan (skip obvious binaries). */
 function isProbablyText(name: string): boolean {
   return !/\.(?:png|jpg|jpeg|gif|webp|ico|pdf|zip|gz|tar|woff2?|ttf|otf|mp4|mp3|wasm|node)$/i.test(name);
