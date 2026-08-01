@@ -128,6 +128,42 @@ describe('F6/1: a native `type` edit propagates; a lossy shape preserves the pri
 });
 
 // ---------------------------------------------------------------------------
+// 1b. Codex must read a hand-authored `type` exactly like the other three
+// ---------------------------------------------------------------------------
+
+describe('F6/2: Codex honours a hand-authored `type` and never leaves a stale one', () => {
+  // A servers.yaml a user wrote in harness shape: `type` is the transport, there is no
+  // `transport` key. Claude/Cursor/OpenCode all read it as the transport hint.
+  const PRIOR_TYPE_SSE = 'linear:\n  type: sse\n  url: https://mcp.linear.app/sse\n';
+
+  it('a Codex url edit leaves NO `type` beside a freshly-inferred `transport`', async () => {
+    const compiled = obj(await compileOne(codexAdapter, PRIOR_TYPE_SSE, 'linear'));
+    expect(compiled).toEqual({ url: 'https://mcp.linear.app/sse' }); // Codex has no `type`
+    const written = await foldOne(codexAdapter, PRIOR_TYPE_SSE, 'linear', {
+      url: 'https://mcp.linear.app/sse?v=2',
+    });
+    // A stale `type: sse` beside `transport: http` is self-contradicting: Claude would
+    // then compile `type: http` and call an SSE endpoint as HTTP.
+    expect(written).toEqual({ transport: 'sse', url: 'https://mcp.linear.app/sse?v=2' });
+  });
+
+  it('a BESPOKE `type` is passed through by Codex, exactly as Claude passes it', async () => {
+    const priorWs = 'ws:\n  type: websocket\n  url: wss://bespoke.example.com/ws\n';
+    const bespoke = { type: 'websocket', url: 'wss://bespoke.example.com/ws' };
+    // Claude treats `type` as the transport hint, so `websocket` is bespoke → passthrough.
+    expect(await compileOne(claudeAdapter, priorWs, 'ws')).toEqual(bespoke);
+    // Codex must not silently compile the same entry to a plain HTTP table.
+    expect(await compileOne(codexAdapter, priorWs, 'ws')).toEqual(bespoke);
+
+    const written = await foldOne(codexAdapter, priorWs, 'ws', {
+      ...bespoke,
+      url: 'wss://bespoke.example.com/ws2',
+    });
+    expect(written).toEqual({ type: 'websocket', url: 'wss://bespoke.example.com/ws2' });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 2. family-aware supersedes
 // ---------------------------------------------------------------------------
 

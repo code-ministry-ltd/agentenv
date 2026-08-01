@@ -23,6 +23,7 @@ import {
   foldDriftIntoCanonical,
   omitKeys,
   passthroughUnshape,
+  transportFamily,
   type UnshapedServer,
 } from './mcp-canonical.js';
 
@@ -180,13 +181,19 @@ function collectPlaceholders(value: unknown, prefix: string, out: Record<string,
 function shapeCodexServer(def: unknown): JsonValue {
   if (!isObject(def)) return def as JsonValue;
 
+  // A HAND-AUTHORED harness-shaped entry (no `transport`, a `type`) is honoured exactly
+  // as the other three adapters honour it: `type` IS the transport hint. Without this,
+  // `{ type: websocket, url }` — which Claude/Cursor/OpenCode all pass through as bespoke
+  // — would silently compile to a plain Codex HTTP table here (F5/2, F6/2).
   const transport =
     typeof def.transport === 'string'
       ? def.transport
       : def.command !== undefined
         ? 'stdio'
         : def.url !== undefined
-          ? 'http'
+          ? typeof def.type === 'string'
+            ? def.type
+            : 'http'
           : undefined;
 
   if (transport === 'stdio') {
@@ -248,8 +255,8 @@ const CODEX_NATIVE_KEYS = [
  * remote branch: Codex's `bearer_token_env_var` is an EXACT bidirectional mapping with no
  * header shadowing it, so its absence really does mean the bearer was removed.
  */
-const CODEX_STDIO_SUPERSEDES = ['command', 'args', 'env'] as const;
-const CODEX_REMOTE_SUPERSEDES = ['url', 'headers', 'auth'] as const;
+const CODEX_STDIO_SUPERSEDES = ['type', 'command', 'args', 'env'] as const;
+const CODEX_REMOTE_SUPERSEDES = ['type', 'url', 'headers', 'auth'] as const;
 
 /**
  * The inverse of {@link shapeCodexServer}, as an OVERLAY over the prior canonical def
@@ -262,9 +269,13 @@ const CODEX_REMOTE_SUPERSEDES = ['url', 'headers', 'auth'] as const;
  * bespoke `transport` the shaper passed through is never re-inferred (F5/1).
  */
 function unshapeCodexServer(def: Record<string, JsonValue>, prior: unknown): UnshapedServer {
-  // A `transport` in `config.toml` can only have come from the shaper's bespoke
-  // passthrough, so the entry is already canonical — never re-infer over it (F5/1).
+  // A `transport` — or a `type` naming a transport Codex has no table shape for — can
+  // only have come from the shaper's bespoke passthrough, so the entry is already
+  // canonical; never re-infer over it (F5/1, F6/2, symmetric with {@link shapeCodexServer}).
   if (typeof def.transport === 'string') return passthroughUnshape(def, prior);
+  if (typeof def.type === 'string' && transportFamily(def.type) === 'bespoke') {
+    return passthroughUnshape(def, prior);
+  }
 
   if (def.command !== undefined) {
     const fields: Record<string, JsonValue> = {
