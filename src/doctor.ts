@@ -4,6 +4,7 @@ import { basename, dirname, join } from 'node:path';
 import type { BackupRef } from './backups.js';
 import { restore } from './backups.js';
 import {
+  ConfigKeysError,
   inspectOwnedKey,
   syncBack as cfgSyncBack,
   type ConfigKeysItem,
@@ -14,6 +15,7 @@ import {
   type DirMergeItem,
 } from './dir-merge.js';
 import {
+  dematerialise as fbDematerialise,
   inspectOwnedRegion,
   materialise as fbMaterialise,
   type FileBlockItem,
@@ -203,7 +205,22 @@ async function detectDanglingSymlinks(manifest: StateManifest): Promise<DoctorPr
   return out;
 }
 
-/** Manifest dir-merge items whose store source is gone (design D4). */
+/**
+ * Whether EVERY store file a file-block record renders is gone — the env's store
+ * contribution to this region has vanished (the store was deleted under a live
+ * activation, Task 5.1). Deliberately all-or-nothing: repair drops the whole
+ * region, so a PARTIAL loss (one of several sources) must not qualify, or a
+ * still-good sub-block would be thrown away with the missing one.
+ */
+async function isRegionSourceGone(item: FileBlockItem): Promise<boolean> {
+  if (item.subBlocks.length === 0) return false;
+  for (const sb of item.subBlocks) {
+    if (await exists(sb.storePath)) return false;
+  }
+  return true;
+}
+
+/** Manifest items whose store source is gone — dir-merge or file-block (design D4). */
 async function detectStoreDrift(manifest: StateManifest): Promise<DoctorProblem[]> {
   const out: DoctorProblem[] = [];
   for (const item of manifest.items) {
@@ -215,6 +232,17 @@ async function detectStoreDrift(manifest: StateManifest): Promise<DoctorProblem[
       where: dm.path,
       what: `owned item '${dm.path}' has no store source — '${dm.target}' is gone`,
       repair: 'remove the orphaned materialisation and drop its ownership record',
+    });
+  }
+  for (const item of fileBlockItems(manifest)) {
+    if (!(await isRegionSourceGone(item))) continue;
+    out.push({
+      kind: 'store-drift',
+      where: `${item.path} (env '${item.ownerEnv}')`,
+      what:
+        `the region env '${item.ownerEnv}' owns in ${item.path} has no store source — ` +
+        `every store file it renders is gone`,
+      repair: "remove the managed region and drop its ownership record (the user's content stays)",
     });
   }
   return out;
@@ -229,12 +257,6 @@ function fileBlockItems(manifest: StateManifest): FileBlockItem[] {
   return manifest.items.filter((i): i is FileBlockItem => i.surface === 'file-block');
 }
 
-/** A manifest-owned region that is no longer well-formed: `conflict` or `absent`. */
-async function isRegionBroken(paths: Paths, item: FileBlockItem): Promise<boolean> {
-  const insp = await inspectOwnedRegion(paths, { target: item.path, env: item.ownerEnv });
-  return insp.status === 'conflict' || insp.status === 'absent';
-}
-
 /** Manifest-owned file-block regions whose markers a harness broke (design D4). */
 async function detectMangledMarkers(
   paths: Paths,
@@ -244,15 +266,20 @@ async function detectMangledMarkers(
   for (const item of fileBlockItems(manifest)) {
     const insp = await inspectOwnedRegion(paths, { target: item.path, env: item.ownerEnv });
     if (insp.status !== 'conflict' && insp.status !== 'absent') continue;
-    const why =
-      insp.status === 'conflict'
-        ? `its markers were mangled (${insp.detail ?? 'no longer well-formed'})`
-        : 'its managed marker region is missing';
+    const conflict = insp.status === 'conflict';
+    const why = conflict
+      ? `its markers were mangled (${insp.detail ?? 'no longer well-formed'})`
+      : 'its managed marker region is missing';
     out.push({
       kind: 'mangled-markers',
       where: `${item.path} (env '${item.ownerEnv}')`,
       what: `the region env '${item.ownerEnv}' owns in ${item.path} is broken — ${why}`,
-      repair: 'restore the file to its pre-materialise backup and re-materialise a clean region',
+      // The two statuses need different — and differently destructive — fixes, so
+      // say which one this problem will get rather than promising a rollback the
+      // absent case does not (and must not) perform.
+      repair: conflict
+        ? 'restore the file to its pre-materialise backup and re-materialise a clean region'
+        : 're-insert the managed region from the manifest + store, leaving the rest of the file as it is',
     });
   }
   return out;
@@ -279,7 +306,13 @@ async function detectReserialisedConfig(manifest: StateManifest): Promise<Doctor
         kind: 'reserialised-config',
         where: `${item.path} (${item.key ?? ''})`,
         what: `could not parse ${item.path} to check owned key '${item.key ?? ''}': ${(err as Error).message}`,
-        repair: 'reconcile by parse once the file parses again',
+        // The one problem in this file that `--repair` deliberately cannot act on:
+        // reconciliation is BY PARSE, so a file that does not parse can only be
+        // fixed by a human (or by restoring a backup). Say so plainly rather than
+        // promising a repair that will never come.
+        repair:
+          'NOT repairable automatically — agentenv will not guess at a config it cannot parse. ' +
+          "Fix the file by hand (or 'agentenv doctor --restore <backup>'), then re-run 'agentenv doctor --repair'",
       });
       continue;
     }
@@ -387,15 +420,28 @@ async function repairStoreDrift(
 }
 
 /**
- * Restore a broken file-block region. The mechanisms fail CLOSED on mangled
- * markers (they refuse to reclaim a guessed span), so repair goes back to the
- * item's preserved pre-materialise backup — removing the mangled markers as bytes,
- * not by trusting them — then re-materialises a clean region from the manifest's
- * recorded sub-blocks + store. The re-materialise is journalled and lock-guarded.
+ * Rebuild a broken file-block region, by HOW it is broken (Task 5.1):
  *
- * Scope: one region per file. Several envs owning regions in ONE file with mangled
- * markers is a hardening case (Task 5.1); here each broken region is repaired from
- * its own backup.
+ * - **conflict** — markers claim this env but do not match the record (duplicated,
+ *   relabelled, non-contiguous, CRLF-rewritten, wrapped in merge fences). The
+ *   mechanisms fail CLOSED on these (they refuse to reclaim a guessed span), so the
+ *   only way to remove the mangled text is to go back to the item's preserved
+ *   pre-materialise backup — removing the markers as bytes, not by trusting them —
+ *   and re-materialise from the manifest's recorded sub-blocks + store. This DOES
+ *   discard edits made to the file since activation; it is the fail-closed price of
+ *   not guessing a span, and the reported `repair` line says so.
+ * - **absent** — the region is simply gone (a harness rewrote the file without it).
+ *   Nothing mangled remains to remove, and `materialise` re-inserts into the file
+ *   exactly as it stands, so rolling the file back would destroy the user's later
+ *   edits for no reason at all. Re-materialise ONLY.
+ *
+ * Either way the re-materialise is journalled and lock-guarded.
+ *
+ * Several envs owning regions in ONE file are handled by re-inspecting each record
+ * against the file as it stands at its turn: a conflict repair that rolls the file
+ * back also removes a sibling env's region, which then reads as `absent` and is
+ * re-materialised in the same pass — so the pass converges with every env's region
+ * present (pinned by doctor.hardening's shared-file test).
  */
 async function repairMangledMarkers(
   paths: Paths,
@@ -403,16 +449,63 @@ async function repairMangledMarkers(
   actions: string[],
 ): Promise<void> {
   for (const item of fileBlockItems(manifest)) {
-    if (!(await isRegionBroken(paths, item))) continue;
-    // Back to the pre-materialise state (markers gone), then rebuild the region.
-    if (item.backupRef) await restore(paths, item.backupRef, item.path);
+    const insp = await inspectOwnedRegion(paths, { target: item.path, env: item.ownerEnv });
+    if (insp.status !== 'conflict' && insp.status !== 'absent') continue;
+    if (insp.status === 'conflict' && item.backupRef) {
+      // KNOWN GAP (data loss, unfixed): this rolls the file back to its activation-time
+      // bytes, discarding any edits the user made outside the region since — and those
+      // bytes are captured NOWHERE, so `--restore` cannot offer them back. `restore`
+      // overwrites without capturing, and the `fbMaterialise` below backs up the
+      // ALREADY-restored content.
+      //
+      // A plain `await backup(paths, item.path)` here does NOT fix it: backups are
+      // content-addressed and reachable only via a manifest item's `backupRef`, so a
+      // rescue copy is referenced by nothing, reads as an orphan, and is deleted by
+      // this same `repair()` run's orphaned-backup GC. Closing it properly needs a
+      // manifest-level "rescue" concept (a retained, GC-exempt ref surfaced by
+      // `--restore`), which is a design change, not a patch.
+      await restore(paths, item.backupRef, item.path);
+    }
     await fbMaterialise(paths, {
       target: item.path,
       env: item.ownerEnv,
       mode: item.mode,
       sources: item.subBlocks.map((sb) => ({ source: sb.source, storePath: sb.storePath })),
     });
-    actions.push(`restored mangled marker region in ${item.path} (env '${item.ownerEnv}')`);
+    actions.push(
+      insp.status === 'conflict'
+        ? `restored mangled marker region in ${item.path} (env '${item.ownerEnv}')`
+        : `re-inserted the missing marker region in ${item.path} (env '${item.ownerEnv}')`,
+    );
+  }
+}
+
+/**
+ * Drop every managed region whose whole store contribution is gone: strip the
+ * region and its ownership record via the manifest-driven, journalled
+ * `file-block.dematerialise`, which restores the surrounding user content
+ * byte-for-byte (and deletes a file agentenv itself created).
+ *
+ * Runs AFTER {@link repairMangledMarkers} on purpose. `dematerialise` fails closed
+ * on a `conflict` region — it will not reclaim a guessed span — so a region that is
+ * BOTH sourceless and mangled must be made well-formed first; otherwise the throw
+ * would escape `repair()` as a stack trace. A region still in conflict at this
+ * point is skipped rather than forced, and `diagnose` reports it again with the
+ * mangled-marker guidance.
+ */
+async function repairRegionStoreDrift(
+  paths: Paths,
+  manifest: StateManifest,
+  actions: string[],
+): Promise<void> {
+  for (const item of fileBlockItems(manifest)) {
+    if (!(await isRegionSourceGone(item))) continue;
+    const insp = await inspectOwnedRegion(paths, { target: item.path, env: item.ownerEnv });
+    if (insp.status === 'conflict') continue;
+    await fbDematerialise(paths, { target: item.path, env: item.ownerEnv });
+    actions.push(
+      `dropped orphaned managed region in ${item.path} (env '${item.ownerEnv}', store source gone)`,
+    );
   }
 }
 
@@ -422,6 +515,14 @@ async function repairMangledMarkers(
  * the owned value and, on drift, writes it back with secret-flagged fields restored
  * to their `${VAR}` placeholders (never the literal, D6) and the record's hash
  * brought into agreement — so the file, the record, and the store all match again.
+ *
+ * A key whose FILE cannot be read or parsed is SKIPPED, not thrown on (Task 5.1).
+ * Reconciliation is by parse, so such a file is genuinely unrepairable here — but
+ * `doctor --repair` is the one command whose whole job is broken states, and
+ * letting the parse error escape killed the entire run with a stack trace, taking
+ * every OTHER surface's fix down with it. Nothing has been mutated when `syncBack`
+ * throws (it parses before it journals), so skipping is safe; the closing re-scan
+ * re-reports the key with guidance naming it as needing a human.
  */
 async function repairReserialisedConfig(
   paths: Paths,
@@ -434,7 +535,19 @@ async function repairReserialisedConfig(
     const tx = await beginTransaction(paths);
     try {
       for (const item of items) {
-        const sync = await cfgSyncBack(paths, tx, item);
+        let sync;
+        try {
+          sync = await cfgSyncBack(paths, tx, item);
+        } catch (err) {
+          // ONLY a parse/read failure is safe to skip: `syncBack` parses before it
+          // journals, so nothing was mutated. A write failure (EROFS, ENOSPC, a
+          // root-owned config) happens AFTER `tx.apply` has persisted the journal
+          // entry — swallowing that would fall through to `tx.commit()`, which clears
+          // the undo record and leaves the manifest disagreeing with the disk. Let it
+          // reach the outer `catch` and roll back.
+          if (!(err instanceof ConfigKeysError)) throw err;
+          continue;
+        }
         if (sync.drifted) {
           actions.push(`reconciled reserialised config key '${item.key ?? ''}' in ${item.path}`);
         }
@@ -453,7 +566,8 @@ async function repairReserialisedConfig(
  * 1. `recoverState` first — roll back any pending journal so the manifest is
  *    consistent before any surface is re-driven (design D4).
  * 2. re-drive broken owned surfaces: drop sourceless materialisations, re-link
- *    dangling symlinks, restore mangled marker regions, reconcile drifted config.
+ *    dangling symlinks, restore mangled marker regions, drop sourceless regions
+ *    (only once their markers are well-formed again), reconcile drifted config.
  * 3. garbage-collect orphaned backups LAST — repairs above legitimately create
  *    fresh transaction backups that de-reference on commit, so GC runs against the
  *    FINAL manifest to leave `backups/` clean and the next run idempotent.
@@ -476,6 +590,7 @@ export async function repair(paths: Paths): Promise<RepairResult> {
   await repairStoreDrift(paths, await readState(paths), actions);
   await repairDanglingSymlinks(paths, await readState(paths), actions);
   await repairMangledMarkers(paths, await readState(paths), actions);
+  await repairRegionStoreDrift(paths, await readState(paths), actions);
   await repairReserialisedConfig(paths, await readState(paths), actions);
 
   // 3. Orphaned backups: GC against the final manifest.
