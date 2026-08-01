@@ -33,6 +33,44 @@ describe('engine: init', () => {
     expect(state.items).toEqual([]);
   });
 
+  // The generated store README is the ONLY explanation a person gets when they find
+  // this repo on another machine — cloned from the sync remote, or in a backup — with
+  // no agentenv installed. Pin the four things it must tell them, so a future edit
+  // cannot quietly drop one.
+  it('writes a store README that explains the layout to a stranger who clones it', async () => {
+    const th = home();
+    const paths = resolvePaths(th.env);
+    expect((await run(['init'], { env: th.env })).code).toBe(0);
+
+    const readme = readFileSync(paths.storeReadme, 'utf8');
+
+    // 1. The content layout, including the canonical MCP file.
+    expect(readme).toContain('environments/');
+    expect(readme).toContain('mcp/');
+    expect(readme).toContain('servers.yaml');
+
+    // 2. The machine-local siblings that are deliberately NOT in the repo.
+    expect(readme).toContain('state.json');
+    expect(readme).toContain('secrets.env');
+
+    // 3. That secrets never sync — the one misunderstanding that leaks credentials.
+    expect(readme).toMatch(/secrets?[^\n]*never synced|never synced/i);
+
+    // 4. How to get from this repo back to a working machine.
+    expect(readme).toContain('agentenv init --remote');
+  });
+
+  it('never overwrites a store README the user has edited', async () => {
+    const th = home();
+    const paths = resolvePaths(th.env);
+    expect((await run(['init'], { env: th.env })).code).toBe(0);
+
+    writeFileSync(paths.storeReadme, '# my own notes\n');
+    expect((await run(['init'], { env: th.env })).code).toBe(0);
+
+    expect(readFileSync(paths.storeReadme, 'utf8')).toBe('# my own notes\n');
+  });
+
   it('installs one shim per registered adapter', async () => {
     const th = home();
     const paths = resolvePaths(th.env);
