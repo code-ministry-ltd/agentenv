@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { resolvePaths } from '../src/paths.js';
+import { writeSecrets } from '../src/secrets.js';
 import type { ExecHarness, ExecSpec } from '../src/session/exec.js';
 import { launchHarness, type LaunchRequest } from '../src/session/launch.js';
 import { FIXTURE_CONFIG_ENV, installFixtureHarness, makeFixtureAdapter } from './fixtures/fixture-adapter.js';
@@ -105,6 +106,29 @@ describe('session launch', () => {
     expect(calls[0]?.args).toEqual([`--view=${result.viewRoot}`, '--print-config-root']);
     expect(calls[0]?.env[FIXTURE_CONFIG_ENV]).toBe(result.viewRoot);
     expect(calls[0]?.env.FIXTURE_EXTRA).toBe('enabled');
+  });
+
+  it('adds machine-local secrets only to an applied child, with secrets.env precedence', async () => {
+    const th = home();
+    const { paths, env } = scenario(th);
+    env.SHARED_TOKEN = 'shell-value';
+    await writeSecrets(paths, new Map([
+      ['SHARED_TOKEN', 'machine-value'],
+      ['CHILD_ONLY', 'child-value'],
+    ]));
+    const applied = capturingExec();
+
+    await launchHarness(req({ paths, adapter: makeFixtureAdapter(), env, execHarness: applied.exec }));
+
+    expect(applied.calls[0]?.env.SHARED_TOKEN).toBe('machine-value');
+    expect(applied.calls[0]?.env.CHILD_ONLY).toBe('child-value');
+
+    const unbound = capturingExec();
+    await launchHarness(
+      req({ paths, adapter: makeFixtureAdapter(), env, envs: null, execHarness: unbound.exec }),
+    );
+    expect(unbound.calls[0]?.env.SHARED_TOKEN).toBe('shell-value');
+    expect(unbound.calls[0]?.env.CHILD_ONLY).toBeUndefined();
   });
 
   it('AC: an unbound launch execs the real binary untouched (no overrides)', async () => {

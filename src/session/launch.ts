@@ -1,6 +1,7 @@
 import type { Adapter, SelfCheckContext } from '../adapter.js';
 import { renderSessionLaunch } from '../adapter-v2.js';
 import type { Paths } from '../paths.js';
+import { loadSecrets } from '../secrets.js';
 import { readState } from '../state.js';
 import { composeView, type SurfaceSkip } from './composer.js';
 import { defaultCapture, defaultExecHarness, type CaptureFn, type ExecHarness } from './exec.js';
@@ -174,7 +175,19 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
   const launch = adapter.definition
     ? renderSessionLaunch(adapter.definition, viewRoot, args)
     : { args: [...args], env: adapter.overrideEnv(viewRoot) };
-  const execEnv: NodeJS.ProcessEnv = { ...sanitisedEnv, ...launch.env };
+  let secretEnv: Record<string, string>;
+  try {
+    secretEnv = Object.fromEntries(await loadSecrets(paths));
+  } catch (err) {
+    notices.push(
+      `agentenv: could not load the child secret environment (${(err as Error).message}) — ` +
+        `launching ${adapter.binaryName} without overrides`,
+    );
+    return execUntouched('fail-open');
+  }
+  // Machine-local secrets exist only in an applied child/materialiser. They override
+  // the shell, while adapter-owned launch variables remain authoritative.
+  const execEnv: NodeJS.ProcessEnv = { ...sanitisedEnv, ...secretEnv, ...launch.env };
   const code = await execHarness({ binaryPath, args: launch.args, env: execEnv, cwd });
   return { code, mode: 'applied', applied: true, viewRoot, binaryPath, skipped, notices };
 }
