@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { adoptSweep, snapshotInventory } from '../src/adopt.js';
+import { adoptSweep } from '../src/adopt.js';
 import { claudeAdapter } from '../src/adapters/claude.js';
 import { codexAdapter } from '../src/adapters/codex.js';
 import { renderSessionLaunch } from '../src/adapter-v2.js';
@@ -99,17 +99,17 @@ describe('merge baseline — accepted known failures', () => {
     );
   });
 
-  it.fails('a deactivated but still-existing environment is not a valid adoption owner', async () => {
+  it('a deactivated but still-existing environment is not a valid adoption owner', async () => {
     const th = home();
     const paths = resolvePaths(th.env);
-    const envDir = paths.envDir('writing');
-    const surfaceDir = join(th.home, 'surface', 'skills');
-    mkdirSync(envDir, { recursive: true });
-    mkdirSync(surfaceDir, { recursive: true });
-    writeFileSync(paths.envYaml('writing'), 'version: "1.0"\ndescription: writing\n');
-    await snapshotInventory(paths, [
-      { dir: surfaceDir, scope: 'global', storeKind: 'skills', ownerEnv: 'writing' },
-    ]);
+    const realRoot = join(th.home, 'fixture-real');
+    const env = { ...th.env, [FIXTURE_CONFIG_ENV]: realRoot };
+    const adapters = [makeFixtureAdapter()];
+    seedSkill(th);
+    expect((await run(['use', 'writing', '--global'], { env, adapters })).code).toBe(0);
+    expect((await run(['drop', '--global'], { env, adapters })).code).toBe(0);
+
+    const surfaceDir = join(realRoot, 'skills');
 
     const candidate = join(surfaceDir, 'late-skill');
     mkdirSync(candidate, { recursive: true });

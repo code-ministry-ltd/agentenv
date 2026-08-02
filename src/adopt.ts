@@ -180,6 +180,32 @@ export async function snapshotInventory(
   });
 }
 
+/** Clear stale global attribution after deactivation while retaining recoverable baselines. */
+export async function reconcileInventoryOwners(
+  paths: Paths,
+  activeOwners: readonly string[],
+): Promise<void> {
+  await withLock(paths, async () => {
+    const manifest = await readState(paths);
+    const inventory = readInventory(manifest);
+    let changed = false;
+    for (const surface of inventory) {
+      if (
+        surface.scope === 'global' &&
+        surface.ownerEnv !== '' &&
+        !activeOwners.includes(surface.ownerEnv)
+      ) {
+        surface.ownerEnv = '';
+        changed = true;
+      }
+    }
+    if (changed) {
+      (manifest as { inventory?: SnapshotSurface[] }).inventory = inventory;
+      await writeState(paths, manifest);
+    }
+  });
+}
+
 // ---------------------------------------------------------------------------
 // The sweep
 // ---------------------------------------------------------------------------

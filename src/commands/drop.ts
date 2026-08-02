@@ -1,5 +1,6 @@
 import { adapters as realAdapters } from '../adapters/index.js';
 import { globalAdapterTargets } from '../adapter-v2.js';
+import { reconcileInventoryOwners } from '../adopt.js';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
 import { driftSweep } from '../drift.js';
@@ -112,6 +113,7 @@ async function dropGlobal(
     ...(restrictToRoots ? { restrictToRoots } : {}),
     onWarn: (m) => notices.push(m),
   });
+  await reconcileInventoryOwners(paths, result.stack);
 
   notices.push(...renderGlobalSkips(result.skips));
   await closeStoreSync(syncCtx, notices); // Git sync END (D9): one fail-soft push.
