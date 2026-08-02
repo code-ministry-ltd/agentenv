@@ -1,4 +1,5 @@
 import type { Adapter, SelfCheckContext } from '../adapter.js';
+import { renderSessionLaunch } from '../adapter-v2.js';
 import type { Paths } from '../paths.js';
 import { readState } from '../state.js';
 import { composeView, type SurfaceSkip } from './composer.js';
@@ -94,10 +95,16 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
 
   // A harness that cannot inherit a shell environment (Cursor) has no session
   // path: launch untouched and point the user at global mode (D11/D15).
-  if (!adapter.sessionSupported) {
+  const sessionSupported = adapter.definition
+    ? adapter.definition.session.supported
+    : adapter.sessionSupported;
+  if (!sessionSupported) {
+    const unsupportedReason = adapter.definition?.session.supported === false
+      ? adapter.definition.session.reason
+      : adapter.sessionUnsupportedReason;
     notices.push(
       `agentenv: ${adapter.id} does not support session mode` +
-        `${adapter.sessionUnsupportedReason ? ` (${adapter.sessionUnsupportedReason})` : ''} — ` +
+        `${unsupportedReason ? ` (${unsupportedReason})` : ''} — ` +
         `launching without an environment; use 'agentenv use … --global' to activate globally`,
     );
     return execUntouched('session-unsupported');
@@ -162,8 +169,12 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
     return execUntouched('self-check-failed');
   }
 
-  // Applied: exec the real binary pointed at the private view.
-  const execEnv: NodeJS.ProcessEnv = { ...sanitisedEnv, ...adapter.overrideEnv(viewRoot) };
-  const code = await execHarness({ binaryPath, args, env: execEnv, cwd });
+  // Applied: Adapter v2 may use launch arguments/environment instead of relocating
+  // a config root (Claude), while unmigrated adapters retain the v1 override path.
+  const launch = adapter.definition
+    ? renderSessionLaunch(adapter.definition, viewRoot, args)
+    : { args: [...args], env: adapter.overrideEnv(viewRoot) };
+  const execEnv: NodeJS.ProcessEnv = { ...sanitisedEnv, ...launch.env };
+  const code = await execHarness({ binaryPath, args: launch.args, env: execEnv, cwd });
   return { code, mode: 'applied', applied: true, viewRoot, binaryPath, skipped, notices };
 }

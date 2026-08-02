@@ -1,4 +1,5 @@
 import type { JsonValue } from './config-keys.js';
+import type { AdapterV2 } from './adapter-v2.js';
 
 /**
  * The adapter contract — FROZEN at the end of Phase 1.
@@ -323,6 +324,9 @@ export interface SelfCheckContext {
  * everything the composer needs without a method call.
  */
 export interface Adapter {
+  /** Adapter-v2 declaration used by the new graph/launch paths during migration. */
+  definition?: AdapterV2;
+
   // — identity —
 
   /** Stable identity, e.g. `claude-code`. Used in manifests, logs and `status`. */

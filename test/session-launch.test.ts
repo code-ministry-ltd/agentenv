@@ -76,6 +76,37 @@ describe('session launch', () => {
     expect(lastStdout().trim()).toBe(result.viewRoot);
   });
 
+  it('uses Adapter v2 launch arguments, environment, and optional root override', async () => {
+    const th = home();
+    const { paths, env } = scenario(th);
+    const { exec, calls } = capturingExec();
+    const adapter = makeFixtureAdapter();
+    adapter.definition = {
+      version: 2,
+      id: adapter.id,
+      binaryName: adapter.binaryName,
+      session: {
+        supported: true,
+        launch: {
+          arguments: ['--view={view}'],
+          environment: { FIXTURE_EXTRA: 'enabled' },
+          rootOverride: { variable: FIXTURE_CONFIG_ENV },
+        },
+      },
+      surfaces: [],
+      rawMappings: [],
+    };
+
+    const result = await launchHarness(
+      req({ paths, adapter, env, args: ['--print-config-root'], execHarness: exec }),
+    );
+
+    expect(result.mode).toBe('applied');
+    expect(calls[0]?.args).toEqual([`--view=${result.viewRoot}`, '--print-config-root']);
+    expect(calls[0]?.env[FIXTURE_CONFIG_ENV]).toBe(result.viewRoot);
+    expect(calls[0]?.env.FIXTURE_EXTRA).toBe('enabled');
+  });
+
   it('AC: an unbound launch execs the real binary untouched (no overrides)', async () => {
     const th = home();
     const { paths, env } = scenario(th);
