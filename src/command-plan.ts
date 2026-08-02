@@ -2,14 +2,21 @@
 export type OperationState = 'pending' | 'applying' | 'applied' | 'undoing' | 'undone';
 
 /** Durable command phases. `committed` is the irreversible command-level commit point. */
-export type CommandPhase = 'planned' | 'applying' | 'committed' | 'rolling-back' | 'rolled-back';
+export type CommandPhase =
+  | 'planned'
+  | 'applying'
+  | 'committed'
+  | 'git-pending'
+  | 'complete'
+  | 'rolling-back'
+  | 'rolled-back';
 
 export interface PlannedOperationInput {
   id: string;
   kind: string;
   path?: string;
-  preIdentity?: string;
-  postIdentity?: string;
+  preIdentity?: PathIdentity;
+  postIdentity?: PathIdentity;
   undoRef?: string;
 }
 
@@ -57,7 +64,9 @@ export function advanceCommand(plan: CommandPlan, next: CommandPhase): CommandPl
   const allowed: Record<CommandPhase, readonly CommandPhase[]> = {
     planned: ['applying'],
     applying: ['committed', 'rolling-back'],
-    committed: [],
+    committed: ['git-pending'],
+    'git-pending': ['complete'],
+    complete: [],
     'rolling-back': ['rolled-back'],
     'rolled-back': [],
   };
@@ -74,7 +83,7 @@ export function advanceCommand(plan: CommandPlan, next: CommandPhase): CommandPl
   ) {
     throw new Error('cannot finish rollback until every applied operation is undone');
   }
-  return { ...plan, phase: next, commitPoint: next === 'committed' };
+  return { ...plan, phase: next, commitPoint: plan.commitPoint || next === 'committed' };
 }
 
 /** Advance one operation without permitting skipped or backward states. */
@@ -88,7 +97,7 @@ export function advanceOperation(
   const current = plan.operations[index]!;
   const allowed: Record<OperationState, readonly OperationState[]> = {
     pending: ['applying'],
-    applying: ['applied'],
+    applying: ['applied', 'undoing'],
     applied: ['undoing'],
     undoing: ['undone'],
     undone: [],
@@ -103,3 +112,4 @@ export function advanceOperation(
   operations[index] = { ...current, state: next };
   return { ...plan, operations };
 }
+import type { PathIdentity } from './path-identity.js';

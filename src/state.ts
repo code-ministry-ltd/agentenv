@@ -204,7 +204,15 @@ function coerceVersionedRecords<T>(
   return raw as T[];
 }
 
-const COMMAND_PHASES = new Set(['planned', 'applying', 'committed', 'rolling-back', 'rolled-back']);
+const COMMAND_PHASES = new Set([
+  'planned',
+  'applying',
+  'committed',
+  'git-pending',
+  'complete',
+  'rolling-back',
+  'rolled-back',
+]);
 const OPERATION_STATES = new Set<OperationState>(['pending', 'applying', 'applied', 'undoing', 'undone']);
 const GENERATION_PHASES = new Set(['building', 'published', 'closing', 'sweeping', 'swept', 'quarantined', 'collected']);
 const GLOBAL_PROJECTION_PHASES = new Set(['building', 'active', 'retired', 'reconciling', 'reconciled', 'quarantined', 'collected']);

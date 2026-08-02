@@ -32,6 +32,9 @@ describe('whole-command plan automaton', () => {
     expect(value.phase).toBe('committed');
     expect(value.commitPoint).toBe(true);
     expect(() => advanceCommand(value, 'rolling-back')).toThrow(/commit point/i);
+    value = advanceCommand(value, 'git-pending');
+    value = advanceCommand(value, 'complete');
+    expect(value.commitPoint).toBe(true);
   });
 
   it('makes rollback progress explicit and resumable before the commit point', () => {
