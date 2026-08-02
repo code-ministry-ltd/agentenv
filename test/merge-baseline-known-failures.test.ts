@@ -125,16 +125,19 @@ describe('merge baseline — accepted known failures', () => {
     );
   });
 
-  it.fails('Codex declares a traversal-safe raw mapping for TOML subagents', () => {
-    const rawMappings = (
-      codexAdapter as unknown as { rawMappings?: readonly Record<string, unknown>[] }
-    ).rawMappings;
-    expect(rawMappings).toEqual(
+  it('Codex declares a traversal-safe raw mapping for TOML subagents', () => {
+    expect(codexAdapter.definition?.rawMappings).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           storeRelativePath: 'agents',
-          sessionRelativePath: 'agents',
-          globalRelativePath: 'agents',
+          session: expect.objectContaining({
+            supported: true,
+            destination: { root: 'view', relativePath: 'agents' },
+          }),
+          global: expect.objectContaining({
+            supported: true,
+            destination: { root: 'config', relativePath: 'agents' },
+          }),
         }),
       ]),
     );

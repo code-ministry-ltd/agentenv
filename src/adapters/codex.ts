@@ -221,7 +221,23 @@ export const codexDefinition: AdapterV2 = {
       },
     },
   ],
-  rawMappings: [],
+  rawMappings: [
+    {
+      id: 'codex-agents',
+      storeRelativePath: 'agents',
+      session: {
+        supported: true,
+        destination: { root: 'view', relativePath: 'agents' },
+        writer: 'direct',
+        inheritUserContent: true,
+      },
+      global: {
+        supported: true,
+        destination: { root: 'config', relativePath: 'agents' },
+        writer: 'projection',
+      },
+    },
+  ],
 };
 
 /** Is `v` a plain (non-array) object? */

@@ -1,6 +1,11 @@
 import { lstat, mkdir, readdir, readFile, readlink, rm, symlink } from 'node:fs/promises';
-import { basename, extname, join, sep } from 'node:path';
-import { resolveGlobalSurfaceDestination } from './adapter-v2.js';
+import { basename, dirname, extname, join, sep } from 'node:path';
+import {
+  globalDestinationRoots,
+  resolveGlobalSurfaceDestination,
+  resolveSurfaceDestination,
+  type RawMappingV2,
+} from './adapter-v2.js';
 import {
   storeToken,
   type Adapter,
@@ -32,6 +37,7 @@ import {
 import { beginTransaction, recoverState } from './journal.js';
 import { withLock } from './lock.js';
 import type { Paths } from './paths.js';
+import { listRawFiles, rawMappingStoreRoot, type RawFile } from './raw-mapping.js';
 import { loadResolver, substituteSecretFields, type SecretResolver } from './secrets.js';
 import { findOwner, readState, writeState, type ManifestItem, type StateManifest } from './state.js';
 
@@ -266,6 +272,11 @@ export async function materialiseGlobal(req: MaterialiseGlobalRequest): Promise<
   // manifest is consistent before we begin (D4).
   await withLock(paths, () => recoverState(paths));
 
+  // Enumerate and validate every canonical raw tree before the first surface
+  // effect. An escaping symlink or unsupported entry must reject the command,
+  // not leave earlier adapters half-materialised.
+  const rawPlans = await planRawMappings(req);
+
   let applied = 0;
   // dir-merge and file-block: each self-locks + self-journals (one atomic op).
   for (const adapter of adapters) {
@@ -287,6 +298,25 @@ export async function materialiseGlobal(req: MaterialiseGlobalRequest): Promise<
       }
       // config-keys handled below, batched under one transaction.
     }
+    for (const mapping of adapter.definition?.rawMappings ?? []) {
+      if (!mapping.global.supported) {
+        skips.push({
+          adapterId: adapter.id,
+          surfaceId: mapping.id,
+          reason: 'unsupported',
+          detail: mapping.global.reason,
+        });
+        continue;
+      }
+      applied += await materialiseRawMapping(
+        req,
+        adapter,
+        mapping,
+        rawPlans.get(mapping) ?? new Map(),
+        skips,
+        onWarn,
+      );
+    }
   }
 
   // config-keys: ONE withLock + transaction across every surface and adapter.
@@ -299,6 +329,116 @@ export async function materialiseGlobal(req: MaterialiseGlobalRequest): Promise<
   for (const w of verifyWarnings) onWarn(w);
 
   return { applied, removed: 0, skips, stack, verifyWarnings };
+}
+
+async function planRawMappings(
+  req: MaterialiseGlobalRequest,
+): Promise<Map<RawMappingV2, Map<string, RawFile[]>>> {
+  const planned = new Map<RawMappingV2, Map<string, RawFile[]>>();
+  for (const adapter of req.adapters) {
+    for (const mapping of adapter.definition?.rawMappings ?? []) {
+      if (!mapping.global.supported) continue;
+      const byEnv = new Map<string, RawFile[]>();
+      for (const env of req.envs) {
+        byEnv.set(
+          env,
+          await listRawFiles(rawMappingStoreRoot(req.paths, adapter, env, mapping)),
+        );
+      }
+      planned.set(mapping, byEnv);
+    }
+  }
+  return planned;
+}
+
+/** Materialise a recursive raw tree as independently owned per-file symlinks. */
+async function materialiseRawMapping(
+  req: MaterialiseGlobalRequest,
+  adapter: Adapter,
+  mapping: RawMappingV2,
+  filesByEnv: ReadonlyMap<string, readonly RawFile[]>,
+  skips: GlobalSkip[],
+  onWarn: (message: string) => void,
+): Promise<number> {
+  if (!mapping.global.supported) return 0;
+  const { paths, envs, env } = req;
+  const targetRoot = resolveSurfaceDestination(mapping.global, globalDestinationRoots(adapter, env));
+  const claimed = new Set<string>();
+  let applied = 0;
+
+  for (const ownerEnv of [...envs].reverse()) {
+    for (const file of filesByEnv.get(ownerEnv) ?? []) {
+      if ([...claimed].some((prior) => rawPathsOverlap(prior, file.relativePath))) {
+        skips.push({
+          adapterId: adapter.id,
+          surfaceId: mapping.id,
+          reason: 'shadowed',
+          detail: `'${file.relativePath}' from env '${ownerEnv}' shadowed by a higher-precedence item in ${mapping.id}`,
+        });
+        continue;
+      }
+      claimed.add(file.relativePath);
+      if (await hasBlockingRawAncestor(targetRoot, file.relativePath)) {
+        skips.push({
+          adapterId: adapter.id,
+          surfaceId: mapping.id,
+          reason: 'user-collision',
+          detail: `'${file.relativePath}' from env '${ownerEnv}' skipped — a non-directory or symlink ancestor blocks the destination`,
+        });
+        continue;
+      }
+      const result = await dmMaterialise(paths, {
+        ownerEnv,
+        sourcePath: file.sourcePath,
+        targetDir: join(targetRoot, dirname(file.relativePath)),
+        itemName: basename(file.relativePath),
+        mode: 'symlink',
+        onWarn,
+      });
+      if (result.status === 'materialised') {
+        applied += 1;
+      } else {
+        skips.push({
+          adapterId: adapter.id,
+          surfaceId: mapping.id,
+          reason: 'user-collision',
+          detail: `'${file.relativePath}' from env '${ownerEnv}' skipped — a non-agentenv item already exists`,
+        });
+      }
+    }
+  }
+  return applied;
+}
+
+function rawPathsOverlap(left: string, right: string): boolean {
+  const a = left.split(/[\\/]/);
+  const b = right.split(/[\\/]/);
+  const common = Math.min(a.length, b.length);
+  for (let i = 0; i < common; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+async function hasBlockingRawAncestor(targetRoot: string, relativePath: string): Promise<boolean> {
+  const rootState = await lstat(targetRoot).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  });
+  if (rootState && !rootState.isDirectory()) return true;
+
+  let current = targetRoot;
+  const segments = relativePath.split(/[\\/]/).slice(0, -1);
+  for (const segment of segments) {
+    current = join(current, segment);
+    const state = await lstat(current).catch((err: NodeJS.ErrnoException) => {
+      if (err.code === 'ENOENT') return null;
+      throw err;
+    });
+    if (!state) return false;
+    if (!state.isDirectory()) return true;
+  }
+  return false;
 }
 
 /**
@@ -809,7 +949,7 @@ async function validateWrittenConfigFiles(
 /** Per-surface support + ownership, for `status` (never pretends unsupported works, D6). */
 export interface SurfaceStatus {
   surfaceId: string;
-  mechanism: 'dir-merge' | 'file-block' | 'config-keys';
+  mechanism: 'dir-merge' | 'file-block' | 'config-keys' | 'raw';
   supported: boolean;
   unsupportedReason?: string;
   /** Items in the manifest owned by the active global stack for this surface. */
@@ -863,7 +1003,9 @@ export async function describeGlobal(req: {
     const surfaces: SurfaceStatus[] = [];
     const skips: GlobalSkip[] = [];
     for (const surface of adapter.surfaces) {
-      const target = resolveGlobalSurfaceDestination(adapter, surface, env);
+      const target = surface.supported
+        ? resolveGlobalSurfaceDestination(adapter, surface, env)
+        : join(adapter.realConfigRoot(env), surface.rootRelativePath);
       surfaces.push({
         surfaceId: surface.id,
         mechanism: surface.mechanism,
@@ -882,6 +1024,28 @@ export async function describeGlobal(req: {
       }
       if (stack.length > 0 && surface.mechanism === 'dir-merge') {
         skips.push(...(await dirMergeStatusSkips(paths, adapter, surface, target, stack, manifest)));
+      }
+    }
+    for (const mapping of adapter.definition?.rawMappings ?? []) {
+      const target = mapping.global.supported
+        ? resolveSurfaceDestination(mapping.global, globalDestinationRoots(adapter, env))
+        : adapter.realConfigRoot(env);
+      surfaces.push({
+        surfaceId: mapping.id,
+        mechanism: 'raw',
+        supported: mapping.global.supported,
+        ...(!mapping.global.supported ? { unsupportedReason: mapping.global.reason } : {}),
+        ownedItems: countOwnedAt(manifest, target, active, 'raw'),
+      });
+      if (!mapping.global.supported) {
+        skips.push({
+          adapterId: adapter.id,
+          surfaceId: mapping.id,
+          reason: 'unsupported',
+          detail: mapping.global.reason,
+        });
+      } else if (stack.length > 0) {
+        skips.push(...(await rawMappingStatusSkips(paths, adapter, mapping, target, stack, manifest)));
       }
     }
     out.push({
@@ -908,11 +1072,62 @@ function countOwned(
   target: string,
   active: readonly string[],
 ): number {
+  return countOwnedAt(manifest, target, active, surface.mechanism);
+}
+
+function countOwnedAt(
+  manifest: StateManifest,
+  target: string,
+  active: readonly string[],
+  mechanism: SurfaceStatus['mechanism'],
+): number {
   return manifest.items.filter((i) => {
     if (!active.includes(i.ownerEnv)) return false;
-    if (surface.mechanism === 'dir-merge') return i.path.startsWith(target + sep);
+    if (mechanism === 'dir-merge' || mechanism === 'raw') {
+      return i.path.startsWith(target + sep);
+    }
     return i.path === target;
   }).length;
+}
+
+async function rawMappingStatusSkips(
+  paths: Paths,
+  adapter: Adapter,
+  mapping: RawMappingV2,
+  targetRoot: string,
+  stack: readonly string[],
+  manifest: StateManifest,
+): Promise<GlobalSkip[]> {
+  const claimed = new Set<string>();
+  const skips: GlobalSkip[] = [];
+  for (const env of [...stack].reverse()) {
+    for (const file of await listRawFiles(rawMappingStoreRoot(paths, adapter, env, mapping))) {
+      if ([...claimed].some((prior) => rawPathsOverlap(prior, file.relativePath))) {
+        skips.push({
+          adapterId: adapter.id,
+          surfaceId: mapping.id,
+          reason: 'shadowed',
+          detail: `'${file.relativePath}' from env '${env}' shadowed by a higher-precedence item in ${mapping.id}`,
+        });
+        continue;
+      }
+      claimed.add(file.relativePath);
+      const targetPath = join(targetRoot, file.relativePath);
+      const owner = findOwner(manifest, targetPath);
+      const blocked = await hasBlockingRawAncestor(targetRoot, file.relativePath);
+      if (blocked || ((await lexists(targetPath)) && (!owner || !stack.includes(owner.ownerEnv)))) {
+        skips.push({
+          adapterId: adapter.id,
+          surfaceId: mapping.id,
+          reason: 'user-collision',
+          detail: blocked
+            ? `'${file.relativePath}' from env '${env}' skipped — a non-directory or symlink ancestor blocks the destination`
+            : `'${file.relativePath}' from env '${env}' skipped — a non-agentenv item already exists`,
+        });
+      }
+    }
+  }
+  return skips;
 }
 
 /** Re-derive the shadowing / user-collision skips a dir-merge surface incurs (read-only). */

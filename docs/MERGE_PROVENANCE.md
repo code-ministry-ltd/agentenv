@@ -21,13 +21,13 @@ or specifications is recorded as behavioral provenance rather than copied code.
 | Filesystem, backups, lock, Git runner, parsers | Retain the CM safety primitives behind new command-level contracts | CM | Existing Apache-2.0 code | Retained |
 | Claude session | Additional directory, explicit MCP file, and additional-directory instruction environment; never default to `CLAUDE_CONFIG_DIR` | JJ `src/adapters/claude.ts` | Behavioral reimplementation with CM probe/compiler | Implemented |
 | Claude global | Top-level `~/.claude.json`, native skills/rules, canonical persistence | JJ `src/adapters/claude.ts` | Behavioral reimplementation with CM transactional writers | Implemented |
-| Codex | Shared skills, commands-as-skills, child environment, persistence | JJ adapter and tests | Behavioral reimplementation with CM TOML/probe/compiler | Vertical session/global behavior implemented; raw mapping and reverse persistence pending |
+| Codex | Shared skills, commands-as-skills, child environment, persistence | JJ adapter and tests | Behavioral reimplementation with CM TOML/probe/compiler | Vertical session/global behavior and TOML-agent raw mapping implemented; reverse persistence pending |
 | OpenCode | `XDG_CONFIG_HOME` plus `OPENCODE_CONFIG_DIR` isolation | CM adapter and live fixture | Existing Apache-2.0 code | Retained |
 | Pi | Five settings arrays and real probe | CM adapter and fixtures | Existing Apache-2.0 code | Retained pending persistence work |
 | Cursor | Fixed real root, shared skills, explicit unsupported semantics | JJ adapter and tests | Behavioral reimplementation with CM validator | Pending |
 | Session generations and inventory | Immutable retained generations and launch-time inventories | JJ view composer/adoption tests | Behavioral reimplementation under new lease model | Pending |
 | CLI and release | Settled commands, root globals, env-less global drop, Node floor, container restore | JJ CLI/release tests | Behavioral reimplementation | Pending |
-| Raw mappings | Generic `files/<harness>/<relpath>` and Codex TOML agents | Merge specification | New implementation | Pending |
+| Raw mappings | Generic `files/<harness>/<relpath>` and Codex TOML agents | Merge specification | New implementation | Implemented with recursive traversal checks, per-file ownership, collision handling, session write-through, global drop, inventory, and status |
 
 ## Baseline defect ledger
 

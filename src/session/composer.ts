@@ -10,7 +10,7 @@ import {
   rm,
   symlink,
 } from 'node:fs/promises';
-import { basename, extname, join } from 'node:path';
+import { basename, dirname, extname, join } from 'node:path';
 import { parse as parseJsonc } from 'jsonc-parser';
 import { parse as parseToml, stringify as stringifyToml } from 'smol-toml';
 import {
@@ -21,12 +21,19 @@ import {
   type ConfigKeysInjection,
   type SurfaceDeclaration,
 } from '../adapter.js';
-import type { SurfaceComposition } from '../adapter-v2.js';
+import {
+  globalDestinationRoots,
+  resolveSurfaceDestination,
+  type DestinationRoots,
+  type RawMappingV2,
+  type SurfaceComposition,
+} from '../adapter-v2.js';
 import type { JsonValue } from '../config-keys.js';
 import { renderConfigKeysDriftReport } from '../drift.js';
 import { appendRegion, closeMarker, openMarker } from '../file-block.js';
 import { writeFileAtomic } from '../fs-atomic.js';
 import type { Paths } from '../paths.js';
+import { listRawFiles, rawMappingStoreRoot } from '../raw-mapping.js';
 import { loadResolver, substituteSecretFields } from '../secrets.js';
 
 /**
@@ -48,7 +55,7 @@ import { loadResolver, substituteSecretFields } from '../secrets.js';
  */
 
 /** Bump to force every view to rebuild when the composition logic changes. */
-const COMPOSER_VERSION = 2;
+const COMPOSER_VERSION = 3;
 
 /** A surface the composer did not fully apply, surfaced to `status` (D6/D7). */
 export interface SurfaceSkip {
@@ -121,7 +128,7 @@ interface ViewMeta {
 export interface ViewInventoryEntry {
   surfaceId: string;
   storeKind: SurfaceDeclaration['storeKind'];
-  mechanism: SurfaceDeclaration['mechanism'];
+  mechanism: SurfaceDeclaration['mechanism'] | 'raw';
   path: string;
   /** Item names for directories; a content signature for files. */
   baseline: string[] | string;
@@ -202,6 +209,7 @@ export async function composeView(req: ComposeRequest): Promise<ComposeResult> {
     for (const group of configKeysByFile.values()) {
       await composeConfigKeysFile(req, buildDir, group, skipped, onWarn);
     }
+    await composeRawMappings(req, buildDir, skipped, onWarn);
     const inventory = await captureViewInventory(req, buildDir, viewRoot);
     await publishAtomically(sessionDir, adapter.id, buildDir, viewRoot);
 
@@ -237,6 +245,21 @@ async function captureViewInventory(
       ownerEnv: req.envs.at(-1) ?? null,
     });
   }
+  for (const mapping of req.adapter.definition?.rawMappings ?? []) {
+    if (!mapping.session.supported) continue;
+    const roots = sessionDestinationRoots(req, buildDir);
+    const buildPath = resolveSurfaceDestination(mapping.session, roots);
+    inventory.push({
+      surfaceId: mapping.id,
+      storeKind: 'files',
+      mechanism: 'raw',
+      path: resolveSurfaceDestination(mapping.session, { ...roots, view: viewRoot }),
+      baseline: (await listRawFiles(buildPath, { allowExternalSymlinks: true })).map(
+        (file) => file.relativePath,
+      ),
+      ownerEnv: req.envs.at(-1) ?? null,
+    });
+  }
   return inventory;
 }
 
@@ -259,7 +282,14 @@ async function composeBucketOne(req: ComposeRequest, buildDir: string): Promise<
   // wholesale pass-through symlink, regardless of what classifyEntry says (H2). A
   // mis-classified target would otherwise be symlinked to the real dir and then
   // have per-item env symlinks written THROUGH it into the user's real location.
-  const surfaceTargets = new Set(adapter.surfaces.map((s) => topLevelSegment(surfaceRootRelativePath(s))));
+  const surfaceTargets = new Set(
+    adapter.surfaces.map((s) => topLevelSegment(surfaceRootRelativePath(s))),
+  );
+  for (const mapping of adapter.definition?.rawMappings ?? []) {
+    if (mapping.session.supported && mapping.session.destination.root === 'view') {
+      surfaceTargets.add(topLevelSegment(mapping.session.destination.relativePath));
+    }
+  }
 
   let entries;
   try {
@@ -347,6 +377,81 @@ function declarationForSession(
 
 function sessionSurfacePlans(adapter: Adapter): SessionSurfacePlan[] {
   return adapter.surfaces.map((surface) => declarationForSession(adapter, surface));
+}
+
+function sessionDestinationRoots(req: ComposeRequest, view: string): DestinationRoots {
+  return {
+    ...globalDestinationRoots(req.adapter, req.env ?? process.env),
+    view,
+    // The request captured this before launch overrides were applied. It is the
+    // only correct source for inherited config-root content.
+    config: req.realConfigRoot,
+  };
+}
+
+async function composeRawMappings(
+  req: ComposeRequest,
+  buildDir: string,
+  skipped: SurfaceSkip[],
+  onWarn: (message: string) => void,
+): Promise<void> {
+  for (const mapping of req.adapter.definition?.rawMappings ?? []) {
+    if (!mapping.session.supported) {
+      skipped.push({ surfaceId: mapping.id, reason: 'unsupported', detail: mapping.session.reason });
+      continue;
+    }
+    if (mapping.session.destination.root !== 'view') {
+      throw new Error(`session raw mapping '${mapping.id}' must target the view root`);
+    }
+    if (mapping.session.writer !== 'direct') {
+      throw new Error(`session raw mapping '${mapping.id}' must use the direct writer`);
+    }
+    await composeRawMapping(req, buildDir, mapping, skipped, onWarn);
+  }
+}
+
+async function composeRawMapping(
+  req: ComposeRequest,
+  buildDir: string,
+  mapping: RawMappingV2,
+  skipped: SurfaceSkip[],
+  onWarn: (message: string) => void,
+): Promise<void> {
+  if (!mapping.session.supported) return;
+  const roots = sessionDestinationRoots(req, buildDir);
+  const targetRoot = resolveSurfaceDestination(mapping.session, roots);
+  await mkdir(targetRoot, { recursive: true });
+  const placed = new Set<string>();
+
+  const place = async (relativePath: string, sourcePath: string): Promise<boolean> => {
+    const target = join(targetRoot, relativePath);
+    if ([...placed].some((prior) => rawPathsOverlap(prior, relativePath))) return false;
+    if (await pathExists(target)) return false;
+    await mkdir(dirname(target), { recursive: true });
+    await symlink(sourcePath, target);
+    placed.add(relativePath);
+    return true;
+  };
+
+  // A raw mapping's global destination is also the user's physical source for
+  // session inheritance. User files are placed first and always win collisions.
+  if (mapping.session.inheritUserContent && mapping.global.supported) {
+    const realRoot = resolveSurfaceDestination(mapping.global, roots);
+    for (const file of await listRawFiles(realRoot, { allowExternalSymlinks: true })) {
+      await place(file.relativePath, file.sourcePath);
+    }
+  }
+
+  // Later environments win by claiming each relative path first.
+  for (const env of [...req.envs].reverse()) {
+    const sourceRoot = rawMappingStoreRoot(req.paths, req.adapter, env, mapping);
+    for (const file of await listRawFiles(sourceRoot)) {
+      if (await place(file.relativePath, file.sourcePath)) continue;
+      const detail = `'${file.relativePath}' from env '${env}' shadowed in ${mapping.id}`;
+      onWarn(`agentenv: skipping ${detail} (a user or higher-precedence item wins)`);
+      skipped.push({ surfaceId: mapping.id, reason: 'collision', detail });
+    }
+  }
 }
 
 async function composeSurface(
@@ -720,6 +825,7 @@ async function fingerprintInputs(req: ComposeRequest): Promise<string> {
     // Adapter structural declaration (L1): a surface/mechanism/path/keyPath change
     // or an override-env change — i.e. an adapter UPGRADE — invalidates stale views.
     adapter.surfaces,
+    adapter.definition,
     adapter.configRootEnv,
     [...envs],
     req.projectRoot ?? null,
@@ -752,7 +858,38 @@ async function fingerprintInputs(req: ComposeRequest): Promise<string> {
     }
     parts.push([surface.id, storeSigs, realSig]);
   }
+  for (const mapping of adapter.definition?.rawMappings ?? []) {
+    const storeSigs: string[] = [];
+    for (const env of envs) {
+      storeSigs.push(
+        await rawTreeSignature(rawMappingStoreRoot(paths, adapter, env, mapping)),
+      );
+    }
+    const roots = sessionDestinationRoots(req, realConfigRoot);
+    const realSig = mapping.global.supported
+      ? await rawTreeSignature(resolveSurfaceDestination(mapping.global, roots), true)
+      : 'unsupported';
+    parts.push([mapping.id, 'raw', storeSigs, realSig]);
+  }
   return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+}
+
+async function rawTreeSignature(root: string, allowExternalSymlinks = false): Promise<string> {
+  const rows: string[] = [];
+  for (const file of await listRawFiles(root, { allowExternalSymlinks })) {
+    rows.push(`${file.relativePath}:${await fileSignature(file.sourcePath)}`);
+  }
+  return rows.join('|');
+}
+
+function rawPathsOverlap(left: string, right: string): boolean {
+  const a = left.split(/[\\/]/);
+  const b = right.split(/[\\/]/);
+  const common = Math.min(a.length, b.length);
+  for (let i = 0; i < common; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }
 
 /** Immediate-children signature (name/kind/size/mtime): a change in listing rebuilds. */
