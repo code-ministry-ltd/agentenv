@@ -16,6 +16,7 @@ import type {
   SelfCheckResult,
   SurfaceDeclaration,
 } from '../adapter.js';
+import { renderSessionLaunch, type AdapterV2 } from '../adapter-v2.js';
 import type { JsonValue } from '../config-keys.js';
 import { resolveBinaryOnPath } from '../session/resolve.js';
 import {
@@ -112,6 +113,96 @@ const SURFACES: readonly SurfaceDeclaration[] = [
     keyPath: ['mcpServers'],
   },
 ];
+
+/** Adapter v2: Claude is the launch-argument exception to config-root sessions. */
+export const claudeDefinition: AdapterV2 = {
+  version: 2,
+  id: 'claude-code',
+  binaryName: 'claude',
+  session: {
+    supported: true,
+    launch: {
+      arguments: ['--add-dir={view}', '--mcp-config={view}/.mcp.json'],
+      environment: { CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1' },
+    },
+  },
+  surfaces: [
+    {
+      id: 'skills',
+      storeKind: 'skills',
+      composition: { mechanism: 'dir-merge', mode: 'symlink' },
+      session: {
+        supported: true,
+        destination: { root: 'view', relativePath: '.claude/skills' },
+        writer: 'direct',
+        inheritUserContent: false,
+        hotReload: true,
+        adopt: true,
+      },
+      global: {
+        supported: true,
+        destination: { root: 'config', relativePath: 'skills' },
+        writer: 'projection',
+        hotReload: true,
+        adopt: true,
+      },
+    },
+    ...(['agents', 'commands'] as const).map((id) => ({
+      id,
+      storeKind: id,
+      composition: { mechanism: 'dir-merge' as const, mode: 'symlink' as const },
+      session: {
+        supported: true as const,
+        destination: { root: 'view' as const, relativePath: `.claude/${id}` },
+        writer: 'direct' as const,
+        inheritUserContent: false,
+        hotReload: true,
+        adopt: true,
+      },
+      global: {
+        supported: true as const,
+        destination: { root: 'config' as const, relativePath: id },
+        writer: 'projection' as const,
+        hotReload: true,
+        adopt: true,
+      },
+    })),
+    {
+      id: 'instructions',
+      storeKind: 'instructions',
+      composition: { mechanism: 'dir-merge', mode: 'symlink' },
+      session: {
+        supported: true,
+        destination: { root: 'view', relativePath: 'CLAUDE.md' },
+        writer: 'direct',
+        inheritUserContent: false,
+        composition: { mechanism: 'file-block', layering: 'inline' },
+      },
+      global: {
+        supported: true,
+        destination: { root: 'config', relativePath: 'rules' },
+        writer: 'projection',
+      },
+    },
+    {
+      id: 'mcp',
+      storeKind: 'mcp',
+      composition: { mechanism: 'config-keys', format: 'json', style: 'keyed', keyPath: ['mcpServers'] },
+      session: {
+        supported: true,
+        destination: { root: 'view', relativePath: '.mcp.json' },
+        writer: 'direct',
+        inheritUserContent: false,
+      },
+      global: {
+        supported: true,
+        destination: { root: 'home', relativePath: '.claude.json' },
+        writer: 'projection',
+      },
+    },
+  ],
+  rawMappings: [],
+};
 
 /** Is `v` a plain (non-array) object? */
 function isObject(v: unknown): v is Record<string, JsonValue> {
@@ -342,6 +433,7 @@ function overrideEnv(root: string): Record<string, string> {
  * The Claude Code adapter instance registered in {@link import('./index.js')}.
  */
 export const claudeAdapter: Adapter = {
+  definition: claudeDefinition,
   id: 'claude-code',
   binaryName: 'claude',
 
@@ -442,10 +534,8 @@ export const claudeAdapter: Adapter = {
     // `.claude.json` mcpServers, so they are correctly excluded from the match set.
     const viewServers = await readViewMcpServerNames(viewRoot);
 
-    const res = await ctx.capture(bin, ['mcp', 'list'], {
-      ...ctx.env,
-      ...overrideEnv(viewRoot),
-    });
+    const launch = renderSessionLaunch(claudeDefinition, viewRoot, ['mcp', 'list']);
+    const res = await ctx.capture(bin, launch.args, { ...ctx.env, ...launch.env });
     const out = `${res.stdout}\n${res.stderr}`;
 
     if (viewServers.length === 0) {
@@ -468,10 +558,10 @@ export const claudeAdapter: Adapter = {
   },
 };
 
-/** Read the top-level `mcpServers` names from a view's `.claude.json` (empty on any error). */
+/** Read the top-level `mcpServers` names from a view's explicit `.mcp.json`. */
 async function readViewMcpServerNames(viewRoot: string): Promise<string[]> {
   try {
-    const raw = await readFile(join(viewRoot, '.claude.json'), 'utf8');
+    const raw = await readFile(join(viewRoot, '.mcp.json'), 'utf8');
     const parsed = JSON.parse(raw) as { mcpServers?: Record<string, unknown> };
     return isObject(parsed.mcpServers) ? Object.keys(parsed.mcpServers) : [];
   } catch {

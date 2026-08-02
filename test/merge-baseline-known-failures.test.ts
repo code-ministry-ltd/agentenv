@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { adoptSweep, snapshotInventory } from '../src/adopt.js';
 import { claudeAdapter } from '../src/adapters/claude.js';
 import { codexAdapter } from '../src/adapters/codex.js';
+import { renderSessionLaunch } from '../src/adapter-v2.js';
 import { run } from '../src/cli.js';
 import { resolvePaths } from '../src/paths.js';
 import { composeView } from '../src/session/composer.js';
@@ -33,17 +34,14 @@ function seedSkill(th: TempHome, envName = 'writing'): void {
 }
 
 describe('merge baseline — accepted known failures', () => {
-  it.fails('Claude sessions use launch arguments and never relocate the config root', () => {
-    const launch = (
-      claudeAdapter as unknown as {
-        sessionLaunch?: (root: string, args: readonly string[]) => {
-          args: readonly string[];
-          env: NodeJS.ProcessEnv;
-        };
-      }
-    ).sessionLaunch?.('/private/view', ['--model', 'sonnet']);
+  it('Claude sessions use launch arguments and never relocate the config root', () => {
+    const launch = renderSessionLaunch(
+      claudeAdapter.definition!,
+      '/private/view',
+      ['--model', 'sonnet'],
+    );
 
-    expect(claudeAdapter.overrideEnv('/private/view')).not.toHaveProperty('CLAUDE_CONFIG_DIR');
+    expect(launch.env).not.toHaveProperty('CLAUDE_CONFIG_DIR');
     expect(launch).toEqual({
       args: [
         '--add-dir=/private/view',

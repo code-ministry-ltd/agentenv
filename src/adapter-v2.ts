@@ -16,6 +16,10 @@ export type ModeSurface =
       writer: SurfaceWriter;
       hotReload?: boolean;
       adopt?: boolean;
+      /** Whether session composition layers the user's real surface into the view. */
+      inheritUserContent?: boolean;
+      /** Per-mode mechanism override (Claude instructions differ by mode). */
+      composition?: SurfaceComposition;
     }
   | { supported: false; reason: string };
 

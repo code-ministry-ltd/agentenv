@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import {
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -220,6 +221,7 @@ describe('round-trip integrity (spec criterion 1) — session variant', () => {
     seedLivedInClaude(h);
     const envDir = paths.envDir('writing');
     seedWritingEnv(envDir);
+    writeFileSync(join(envDir, 'instructions', 'base.md'), '# session instructions\n');
     // A project dir the session binds to — part of the stable baseline (it never
     // changes across the session, so it stays inside the byte-identity guarantee).
     const session = 'sh-1';
@@ -253,38 +255,32 @@ describe('round-trip integrity (spec criterion 1) — session variant', () => {
     // The real home is byte-identical after compose — the view lives under live/.
     expect(hashTree(h.home, exclude)).toBe(step0);
 
-    // Bucket 1 (login pass-through): .credentials.json is a symlink to the real file.
-    expect(lstatSync(join(view, '.credentials.json')).isSymbolicLink()).toBe(true);
-    expect(readlinkSync(join(view, '.credentials.json'))).toBe(
-      join(h.claudeHome, '.credentials.json'),
-    );
-    // CLAUDE.md and other non-surface state also pass through (bucket 1).
-    expect(readlinkSync(join(view, 'CLAUDE.md'))).toBe(join(h.claudeHome, 'CLAUDE.md'));
-    expect(readlinkSync(join(view, 'projects'))).toBe(join(h.claudeHome, 'projects'));
+    // Claude's additional-directory view contains no auth or static real-root
+    // links: the child keeps the real config/Keychain layer active independently.
+    expect(existsSync(join(view, '.credentials.json'))).toBe(false);
+    expect(existsSync(join(view, 'projects'))).toBe(false);
 
-    // Bucket 2 — skills: env's unique skill symlinks to the STORE (write-through);
-    // the collision resolves to the USER's real skill; the foreign symlink is
-    // represented by its real PATH (never un-followed, never rewritten).
-    expect(readlinkSync(join(view, 'skills', 'draft-helper'))).toBe(
+    // Environment skills are private and write through to the store. A same-named
+    // user skill remains in the real layer; agentenv does not copy or rewrite it.
+    expect(readlinkSync(join(view, '.claude', 'skills', 'draft-helper'))).toBe(
       join(envDir, 'skills', 'draft-helper'),
     );
-    expect(readlinkSync(join(view, 'skills', 'shared-skill'))).toBe(
-      join(h.claudeHome, 'skills', 'shared-skill'),
+    expect(readlinkSync(join(view, '.claude', 'skills', 'shared-skill'))).toBe(
+      join(envDir, 'skills', 'shared-skill'),
     );
-    expect(readlinkSync(join(view, 'skills', 'vendor-linked'))).toBe(foreignLink);
-    expect(composed.skipped.some((s) => s.detail.includes('shared-skill'))).toBe(true);
+    expect(existsSync(join(view, '.claude', 'skills', 'vendor-linked'))).toBe(false);
+    expect(readlinkSync(foreignLink)).toBe(foreignTarget);
 
-    // Bucket 2 — instructions land in rules/ as a symlink beside the user's rule.
-    expect(readlinkSync(join(view, 'rules', 'writing-rules.md'))).toBe(
-      join(envDir, 'instructions', 'writing-rules.md'),
-    );
+    // Additional-directory instructions are a generated CLAUDE.md.
+    expect(readFileSync(join(view, 'CLAUDE.md'), 'utf8')).toContain('session instructions');
 
-    // Bucket 2 — .claude.json seeded from the real file with the env server injected.
-    const viewCfg = JSON.parse(readFileSync(join(view, '.claude.json'), 'utf8'));
-    expect(Object.keys(viewCfg.mcpServers).sort()).toEqual(['context7', 'linear']);
+    // Explicit MCP config contains only the environment server. The user's real
+    // ~/.claude.json remains active as a separate native layer.
+    const viewCfg = JSON.parse(readFileSync(join(view, '.mcp.json'), 'utf8'));
+    expect(Object.keys(viewCfg.mcpServers)).toEqual(['linear']);
 
     // --- Simulate a session: a WRITE-THROUGH edit to a bucket-2 managed item. ---
-    const draftSkill = join(view, 'skills', 'draft-helper', 'SKILL.md');
+    const draftSkill = join(view, '.claude', 'skills', 'draft-helper', 'SKILL.md');
     writeFileSync(draftSkill, '# draft helper (edited mid-session)\n');
     // The edit wrote THROUGH to the store, not the real home.
     expect(readFileSync(join(envDir, 'skills', 'draft-helper', 'SKILL.md'), 'utf8')).toBe(
@@ -292,12 +288,10 @@ describe('round-trip integrity (spec criterion 1) — session variant', () => {
     );
     expect(hashTree(h.home, exclude)).toBe(step0); // real home still byte-identical
 
-    // --- Discard rule (D15): a write to LAYERED USER content in a generated file. ---
-    // An agent grants a trust approval mid-session by editing the view's .claude.json
-    // (a discardable private copy seeded from the real file). This drift is NOT
-    // written back — it dies with the view. The real file must never see it.
-    viewCfg.projects['/tmp/session-trust'] = { hasTrustDialogAccepted: true };
-    writeFileSync(join(view, '.claude.json'), `${JSON.stringify(viewCfg, null, 2)}\n`);
+    // An unrelated edit to the derived explicit MCP file dies with the view and
+    // can never alter the user's real internal config.
+    viewCfg.sessionOnly = true;
+    writeFileSync(join(view, '.mcp.json'), `${JSON.stringify(viewCfg, null, 2)}\n`);
     expect(readFileSync(join(h.claudeHome, '.claude.json'), 'utf8')).toBe(realClaudeJson);
     expect(hashTree(h.home, exclude)).toBe(step0);
 

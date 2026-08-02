@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { validateAdapter, type ConfigKeysSurface, type SelfCheckContext } from '../src/adapter.js';
+import { renderSessionLaunch } from '../src/adapter-v2.js';
 import { claudeAdapter } from '../src/adapters/claude.js';
 import type { JsonValue } from '../src/config-keys.js';
 import { driftKinds } from './helpers.js';
@@ -33,12 +34,20 @@ describe('adapter.claude — identity & declarations', () => {
     expect(validateAdapter(claudeAdapter)).toBeNull();
   });
 
-  it('declares Claude identity and the config-root override', () => {
+  it('declares Claude identity and the additional-directory session launch', () => {
     expect(claudeAdapter.id).toBe('claude-code');
     expect(claudeAdapter.binaryName).toBe('claude');
     expect(claudeAdapter.sessionSupported).toBe(true);
-    expect(claudeAdapter.configRootEnv).toBe('CLAUDE_CONFIG_DIR');
-    expect(claudeAdapter.overrideEnv('/v/root')).toEqual({ CLAUDE_CONFIG_DIR: '/v/root' });
+    expect(claudeAdapter.definition).toBeDefined();
+    expect(renderSessionLaunch(claudeAdapter.definition!, '/v/root', ['--model', 'sonnet'])).toEqual({
+      args: [
+        '--add-dir=/v/root',
+        '--mcp-config=/v/root/.mcp.json',
+        '--model',
+        'sonnet',
+      ],
+      env: { CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1' },
+    });
   });
 
   it('realConfigRoot honours a set CLAUDE_CONFIG_DIR, else ~/.claude', () => {
@@ -249,10 +258,10 @@ describe('adapter.claude — describeConfigKeysDrift (report only, store untouch
 });
 
 describe('adapter.claude — selfCheck (injected capture, no real harness)', () => {
-  /** A view dir with an authored `.claude.json` mcpServers set. */
+  /** A view dir with an authored explicit `.mcp.json` mcpServers set. */
   function viewWith(servers: Record<string, unknown>): string {
     const view = tmp();
-    writeFileSync(join(view, '.claude.json'), JSON.stringify({ mcpServers: servers }));
+    writeFileSync(join(view, '.mcp.json'), JSON.stringify({ mcpServers: servers }));
     return view;
   }
 
@@ -271,19 +280,28 @@ describe('adapter.claude — selfCheck (injected capture, no real harness)', () 
     expect(await claudeAdapter.selfCheck(view, ctx)).toEqual({ ok: true });
   });
 
-  it('passes the CLAUDE_CONFIG_DIR override to the probe', async () => {
+  it('passes the additional-directory arguments and environment to the probe', async () => {
     const view = viewWith({ srv: {} });
     let seenEnv: NodeJS.ProcessEnv = {};
+    let seenArgs: readonly string[] = [];
     const ctx: SelfCheckContext = {
       resolveBinary: async () => '/fake/claude',
-      capture: async (_bin, _args, env) => {
+      capture: async (_bin, args, env) => {
+        seenArgs = args;
         seenEnv = env;
         return { code: 0, stdout: 'srv: ...\n', stderr: '' };
       },
       env: { EXISTING: '1' },
     };
     await claudeAdapter.selfCheck(view, ctx);
-    expect(seenEnv.CLAUDE_CONFIG_DIR).toBe(view);
+    expect(seenArgs).toEqual([
+      `--add-dir=${view}`,
+      `--mcp-config=${join(view, '.mcp.json')}`,
+      'mcp',
+      'list',
+    ]);
+    expect(seenEnv.CLAUDE_CONFIG_DIR).toBeUndefined();
+    expect(seenEnv.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD).toBe('1');
     expect(seenEnv.EXISTING).toBe('1');
   });
 
@@ -309,7 +327,7 @@ describe('adapter.claude — selfCheck (injected capture, no real harness)', () 
   });
 
   it('with no view servers, falls back to a mechanism check on the exit code', async () => {
-    const view = tmp(); // no .claude.json → zero declared servers
+    const view = tmp(); // no .mcp.json → zero declared servers
     expect(await claudeAdapter.selfCheck(view, ctxCapturing('No MCP servers configured.', 0))).toEqual({
       ok: true,
     });

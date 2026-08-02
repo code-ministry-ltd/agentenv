@@ -19,7 +19,7 @@ or specifications is recorded as behavioral provenance rather than copied code.
 | Area | Selected behavior or primitive | Source | Incorporation | Status |
 |---|---|---|---|---|
 | Filesystem, backups, lock, Git runner, parsers | Retain the CM safety primitives behind new command-level contracts | CM | Existing Apache-2.0 code | Retained |
-| Claude session | Additional directory, explicit MCP file, and additional-directory instruction environment; never default to `CLAUDE_CONFIG_DIR` | JJ `src/adapters/claude.ts` | Behavioral reimplementation with CM probe/compiler | Pending |
+| Claude session | Additional directory, explicit MCP file, and additional-directory instruction environment; never default to `CLAUDE_CONFIG_DIR` | JJ `src/adapters/claude.ts` | Behavioral reimplementation with CM probe/compiler | Implemented |
 | Claude global | Top-level `~/.claude.json`, shared skills/rules, canonical persistence | JJ `src/adapters/claude.ts` | Behavioral reimplementation | Pending |
 | Codex | Shared skills, commands-as-skills, child environment, persistence | JJ adapter and tests | Behavioral reimplementation with CM TOML/probe/compiler | Pending |
 | OpenCode | `XDG_CONFIG_HOME` plus `OPENCODE_CONFIG_DIR` isolation | CM adapter and live fixture | Existing Apache-2.0 code | Retained |
@@ -33,7 +33,8 @@ or specifications is recorded as behavioral provenance rather than copied code.
 
 Vitest `test.fails` cases are intentional executable characterizations: the suite
 passes while the documented defect remains and fails if a test unexpectedly starts
-passing. The marker is removed in the same slice that implements the behavior.
+passing. The marker is removed in the same slice that implements the behavior,
+leaving the case as a normal regression test.
 
 | Defect or retained safeguard | Executable evidence at the pinned CM base |
 |---|---|

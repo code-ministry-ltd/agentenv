@@ -21,6 +21,7 @@ import {
   type ConfigKeysInjection,
   type SurfaceDeclaration,
 } from '../adapter.js';
+import type { SurfaceComposition } from '../adapter-v2.js';
 import type { JsonValue } from '../config-keys.js';
 import { renderConfigKeysDriftReport } from '../drift.js';
 import { appendRegion, closeMarker, openMarker } from '../file-block.js';
@@ -167,8 +168,9 @@ export async function composeView(req: ComposeRequest): Promise<ComposeResult> {
     // config-keys surfaces are GROUPED by target file so a file shared by several
     // surfaces is seeded once and written once — composing them per-surface would
     // re-seed and re-write, clobbering earlier surfaces' injections (H4).
-    const configKeysByFile = new Map<string, ConfigKeysSurfaceDecl[]>();
-    for (const surface of adapter.surfaces) {
+    const configKeysByFile = new Map<string, SessionSurfacePlan[]>();
+    for (const plan of sessionSurfacePlans(adapter)) {
+      const { surface } = plan;
       if (!surface.supported) {
         skipped.push({
           surfaceId: surface.id,
@@ -179,11 +181,11 @@ export async function composeView(req: ComposeRequest): Promise<ComposeResult> {
       }
       if (surface.mechanism === 'config-keys') {
         const group = configKeysByFile.get(surface.rootRelativePath);
-        if (group) group.push(surface);
-        else configKeysByFile.set(surface.rootRelativePath, [surface]);
+        if (group) group.push(plan);
+        else configKeysByFile.set(surface.rootRelativePath, [plan]);
         continue;
       }
-      await composeSurface(req, buildDir, surface, skipped, onWarn);
+      await composeSurface(req, buildDir, plan, skipped, onWarn);
     }
     for (const group of configKeysByFile.values()) {
       await composeConfigKeysFile(req, buildDir, group, skipped, onWarn);
@@ -207,6 +209,12 @@ export async function composeView(req: ComposeRequest): Promise<ComposeResult> {
 
 async function composeBucketOne(req: ComposeRequest, buildDir: string): Promise<void> {
   const { adapter, realConfigRoot } = req;
+  // An argument-based additional view (Claude) leaves the real config/auth layer
+  // active in the child, so copying or linking config-root state into the view is
+  // both unnecessary and an isolation/auth regression.
+  if (adapter.definition?.session.supported && !adapter.definition.session.launch.rootOverride) {
+    return;
+  }
   const isGloballyOwned = req.isGloballyOwned ?? (() => false);
 
   // The top-level names every surface targets. A surface target is bucket-2
@@ -245,18 +253,75 @@ function topLevelSegment(rel: string): string {
 /** A config-keys surface, narrowed from the discriminated union. */
 type ConfigKeysSurfaceDecl = Extract<SurfaceDeclaration, { mechanism: 'config-keys' }>;
 
+interface SessionSurfacePlan {
+  /** Session-mode declaration with its explicit view-relative destination. */
+  surface: SurfaceDeclaration;
+  /** V1 declaration still identifies the user's real source path. */
+  source: SurfaceDeclaration;
+  inheritUserContent: boolean;
+}
+
+function declarationForSession(
+  adapter: Adapter,
+  source: SurfaceDeclaration,
+): SessionSurfacePlan {
+  const logical = adapter.definition?.surfaces.find((surface) => surface.id === source.id);
+  if (!logical) return { surface: source, source, inheritUserContent: true };
+  const mode = logical.session;
+  if (!mode.supported) {
+    return {
+      source,
+      inheritUserContent: false,
+      surface: { ...source, supported: false, unsupportedReason: mode.reason },
+    };
+  }
+  if (mode.destination.root !== 'view') {
+    throw new Error(`session surface '${source.id}' must target the view root`);
+  }
+  const common = {
+    id: source.id,
+    storeKind: source.storeKind,
+    supported: true as const,
+    rootRelativePath: mode.destination.relativePath,
+  };
+  const composition: SurfaceComposition = mode.composition ?? logical.composition;
+  let surface: SurfaceDeclaration;
+  if (composition.mechanism === 'dir-merge') {
+    surface = { ...common, mechanism: 'dir-merge', ...(composition.mode ? { mode: composition.mode } : {}) };
+  } else if (composition.mechanism === 'file-block') {
+    surface = { ...common, mechanism: 'file-block', layering: composition.layering };
+  } else {
+    surface = {
+      ...common,
+      mechanism: 'config-keys',
+      format: composition.format,
+      style: composition.style,
+      keyPath: composition.keyPath,
+      ...(composition.substitutePlaceholders ? { substitutePlaceholders: true } : {}),
+    };
+  }
+  return { surface, source, inheritUserContent: mode.inheritUserContent ?? true };
+}
+
+function sessionSurfacePlans(adapter: Adapter): SessionSurfacePlan[] {
+  return adapter.surfaces.map((surface) => declarationForSession(adapter, surface));
+}
+
 async function composeSurface(
   req: ComposeRequest,
   buildDir: string,
-  surface: Extract<SurfaceDeclaration, { mechanism: 'dir-merge' | 'file-block' }>,
+  plan: SessionSurfacePlan,
   skipped: SurfaceSkip[],
   onWarn: (m: string) => void,
 ): Promise<void> {
+  const surface = plan.surface;
   switch (surface.mechanism) {
     case 'dir-merge':
-      return composeDirMerge(req, buildDir, surface, skipped, onWarn);
+      return composeDirMerge(req, buildDir, plan, skipped, onWarn);
     case 'file-block':
-      return composeFileBlock(req, buildDir, surface);
+      return composeFileBlock(req, buildDir, plan);
+    case 'config-keys':
+      throw new Error(`config-keys surface '${surface.id}' was not grouped`);
   }
 }
 
@@ -268,10 +333,12 @@ async function composeSurface(
 async function composeDirMerge(
   req: ComposeRequest,
   buildDir: string,
-  surface: Extract<SurfaceDeclaration, { mechanism: 'dir-merge' }>,
+  plan: SessionSurfacePlan,
   skipped: SurfaceSkip[],
   onWarn: (m: string) => void,
 ): Promise<void> {
+  const surface = plan.surface;
+  if (surface.mechanism !== 'dir-merge') throw new Error('expected dir-merge surface');
   const { paths, envs, realConfigRoot } = req;
   const targetDir = join(buildDir, surface.rootRelativePath);
   await mkdir(targetDir, { recursive: true });
@@ -283,9 +350,12 @@ async function composeDirMerge(
   };
 
   // 1. The user's real items win every collision (D7).
-  const realDir = join(realConfigRoot, surface.rootRelativePath);
-  for (const name of await listNames(realDir)) {
-    await place(name, join(realDir, name));
+  if (plan.inheritUserContent) {
+    const sourcePath = surfaceRootRelativePath(plan.source);
+    const realDir = join(realConfigRoot, sourcePath);
+    for (const name of await listNames(realDir)) {
+      await place(name, join(realDir, name));
+    }
   }
 
   // 2. Env items, reversed so a LATER env in the stack wins an EARLIER one (D5).
@@ -312,10 +382,14 @@ async function composeDirMerge(
 async function composeFileBlock(
   req: ComposeRequest,
   buildDir: string,
-  surface: Extract<SurfaceDeclaration, { mechanism: 'file-block' }>,
+  plan: SessionSurfacePlan,
 ): Promise<void> {
+  const surface = plan.surface;
+  if (surface.mechanism !== 'file-block') throw new Error('expected file-block surface');
   const { paths, adapter, envs, realConfigRoot } = req;
-  const userContent = await readFileOrEmpty(join(realConfigRoot, surface.rootRelativePath));
+  const userContent = plan.inheritUserContent
+    ? await readFileOrEmpty(join(realConfigRoot, surfaceRootRelativePath(plan.source)))
+    : '';
 
   const regions: string[] = [];
   for (const env of envs) {
@@ -363,27 +437,33 @@ async function instructionSources(
 async function composeConfigKeysFile(
   req: ComposeRequest,
   buildDir: string,
-  surfaces: readonly ConfigKeysSurfaceDecl[],
+  plans: readonly SessionSurfacePlan[],
   skipped: SurfaceSkip[],
   onWarn: (m: string) => void,
 ): Promise<void> {
   const { paths, adapter, envs, realConfigRoot } = req;
-  const file = surfaces[0]!.rootRelativePath;
-  const format = surfaces[0]!.format;
+  const first = plans[0]!;
+  const firstSurface = first.surface;
+  if (firstSurface.mechanism !== 'config-keys') throw new Error('expected config-keys surface');
+  const file = firstSurface.rootRelativePath;
+  const format = firstSurface.format;
 
   // Secrets resolver for the substitute rung (D6): secrets.env first, then the
   // launching shell's env. The private view is derived and never synced, so a
   // resolved literal here reaches only the ephemeral view — never the store.
   const resolver = await loadResolver(paths, req.env ?? process.env);
 
-  const seedText = await readFileOrEmpty(join(realConfigRoot, file));
+  const sourceFile = join(realConfigRoot, surfaceRootRelativePath(first.source));
+  const seedText = first.inheritUserContent ? await readFileOrEmpty(sourceFile) : '';
   const seed = parseConfigDoc(format, seedText);
   const userSnapshot = structuredClone(seed);
   // Which env last set each keyed path, so a later env overriding an earlier one
   // records a skip that NAMES the loser (L2 / D5), as dir-merge already does.
   const keyedOwner = new Map<string, string>();
 
-  for (const surface of surfaces) {
+  for (const plan of plans) {
+    const surface = plan.surface;
+    if (surface.mechanism !== 'config-keys') throw new Error('expected config-keys surface');
     for (const env of envs) {
       let injections: ConfigKeysInjection[];
       try {
@@ -413,7 +493,17 @@ async function composeConfigKeysFile(
             // session user learns it from the launch rather than never (the private view
             // is rebuilt from canonical every launch, so nothing else would surface it).
             // Reporting only: `mcp/servers.yaml` is not touched here either.
-            await reportUserValueDrift(req, surface, env, inj.keyPath, userValue.value, onWarn);
+            if (plan.inheritUserContent) {
+              await reportUserValueDrift(
+                req,
+                surface,
+                sourceFile,
+                env,
+                inj.keyPath,
+                userValue.value,
+                onWarn,
+              );
+            }
             continue;
           }
           // Resolve substitute-rung placeholders; unresolved → fail closed per server.
@@ -469,6 +559,7 @@ async function composeConfigKeysFile(
 async function reportUserValueDrift(
   req: ComposeRequest,
   surface: ConfigKeysSurfaceDecl,
+  configFile: string,
   env: string,
   keyPath: readonly (string | number)[],
   userValue: unknown,
@@ -489,7 +580,7 @@ async function reportUserValueDrift(
       renderConfigKeysDriftReport({
         adapterId: req.adapter.id,
         surfaceId: surface.id,
-        configFile: join(req.realConfigRoot, surface.rootRelativePath),
+        configFile,
         ownerEnv: env,
         canonicalFile: join(envContentDir, report.storeRelativePath),
         report,
