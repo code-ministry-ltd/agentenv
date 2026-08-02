@@ -68,7 +68,7 @@ describe('merge baseline — accepted known failures', () => {
     expect((await readState(paths)).globalStack).toEqual([]);
   });
 
-  it.fails('a session view generation records its complete launch-time inventory', async () => {
+  it('a session view generation records its complete launch-time inventory', async () => {
     const th = home();
     const paths = resolvePaths(th.env);
     const realRoot = join(th.home, 'fixture-real');
@@ -87,7 +87,16 @@ describe('merge baseline — accepted known failures', () => {
     const meta = JSON.parse(
       readFileSync(join(paths.live, 'session-1', 'fixture.meta.json'), 'utf8'),
     ) as Record<string, unknown>;
-    expect(Object.keys(meta).some((key) => /inventor/i.test(key))).toBe(true);
+    expect(meta.inventory).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          surfaceId: 'skills',
+          mechanism: 'dir-merge',
+          path: join(paths.live, 'session-1', 'fixture', 'skills'),
+          baseline: ['w-skill'],
+        }),
+      ]),
+    );
   });
 
   it.fails('a deactivated but still-existing environment is not a valid adoption owner', async () => {

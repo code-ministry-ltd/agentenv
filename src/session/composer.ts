@@ -48,7 +48,7 @@ import { loadResolver, substituteSecretFields } from '../secrets.js';
  */
 
 /** Bump to force every view to rebuild when the composition logic changes. */
-const COMPOSER_VERSION = 1;
+const COMPOSER_VERSION = 2;
 
 /** A surface the composer did not fully apply, surfaced to `status` (D6/D7). */
 export interface SurfaceSkip {
@@ -114,6 +114,18 @@ interface ViewMeta {
   generation: number;
   builtAt: number;
   viewRoot: string;
+  inventory: ViewInventoryEntry[];
+}
+
+/** Complete launch-time identity of one supported logical surface in a generation. */
+export interface ViewInventoryEntry {
+  surfaceId: string;
+  storeKind: SurfaceDeclaration['storeKind'];
+  mechanism: SurfaceDeclaration['mechanism'];
+  path: string;
+  /** Item names for directories; a content signature for files. */
+  baseline: string[] | string;
+  ownerEnv: string | null;
 }
 
 const rand = (): string => randomBytes(6).toString('hex');
@@ -190,17 +202,42 @@ export async function composeView(req: ComposeRequest): Promise<ComposeResult> {
     for (const group of configKeysByFile.values()) {
       await composeConfigKeysFile(req, buildDir, group, skipped, onWarn);
     }
+    const inventory = await captureViewInventory(req, buildDir, viewRoot);
     await publishAtomically(sessionDir, adapter.id, buildDir, viewRoot);
+
+    const generation = (prevMeta?.generation ?? 0) + 1;
+    const meta: ViewMeta = { fingerprint, generation, builtAt: now(), viewRoot, inventory };
+    await writeFileAtomic(metaPath, `${JSON.stringify(meta, null, 2)}\n`);
+    return { viewRoot, rebuilt: true, fingerprint, generation, skipped };
   } catch (err) {
     await rm(buildDir, { recursive: true, force: true });
     throw err;
   }
+}
 
-  const generation = (prevMeta?.generation ?? 0) + 1;
-  const meta: ViewMeta = { fingerprint, generation, builtAt: now(), viewRoot };
-  await writeFileAtomic(metaPath, `${JSON.stringify(meta, null, 2)}\n`);
-
-  return { viewRoot, rebuilt: true, fingerprint, generation, skipped };
+async function captureViewInventory(
+  req: ComposeRequest,
+  buildDir: string,
+  viewRoot: string,
+): Promise<ViewInventoryEntry[]> {
+  const inventory: ViewInventoryEntry[] = [];
+  for (const plan of sessionSurfacePlans(req.adapter)) {
+    const surface = plan.surface;
+    if (!surface.supported) continue;
+    const buildPath = join(buildDir, surface.rootRelativePath);
+    inventory.push({
+      surfaceId: surface.id,
+      storeKind: surface.storeKind,
+      mechanism: surface.mechanism,
+      path: join(viewRoot, surface.rootRelativePath),
+      baseline:
+        surface.mechanism === 'dir-merge'
+          ? await listNames(buildPath)
+          : await fileSignature(buildPath),
+      ownerEnv: req.envs.at(-1) ?? null,
+    });
+  }
+  return inventory;
 }
 
 // ---------------------------------------------------------------------------
