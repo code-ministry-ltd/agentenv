@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { backup } from '../src/backups.js';
 import { run } from '../src/cli.js';
 import { resolvePaths } from '../src/paths.js';
-import { readState, writeState, type JournalEntry, type StateManifest } from '../src/state.js';
+import { emptyManifest, readState, writeState, type JournalEntry, type StateManifest } from '../src/state.js';
 import { makeTempHome, type TempHome } from './helpers.js';
 
 const homes: TempHome[] = [];
@@ -46,7 +46,7 @@ async function seedPendingJournal(th: TempHome): Promise<{ marker: string }> {
     },
     undo: { path: marker, backupRef: undoRef },
   };
-  const manifest: StateManifest = { version: '1.0', items: [], journal: [entry] };
+  const manifest: StateManifest = { ...emptyManifest(), journal: [entry] };
   await writeState(paths, manifest);
   return { marker };
 }

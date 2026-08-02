@@ -51,6 +51,13 @@ describe('state manifest', () => {
         version: STATE_SCHEMA_VERSION_STRING,
         items: [],
         journal: null,
+        commands: [],
+        generations: [],
+        globalProjections: [],
+        projectionRecords: [],
+        candidates: [],
+        quarantine: [],
+        migration: null,
       });
     });
 
@@ -81,6 +88,27 @@ describe('state manifest', () => {
       await writeState(p, manifest);
       const reloaded = await readState(p);
       expect(reloaded.version).toBe(STATE_SCHEMA_VERSION_STRING);
+    });
+
+    it('reads CM v1 state into v2 defaults and upgrades it only on write', async () => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({
+          version: '1.0',
+          items: [symlinkItem()],
+          globalStack: ['work'],
+        }),
+      );
+
+      const legacy = await readState(p);
+      expect(legacy.version).toBe('1.0');
+      expect(legacy.commands).toEqual([]);
+      expect(legacy.generations).toEqual([]);
+      expect(legacy.globalStack).toEqual(['work']);
+
+      await writeState(p, legacy);
+      expect((await readState(p)).version).toBe(STATE_SCHEMA_VERSION_STRING);
     });
 
     it('omits an empty journal from disk', async () => {
@@ -214,6 +242,43 @@ describe('state manifest', () => {
       );
       const manifest = await readState(p);
       expect(manifest.journal).toHaveLength(1);
+    });
+  });
+
+  describe('schema-v2 lifecycle validation', () => {
+    it('rejects a malformed durable command before it can reach a mutating path', async () => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({
+          version: STATE_SCHEMA_VERSION_STRING,
+          items: [],
+          commands: [{
+            schemaVersion: 2,
+            transactionId: 'tx',
+            kind: 'activate-global',
+            phase: 'teleported',
+            commitPoint: false,
+            operations: [],
+          }],
+        }),
+      );
+
+      await expect(readState(p)).rejects.toThrow(/commands.*phase/i);
+    });
+
+    it('rejects a lifecycle record from a different schema major', async () => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({
+          version: STATE_SCHEMA_VERSION_STRING,
+          items: [],
+          candidates: [{ schemaVersion: 3, id: 'candidate-1' }],
+        }),
+      );
+
+      await expect(readState(p)).rejects.toThrow(/candidates.*schemaVersion/i);
     });
   });
 

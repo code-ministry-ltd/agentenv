@@ -19,6 +19,7 @@ import { beginTransaction } from '../src/journal.js';
 import { withLock } from '../src/lock.js';
 import { resolvePaths, type Paths } from '../src/paths.js';
 import {
+  emptyManifest,
   readState,
   writeState,
   type JournalEntry,
@@ -123,7 +124,7 @@ async function crashWith(
   journal: JournalEntry[],
   items: ManifestItem[] = [],
 ): Promise<void> {
-  const manifest: StateManifest = { version: '1.0', items, journal };
+  const manifest: StateManifest = { ...emptyManifest(), items, journal };
   await writeState(paths, manifest);
 }
 

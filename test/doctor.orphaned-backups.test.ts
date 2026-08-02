@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { backup } from '../src/backups.js';
 import { run } from '../src/cli.js';
 import { resolvePaths } from '../src/paths.js';
-import { writeState, type ManifestItem, type StateManifest } from '../src/state.js';
+import { emptyManifest, writeState, type ManifestItem, type StateManifest } from '../src/state.js';
 import { makeTempHome, type TempHome } from './helpers.js';
 
 const homes: TempHome[] = [];
@@ -60,7 +60,7 @@ async function seed(th: TempHome): Promise<{ orphan: string; referenced: string 
     ownerEnv: 'writing',
     backupRef: referencedRef,
   } as unknown as ManifestItem;
-  const manifest: StateManifest = { version: '1.0', items: [item], journal: null };
+  const manifest: StateManifest = { ...emptyManifest(), items: [item] };
   await writeState(paths, manifest);
 
   return {

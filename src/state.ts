@@ -1,8 +1,14 @@
 import { readFile } from 'node:fs/promises';
+import type { CommandPlan, OperationState } from './command-plan.js';
+import type { GlobalProjection } from './global-projection.js';
+import type { MigrationState } from './migration-state.js';
 import type { BackupRef } from './backups.js';
 import { writeFileAtomic } from './fs-atomic.js';
 import type { Paths } from './paths.js';
+import { validateProjectionRecord, type ProjectionRecord } from './projection.js';
 import { parseVersion } from './schema-version.js';
+import type { SyncCandidate } from './sync-candidate.js';
+import type { ViewGeneration } from './view-generation.js';
 
 /**
  * The state.json schema version this CLI understands, as {major, minor}.
@@ -12,7 +18,7 @@ import { parseVersion } from './schema-version.js';
  * same way env.yaml does (design D4): unknown fields and a newer MINOR load; a
  * newer MAJOR is refused with an upgrade message, not a cryptic schema error.
  */
-export const STATE_SCHEMA_VERSION = { major: 1, minor: 0 } as const;
+export const STATE_SCHEMA_VERSION = { major: 2, minor: 0 } as const;
 export const STATE_SCHEMA_VERSION_STRING = `${STATE_SCHEMA_VERSION.major}.${STATE_SCHEMA_VERSION.minor}`;
 
 /**
@@ -115,7 +121,25 @@ export interface StateManifest {
   version: string;
   items: ManifestItem[];
   journal: JournalEntry[] | null;
+  commands: CommandPlan[];
+  generations: ViewGeneration[];
+  globalProjections: GlobalProjection[];
+  projectionRecords: ProjectionRecord[];
+  candidates: SyncCandidate[];
+  quarantine: QuarantineRecord[];
+  migration: MigrationState | null;
   [key: string]: unknown;
+}
+
+export interface QuarantineRecord {
+  schemaVersion: 2;
+  id: string;
+  kind: string;
+  path: string;
+  retainedPath: string;
+  reason: string;
+  createdAt: number;
+  resolved: boolean;
 }
 
 function normaliseStateVersion(raw: unknown, file: string): string {
@@ -151,6 +175,100 @@ function coerceItems(raw: unknown, file: string): ManifestItem[] {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function requireString(record: Record<string, unknown>, field: string, label: string): string | null {
+  return typeof record[field] === 'string' && record[field] !== ''
+    ? null
+    : `${label} requires '${field}'`;
+}
+
+function coerceVersionedRecords<T>(
+  raw: unknown,
+  field: string,
+  file: string,
+  validate: (record: Record<string, unknown>, label: string) => string | null,
+): T[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new StateError(`${file}: '${field}' must be an array`, file);
+  for (let index = 0; index < raw.length; index++) {
+    const record = raw[index];
+    const label = `${field}[${index}]`;
+    if (!isObject(record)) throw new StateError(`${file}: ${label} must be an object`, file);
+    if (record.schemaVersion !== 2) {
+      throw new StateError(`${file}: ${label}.schemaVersion must be 2`, file);
+    }
+    const invalid = validate(record, label);
+    if (invalid) throw new StateError(`${file}: ${invalid}`, file);
+  }
+  return raw as T[];
+}
+
+const COMMAND_PHASES = new Set(['planned', 'applying', 'committed', 'rolling-back', 'rolled-back']);
+const OPERATION_STATES = new Set<OperationState>(['pending', 'applying', 'applied', 'undoing', 'undone']);
+const GENERATION_PHASES = new Set(['building', 'published', 'closing', 'sweeping', 'swept', 'quarantined', 'collected']);
+const GLOBAL_PROJECTION_PHASES = new Set(['building', 'active', 'retired', 'reconciling', 'reconciled', 'quarantined', 'collected']);
+const CANDIDATE_PHASES = new Set(['fetched', 'validating', 'approved', 'deferred', 'rejected', 'promoting', 'promoted', 'abandoned']);
+const MIGRATION_PHASES = new Set(['planned', 'backing-up', 'backed-up', 'importing', 'imported', 'probing', 'opened', 'rolling-back', 'rolled-back']);
+
+function validateCommand(record: Record<string, unknown>, label: string): string | null {
+  const required = requireString(record, 'transactionId', label) ?? requireString(record, 'kind', label);
+  if (required) return required;
+  if (!COMMAND_PHASES.has(record.phase as string)) return `${label}.phase is invalid`;
+  if (typeof record.commitPoint !== 'boolean') return `${label}.commitPoint must be boolean`;
+  if (!Array.isArray(record.operations)) return `${label}.operations must be an array`;
+  for (const operation of record.operations) {
+    if (!isObject(operation) || typeof operation.id !== 'string' || typeof operation.kind !== 'string') {
+      return `${label}.operations contains an invalid operation`;
+    }
+    if (!OPERATION_STATES.has(operation.state as OperationState)) {
+      return `${label}.operations contains an invalid state`;
+    }
+  }
+  return null;
+}
+
+function validateGeneration(record: Record<string, unknown>, label: string): string | null {
+  const required = requireString(record, 'id', label);
+  if (required) return required;
+  if (!GENERATION_PHASES.has(record.phase as string)) return `${label}.phase is invalid`;
+  if (!Array.isArray(record.envs) || !Array.isArray(record.reservations) || !Array.isArray(record.leases)) {
+    return `${label} requires envs, reservations, and leases arrays`;
+  }
+  return null;
+}
+
+function validateGlobalProjection(record: Record<string, unknown>, label: string): string | null {
+  const required = requireString(record, 'id', label);
+  if (required) return required;
+  if (!GLOBAL_PROJECTION_PHASES.has(record.phase as string)) return `${label}.phase is invalid`;
+  if (!isObject(record.baseline) || !isObject(record.observed)) {
+    return `${label} requires baseline and observed identities`;
+  }
+  return null;
+}
+
+function validateCandidate(record: Record<string, unknown>, label: string): string | null {
+  const required = requireString(record, 'id', label) ?? requireString(record, 'ref', label) ?? requireString(record, 'worktree', label);
+  if (required) return required;
+  if (!CANDIDATE_PHASES.has(record.phase as string)) return `${label}.phase is invalid`;
+  if (!Array.isArray(record.blockers) || !Array.isArray(record.touchedCanonicalPaths)) {
+    return `${label} requires blockers and touchedCanonicalPaths arrays`;
+  }
+  return null;
+}
+
+function coerceMigration(raw: unknown, file: string): MigrationState | null {
+  if (raw === undefined || raw === null) return null;
+  if (!isObject(raw)) throw new StateError(`${file}: 'migration' must be an object or null`, file);
+  if (raw.schemaVersion !== 2) throw new StateError(`${file}: migration.schemaVersion must be 2`, file);
+  if (requireString(raw, 'id', 'migration') || !MIGRATION_PHASES.has(raw.phase as string)) {
+    throw new StateError(`${file}: migration id or phase is invalid`, file);
+  }
+  if (raw.gate !== 'closed' && raw.gate !== 'open') {
+    throw new StateError(`${file}: migration.gate is invalid`, file);
+  }
+  return raw as unknown as MigrationState;
 }
 
 /**
@@ -190,7 +308,18 @@ function coerceJournal(raw: unknown, file: string): JournalEntry[] | null {
 
 /** A fresh, empty manifest at the current schema version. */
 export function emptyManifest(): StateManifest {
-  return { version: STATE_SCHEMA_VERSION_STRING, items: [], journal: null };
+  return {
+    version: STATE_SCHEMA_VERSION_STRING,
+    items: [],
+    journal: null,
+    commands: [],
+    generations: [],
+    globalProjections: [],
+    projectionRecords: [],
+    candidates: [],
+    quarantine: [],
+    migration: null,
+  };
 }
 
 /**
@@ -226,7 +355,59 @@ export async function readState(paths: Paths): Promise<StateManifest> {
   const version = normaliseStateVersion(obj.version, file);
   const items = coerceItems(obj.items, file);
   const journal = coerceJournal(obj.journal, file);
-  return { ...obj, version, items, journal };
+  const commands = coerceVersionedRecords<CommandPlan>(obj.commands, 'commands', file, validateCommand);
+  const generations = coerceVersionedRecords<ViewGeneration>(
+    obj.generations,
+    'generations',
+    file,
+    validateGeneration,
+  );
+  const globalProjections = coerceVersionedRecords<GlobalProjection>(
+    obj.globalProjections,
+    'globalProjections',
+    file,
+    validateGlobalProjection,
+  );
+  const projectionRecords = coerceVersionedRecords<ProjectionRecord>(
+    obj.projectionRecords,
+    'projectionRecords',
+    file,
+    (record, label) => {
+      const invalid = validateProjectionRecord(record as unknown as ProjectionRecord);
+      return invalid ? `${label}: ${invalid}` : null;
+    },
+  );
+  const candidates = coerceVersionedRecords<SyncCandidate>(
+    obj.candidates,
+    'candidates',
+    file,
+    validateCandidate,
+  );
+  const quarantine = coerceVersionedRecords<QuarantineRecord>(
+    obj.quarantine,
+    'quarantine',
+    file,
+    (record, label) =>
+      requireString(record, 'id', label) ??
+      requireString(record, 'kind', label) ??
+      requireString(record, 'path', label) ??
+      requireString(record, 'retainedPath', label) ??
+      requireString(record, 'reason', label),
+  );
+  const migration = coerceMigration(obj.migration, file);
+  return {
+    ...obj,
+    version,
+    items,
+    journal,
+    commands,
+    generations,
+    globalProjections,
+    projectionRecords,
+    candidates,
+    quarantine,
+    migration,
+  };
 }
 
 /**
@@ -242,6 +423,13 @@ export async function writeState(paths: Paths, manifest: StateManifest): Promise
     ...manifest,
     version: STATE_SCHEMA_VERSION_STRING,
     items: manifest.items,
+    commands: manifest.commands,
+    generations: manifest.generations,
+    globalProjections: manifest.globalProjections,
+    projectionRecords: manifest.projectionRecords,
+    candidates: manifest.candidates,
+    quarantine: manifest.quarantine,
+    migration: manifest.migration,
   };
   if (manifest.journal && manifest.journal.length > 0) {
     out.journal = manifest.journal;
