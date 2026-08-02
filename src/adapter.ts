@@ -95,6 +95,8 @@ export interface DirMergeSurface extends SurfaceBase {
    * (Windows, OpenCode skills).
    */
   mode?: 'symlink' | 'copy';
+  /** Optional physical layout transform for command markdown exposed as skills. */
+  layout?: 'command-skill';
 }
 
 /**

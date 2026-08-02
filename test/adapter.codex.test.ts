@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { validateAdapter, type ConfigKeysSurface, type SelfCheckContext } from '../src/adapter.js';
+import { renderSessionLaunch } from '../src/adapter-v2.js';
 import { codexAdapter } from '../src/adapters/codex.js';
 import type { JsonValue } from '../src/config-keys.js';
 import { driftKinds } from './helpers.js';
@@ -33,26 +34,39 @@ describe('adapter.codex — identity & declarations', () => {
     expect(validateAdapter(codexAdapter)).toBeNull();
   });
 
-  it('declares Codex identity and the CODEX_HOME override', () => {
+  it('declares Codex identity and its v2 CODEX_HOME launch', () => {
     expect(codexAdapter.id).toBe('codex');
     expect(codexAdapter.binaryName).toBe('codex');
     expect(codexAdapter.sessionSupported).toBe(true);
     expect(codexAdapter.configRootEnv).toBe('CODEX_HOME');
     expect(codexAdapter.overrideEnv('/v/root')).toEqual({ CODEX_HOME: '/v/root' });
+    expect(codexAdapter.definition).toBeDefined();
+    expect(renderSessionLaunch(codexAdapter.definition!, '/v/root', ['--model', 'gpt-5'])).toEqual({
+      args: ['--model', 'gpt-5'],
+      env: { CODEX_HOME: '/v/root' },
+    });
   });
 
   it('realConfigRoot honours a set CODEX_HOME, else ~/.codex', () => {
     expect(codexAdapter.realConfigRoot({ CODEX_HOME: '/custom' })).toBe('/custom');
+    expect(codexAdapter.realConfigRoot({ HOME: '/fixture-home' })).toBe('/fixture-home/.codex');
     expect(codexAdapter.realConfigRoot({ CODEX_HOME: '   ' })).toMatch(/\.codex$/);
     expect(codexAdapter.realConfigRoot({})).toMatch(/\.codex$/);
   });
 
-  it('declares the three surfaces with the right mechanisms (D2 inline AGENTS.md, TOML MCP)', () => {
+  it('declares skills and commands-as-skills plus inline AGENTS.md and TOML MCP', () => {
     const byId = new Map(codexAdapter.surfaces.map((s) => [s.id, s]));
     expect(byId.get('skills')).toMatchObject({
       mechanism: 'dir-merge',
       rootRelativePath: 'skills',
       mode: 'symlink',
+      supported: true,
+    });
+    expect(byId.get('commands')).toMatchObject({
+      mechanism: 'dir-merge',
+      rootRelativePath: 'skills',
+      storeKind: 'commands',
+      layout: 'command-skill',
       supported: true,
     });
     // Instructions are a file-block on AGENTS.md in INLINE mode (Codex has no @import).
@@ -203,30 +217,22 @@ describe('adapter.codex — compileConfigKeys (MCP → native indirections, D6)'
     expect(inj.secretFields).toEqual({ url: 'https://x?key=${API_KEY}' });
   });
 
-  it('emits a trust entry keyed by the projectRoot when the launch has one (trust-gating)', async () => {
+  it('does not grant project trust automatically when a projectRoot is present', async () => {
     const dir = envWithServers('a:\n  transport: stdio\n  command: a-cmd\n');
     const out = await codexAdapter.compileConfigKeys(MCP_SURFACE, {
       envContentDir: dir,
       projectRoot: '/home/jim/repo',
     });
-    // The server injection plus the trust injection.
-    expect(out).toHaveLength(2);
-    const trust = out.find((i) => i.style === 'keyed' && i.keyPath[0] === 'projects');
-    expect(trust).toEqual({
-      style: 'keyed',
-      keyPath: ['projects', '/home/jim/repo'],
-      value: { trust_level: 'trusted' },
-    });
+    expect(out).toHaveLength(1);
+    expect(out.some((i) => i.style === 'keyed' && i.keyPath[0] === 'projects')).toBe(false);
   });
 
-  it('emits only a trust entry when projectRoot is set but no servers.yaml exists', async () => {
+  it('emits nothing when only projectRoot is set and no servers.yaml exists', async () => {
     const out = await codexAdapter.compileConfigKeys(MCP_SURFACE, {
       envContentDir: tmp(),
       projectRoot: '/repo',
     });
-    expect(out).toEqual([
-      { style: 'keyed', keyPath: ['projects', '/repo'], value: { trust_level: 'trusted' } },
-    ]);
+    expect(out).toEqual([]);
   });
 });
 

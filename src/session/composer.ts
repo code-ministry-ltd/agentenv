@@ -10,7 +10,7 @@ import {
   rm,
   symlink,
 } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, extname, join } from 'node:path';
 import { parse as parseJsonc } from 'jsonc-parser';
 import { parse as parseToml, stringify as stringifyToml } from 'smol-toml';
 import {
@@ -287,7 +287,12 @@ function declarationForSession(
   const composition: SurfaceComposition = mode.composition ?? logical.composition;
   let surface: SurfaceDeclaration;
   if (composition.mechanism === 'dir-merge') {
-    surface = { ...common, mechanism: 'dir-merge', ...(composition.mode ? { mode: composition.mode } : {}) };
+    surface = {
+      ...common,
+      mechanism: 'dir-merge',
+      ...(composition.mode ? { mode: composition.mode } : {}),
+      ...(composition.layout ? { layout: composition.layout } : {}),
+    };
   } else if (composition.mechanism === 'file-block') {
     surface = { ...common, mechanism: 'file-block', layering: composition.layering };
   } else {
@@ -342,10 +347,18 @@ async function composeDirMerge(
   const { paths, envs, realConfigRoot } = req;
   const targetDir = join(buildDir, surface.rootRelativePath);
   await mkdir(targetDir, { recursive: true });
-  const placed = new Set<string>();
+  const placed = new Set(await listNames(targetDir));
   const place = async (name: string, source: string): Promise<void> => {
-    if (surface.mode === 'copy') await copyPath(source, join(targetDir, name));
-    else await symlink(source, join(targetDir, name));
+    const target = join(targetDir, name);
+    if (surface.layout === 'command-skill') {
+      await mkdir(target, { recursive: true });
+      if (surface.mode === 'copy') await copyPath(source, join(target, 'SKILL.md'));
+      else await symlink(source, join(target, 'SKILL.md'));
+    } else if (surface.mode === 'copy') {
+      await copyPath(source, target);
+    } else {
+      await symlink(source, target);
+    }
     placed.add(name);
   };
 
@@ -361,14 +374,16 @@ async function composeDirMerge(
   // 2. Env items, reversed so a LATER env in the stack wins an EARLIER one (D5).
   for (const env of [...envs].reverse()) {
     const envDir = join(paths.envDir(env), surface.storeKind);
-    for (const name of await listNames(envDir)) {
+    for (const storeName of await listNames(envDir)) {
+      if (surface.layout === 'command-skill' && extname(storeName) !== '.md') continue;
+      const name = surface.layout === 'command-skill' ? basename(storeName, '.md') : storeName;
       if (placed.has(name)) {
         const detail = `'${name}' from env '${env}' shadowed in ${surface.id}`;
         onWarn(`agentenv: skipping ${detail} (a user or higher-precedence item wins)`);
         skipped.push({ surfaceId: surface.id, reason: 'collision', detail });
         continue;
       }
-      await place(name, join(envDir, name));
+      await place(name, join(envDir, storeName));
     }
   }
 }

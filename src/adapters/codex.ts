@@ -1,7 +1,6 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
 import { parse as parseYaml } from 'yaml';
@@ -17,6 +16,7 @@ import type {
   SelfCheckResult,
   SurfaceDeclaration,
 } from '../adapter.js';
+import { userHome, type AdapterV2 } from '../adapter-v2.js';
 import type { JsonValue } from '../config-keys.js';
 import { resolveBinaryOnPath } from '../session/resolve.js';
 import {
@@ -99,6 +99,15 @@ const SURFACES: readonly SurfaceDeclaration[] = [
     mode: 'symlink',
   },
   {
+    id: 'commands',
+    storeKind: 'commands',
+    supported: true,
+    mechanism: 'dir-merge',
+    rootRelativePath: 'skills',
+    mode: 'symlink',
+    layout: 'command-skill',
+  },
+  {
     id: 'instructions',
     storeKind: 'instructions',
     supported: true,
@@ -118,6 +127,102 @@ const SURFACES: readonly SurfaceDeclaration[] = [
     substitutePlaceholders: true,
   },
 ];
+
+/** Adapter v2: Codex sessions relocate CODEX_HOME; global skills use the shared standard. */
+export const codexDefinition: AdapterV2 = {
+  version: 2,
+  id: 'codex',
+  binaryName: 'codex',
+  session: {
+    supported: true,
+    launch: { rootOverride: { variable: CONFIG_ROOT_ENV } },
+  },
+  surfaces: [
+    {
+      id: 'skills',
+      storeKind: 'skills',
+      composition: { mechanism: 'dir-merge', mode: 'symlink' },
+      session: {
+        supported: true,
+        destination: { root: 'view', relativePath: 'skills' },
+        writer: 'direct',
+        hotReload: true,
+        adopt: true,
+      },
+      global: {
+        supported: true,
+        destination: { root: 'agents-standard', relativePath: '' },
+        writer: 'projection',
+        hotReload: true,
+        adopt: true,
+      },
+    },
+    {
+      id: 'commands',
+      storeKind: 'commands',
+      composition: { mechanism: 'dir-merge', mode: 'symlink', layout: 'command-skill' },
+      session: {
+        supported: true,
+        destination: { root: 'view', relativePath: 'skills' },
+        writer: 'direct',
+        inheritUserContent: false,
+        hotReload: true,
+      },
+      global: {
+        supported: true,
+        destination: { root: 'agents-standard', relativePath: '' },
+        writer: 'projection',
+        hotReload: true,
+      },
+    },
+    {
+      id: 'instructions',
+      storeKind: 'instructions',
+      composition: { mechanism: 'file-block', layering: 'inline' },
+      session: {
+        supported: true,
+        destination: { root: 'view', relativePath: 'AGENTS.md' },
+        writer: 'direct',
+        inheritUserContent: true,
+      },
+      global: {
+        supported: true,
+        destination: { root: 'config', relativePath: 'AGENTS.md' },
+        writer: 'projection',
+      },
+    },
+    {
+      id: 'agents',
+      storeKind: 'agents',
+      composition: { mechanism: 'dir-merge', mode: 'symlink' },
+      session: { supported: false, reason: 'Codex subagents require raw TOML mappings' },
+      global: { supported: false, reason: 'Codex subagents require raw TOML mappings' },
+    },
+    {
+      id: 'mcp',
+      storeKind: 'mcp',
+      composition: {
+        mechanism: 'config-keys',
+        format: 'toml',
+        style: 'keyed',
+        keyPath: ['mcp_servers'],
+        substitutePlaceholders: true,
+      },
+      session: {
+        supported: true,
+        destination: { root: 'view', relativePath: 'config.toml' },
+        writer: 'direct',
+        inheritUserContent: true,
+      },
+      global: {
+        supported: true,
+        destination: { root: 'config', relativePath: 'config.toml' },
+        writer: 'projection',
+      },
+    },
+  ],
+  rawMappings: [],
+};
 
 /** Is `v` a plain (non-array) object? */
 function isObject(v: unknown): v is Record<string, JsonValue> {
@@ -397,6 +502,7 @@ function overrideEnv(root: string): Record<string, string> {
  * The Codex CLI adapter instance registered in {@link import('./index.js')}.
  */
 export const codexAdapter: Adapter = {
+  definition: codexDefinition,
   id: 'codex',
   binaryName: 'codex',
 
@@ -413,7 +519,7 @@ export const codexAdapter: Adapter = {
   realConfigRoot(env) {
     const configured = env[CONFIG_ROOT_ENV];
     if (configured && configured.trim() !== '') return configured;
-    return join(homedir(), '.codex');
+    return join(userHome(env), '.codex');
   },
 
   surfaces: SURFACES,
@@ -454,17 +560,6 @@ export const codexAdapter: Adapter = {
           });
         }
       }
-    }
-
-    // Trust-gating (spike finding #4): Codex merges a project's `.codex/config.toml`
-    // only when the view's config.toml trusts that project. When the launch has a
-    // project root, emit its trust entry so project-static MCP/config is visible.
-    if (ctx.projectRoot) {
-      injections.push({
-        style: 'keyed',
-        keyPath: ['projects', ctx.projectRoot],
-        value: { trust_level: 'trusted' },
-      });
     }
 
     return injections;

@@ -34,6 +34,8 @@ function seedRealCodex(root: string): void {
 function seedWritingEnv(envDir: string): void {
   mkdirSync(join(envDir, 'skills', 'w-skill'), { recursive: true });
   writeFileSync(join(envDir, 'skills', 'w-skill', 'SKILL.md'), '# w skill\n');
+  mkdirSync(join(envDir, 'commands'), { recursive: true });
+  writeFileSync(join(envDir, 'commands', 'ship.md'), '# Ship command\n');
   mkdirSync(join(envDir, 'instructions'), { recursive: true });
   writeFileSync(join(envDir, 'instructions', 'codex.md'), 'CODEX RULE: be terse.\n');
   mkdirSync(join(envDir, 'mcp'), { recursive: true });
@@ -66,7 +68,7 @@ function baseReq(th: TempHome, realRoot: string, extra: Partial<ComposeRequest> 
 }
 
 describe('adapter.codex — session composer (TOML config.toml view, D6/D15)', () => {
-  it('composes an isolating view: native indirections, trust entry, inline AGENTS.md, bucket-1 auth', async () => {
+  it('composes an isolating view without granting trust: native indirections, inline AGENTS.md, bucket-1 auth', async () => {
     const th = home();
     const paths = resolvePaths(th.env);
     const realRoot = join(th.home, 'codex-real');
@@ -87,7 +89,7 @@ describe('adapter.codex — session composer (TOML config.toml view, D6/D15)', (
     // --- config.toml (config-keys, TOML) ---
     const cfg = parseToml(readFileSync(join(view, 'config.toml'), 'utf8')) as {
       mcp_servers: Record<string, Record<string, unknown>>;
-      projects: Record<string, { trust_level: string }>;
+      projects?: Record<string, { trust_level: string }>;
     };
     // The user's server survives (seed pass-through), env servers injected beside it.
     expect(Object.keys(cfg.mcp_servers).sort()).toEqual(['context7', 'embedded', 'github', 'linear']);
@@ -101,8 +103,8 @@ describe('adapter.codex — session composer (TOML config.toml view, D6/D15)', (
     // url-embedded secret has no native indirection → substitute rung resolved the
     // literal into the EPHEMERAL view (never the store).
     expect(cfg.mcp_servers.embedded).toEqual({ url: 'https://svc/?key=sekret' });
-    // Trust-gating: the launch's projectRoot is trusted so project-static config merges.
-    expect(cfg.projects[projectRoot]).toEqual({ trust_level: 'trusted' });
+    // Project trust is user-owned static state; agentenv never grants it automatically.
+    expect(cfg.projects).toBeUndefined();
 
     // --- AGENTS.md (file-block, inline mode) ---
     const agents = readFileSync(join(view, 'AGENTS.md'), 'utf8');
@@ -116,6 +118,10 @@ describe('adapter.codex — session composer (TOML config.toml view, D6/D15)', (
       join(paths.envDir('writing'), 'skills', 'w-skill'),
     );
     expect(lstatSync(join(view, 'skills', 'user-skill')).isSymbolicLink()).toBe(true); // user item kept
+    expect(lstatSync(join(view, 'skills', 'ship')).isDirectory()).toBe(true);
+    expect(readlinkSync(join(view, 'skills', 'ship', 'SKILL.md'))).toBe(
+      join(paths.envDir('writing'), 'commands', 'ship.md'),
+    );
 
     // --- auth.json (bucket-1 state) passes through to the real (copied) token ---
     expect(lstatSync(join(view, 'auth.json')).isSymbolicLink()).toBe(true);

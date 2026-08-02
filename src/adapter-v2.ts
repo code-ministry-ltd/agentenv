@@ -25,7 +25,7 @@ export type ModeSurface =
   | { supported: false; reason: string };
 
 export type SurfaceComposition =
-  | { mechanism: 'dir-merge'; mode?: 'symlink' | 'copy' }
+  | { mechanism: 'dir-merge'; mode?: 'symlink' | 'copy'; layout?: 'command-skill' }
   | { mechanism: 'file-block'; layering: 'import' | 'inline' }
   | {
       mechanism: 'config-keys';

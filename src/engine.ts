@@ -1,5 +1,5 @@
-import { lstat, readdir, readFile } from 'node:fs/promises';
-import { join, sep } from 'node:path';
+import { lstat, mkdir, readdir, readFile, readlink, rm, symlink } from 'node:fs/promises';
+import { basename, extname, join, sep } from 'node:path';
 import { resolveGlobalSurfaceDestination } from './adapter-v2.js';
 import {
   storeToken,
@@ -193,6 +193,36 @@ function keyPathEqual(a: KeyPath, b: KeyPath): boolean {
   return a.length === b.length && a.every((seg, i) => seg === b[i]);
 }
 
+function dirMergeItemName(surface: DirMergeSurface, storeName: string): string | null {
+  if (surface.layout !== 'command-skill') return storeName;
+  return extname(storeName) === '.md' ? basename(storeName, '.md') : null;
+}
+
+/** Build the derived directory Codex needs to expose one command markdown as a skill. */
+async function commandSkillWrapper(
+  paths: Paths,
+  env: string,
+  name: string,
+  source: string,
+): Promise<string> {
+  const wrapper = join(paths.live, 'global', 'command-skills', env, name);
+  const current = await lstat(wrapper).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  });
+  if (current && !current.isDirectory()) await rm(wrapper, { recursive: true, force: true });
+  await mkdir(wrapper, { recursive: true });
+  const skill = join(wrapper, 'SKILL.md');
+  const skillState = await lstat(skill).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  });
+  if (skillState?.isSymbolicLink() && (await readlink(skill)) === source) return wrapper;
+  if (skillState) await rm(skill, { recursive: true, force: true });
+  await symlink(source, skill);
+  return wrapper;
+}
+
 /** The env owning a keyed config value at (file, keyPath), or null (for idempotency). */
 function ownedConfigKey(manifest: StateManifest, file: string, keyPath: KeyPath): string | null {
   for (const item of manifest.items) {
@@ -292,7 +322,9 @@ async function materialiseDirMerge(
 
   for (const env of [...envs].reverse()) {
     const storeDir = join(paths.envDir(env), surface.storeKind);
-    for (const name of await listNames(storeDir)) {
+    for (const storeName of await listNames(storeDir)) {
+      const name = dirMergeItemName(surface, storeName);
+      if (name === null) continue;
       if (claimed.has(name)) {
         skips.push({
           adapterId: adapter.id,
@@ -303,9 +335,13 @@ async function materialiseDirMerge(
         continue;
       }
       claimed.add(name);
+      const canonicalSource = join(storeDir, storeName);
+      const sourcePath = surface.layout === 'command-skill'
+        ? await commandSkillWrapper(paths, env, name, canonicalSource)
+        : canonicalSource;
       const result = await dmMaterialise(paths, {
         ownerEnv: env,
-        sourcePath: join(storeDir, name),
+        sourcePath,
         targetDir,
         itemName: name,
         mode,
@@ -892,7 +928,9 @@ async function dirMergeStatusSkips(
   const skips: GlobalSkip[] = [];
   for (const env of [...stack].reverse()) {
     const storeDir = join(paths.envDir(env), surface.storeKind);
-    for (const name of await listNames(storeDir)) {
+    for (const storeName of await listNames(storeDir)) {
+      const name = dirMergeItemName(surface, storeName);
+      if (name === null) continue;
       const targetPath = join(targetDir, name);
       if (claimed.has(name)) {
         skips.push({

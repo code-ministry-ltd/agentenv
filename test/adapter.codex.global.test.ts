@@ -49,10 +49,11 @@ function hashTree(root: string): string {
   return createHash('sha256').update(rows.join('\n')).digest('hex');
 }
 
-/** A Codex-shaped "real ~/.codex" copy: user items in each surface plus a bucket-1 auth.json. */
-function seedCodexHome(realHome: string): void {
-  mkdirSync(join(realHome, 'skills', 'user-skill'), { recursive: true });
-  writeFileSync(join(realHome, 'skills', 'user-skill', 'SKILL.md'), '# user skill\n');
+/** A Codex-shaped home with shared standard skills plus a bucket-1 auth.json. */
+function seedCodexHome(realHome: string, sharedSkills: string): void {
+  mkdirSync(realHome, { recursive: true });
+  mkdirSync(join(sharedSkills, 'user-skill'), { recursive: true });
+  writeFileSync(join(sharedSkills, 'user-skill', 'SKILL.md'), '# user skill\n');
   writeFileSync(join(realHome, 'AGENTS.md'), '# user agents instructions\n');
   // A user MCP server plus an unrelated user key — both must survive untouched.
   writeFileSync(
@@ -66,6 +67,8 @@ function seedCodexHome(realHome: string): void {
 function seedWritingEnv(envDir: string): void {
   mkdirSync(join(envDir, 'skills', 'w-skill'), { recursive: true });
   writeFileSync(join(envDir, 'skills', 'w-skill', 'SKILL.md'), '# w skill\n');
+  mkdirSync(join(envDir, 'commands'), { recursive: true });
+  writeFileSync(join(envDir, 'commands', 'ship.md'), '# Ship command\n');
   mkdirSync(join(envDir, 'instructions'), { recursive: true });
   writeFileSync(join(envDir, 'instructions', 'codex.md'), 'CODEX RULE: be terse.\n');
   mkdirSync(join(envDir, 'mcp'), { recursive: true });
@@ -86,24 +89,30 @@ describe('adapter.codex — global materialise/restore (AC)', () => {
   it('use --global materialises ALL supported surface kinds onto a Codex copy; drop --global restores byte-identical', async () => {
     const th = home();
     const paths = resolvePaths(th.env);
-    const realHome = join(th.home, 'codex-copy');
-    seedCodexHome(realHome);
+    const userHome = join(th.home, 'user-home');
+    const realHome = join(userHome, '.codex');
+    const sharedSkills = join(userHome, '.agents', 'skills');
+    seedCodexHome(realHome, sharedSkills);
     seedWritingEnv(paths.envDir('writing'));
     // realConfigRoot(env) reads CODEX_HOME → point Codex at the copy.
-    const env: NodeJS.ProcessEnv = { ...th.env, CODEX_HOME: realHome };
+    const env: NodeJS.ProcessEnv = { ...th.env, HOME: userHome, CODEX_HOME: realHome };
     const opts = { env, adapters: [codexAdapter] };
 
-    const before = hashTree(realHome);
+    const before = hashTree(userHome);
 
     const used = await run(['use', 'writing', '--global'], opts);
     expect(used.code).toBe(0);
-    expect(hashTree(realHome)).not.toBe(before); // something changed
+    expect(hashTree(userHome)).not.toBe(before); // something changed
 
     // dir-merge (skills): env item symlinked in beside the user's, user item intact.
-    const wSkill = join(realHome, 'skills', 'w-skill');
+    const wSkill = join(sharedSkills, 'w-skill');
     expect(lstatSync(wSkill).isSymbolicLink()).toBe(true);
     expect(readlinkSync(wSkill)).toBe(join(paths.envDir('writing'), 'skills', 'w-skill'));
-    expect(readFileSync(join(realHome, 'skills', 'user-skill', 'SKILL.md'), 'utf8')).toBe('# user skill\n');
+    expect(readFileSync(join(sharedSkills, 'user-skill', 'SKILL.md'), 'utf8')).toBe('# user skill\n');
+    expect(lstatSync(join(sharedSkills, 'ship')).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(join(sharedSkills, 'ship', 'SKILL.md'))).toBe(
+      join(paths.envDir('writing'), 'commands', 'ship.md'),
+    );
 
     // file-block (AGENTS.md inline): env content INLINED into a managed region; user content kept.
     const agents = readFileSync(join(realHome, 'AGENTS.md'), 'utf8');
@@ -139,7 +148,7 @@ describe('adapter.codex — global materialise/restore (AC)', () => {
     // drop --global --all restores the copy byte-for-byte.
     const dropped = await run(['drop', '--global', '--all'], opts);
     expect(dropped.code).toBe(0);
-    expect(hashTree(realHome)).toBe(before);
+    expect(hashTree(userHome)).toBe(before);
     const after = await readState(paths);
     expect(after.items).toEqual([]);
     expect(after.globalStack).toEqual([]);
