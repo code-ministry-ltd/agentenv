@@ -40,7 +40,7 @@ export const dropCommand: Command = {
     }
     const harnesses = parseHarnesses(parsed.values.get('harness'));
     if (parsed.booleans.has('global')) {
-      return dropGlobal(ctx, parsed.positionals, all, harnesses);
+      return dropGlobal(ctx, parsed.positionals, all || parsed.positionals.length === 0, harnesses);
     }
     return dropSession(ctx, parsed.positionals, all);
   },

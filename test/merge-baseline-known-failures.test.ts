@@ -53,7 +53,7 @@ describe('merge baseline — accepted known failures', () => {
     });
   });
 
-  it.fails('drop --global without environment names clears the active global stack', async () => {
+  it('drop --global without environment names clears the active global stack', async () => {
     const th = home();
     const paths = resolvePaths(th.env);
     const realRoot = join(th.home, 'fixture-real');
