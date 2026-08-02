@@ -1,4 +1,5 @@
 import { isAbsolute, join } from 'node:path';
+import { homedir } from 'node:os';
 import type { ConfigFormat, ConfigKeysStyle, StoreKind } from './adapter.js';
 
 export type DestinationRoot = 'view' | 'config' | 'home' | 'agents-standard' | 'project';
@@ -73,6 +74,68 @@ export interface DestinationRoots {
   home: string;
   agentsStandard: string;
   project: string;
+}
+
+interface GlobalDestinationAdapter {
+  definition?: AdapterV2;
+  realConfigRoot(env: NodeJS.ProcessEnv): string;
+}
+
+interface LegacySurfaceDestination {
+  id: string;
+  rootRelativePath: string;
+}
+
+/** Resolve the user's home from the command environment before consulting the host process. */
+export function userHome(env: NodeJS.ProcessEnv): string {
+  const configured = env.HOME?.trim() || env.USERPROFILE?.trim();
+  return configured || homedir();
+}
+
+/** The physical roots available to an adapter's explicit global destinations. */
+export function globalDestinationRoots(
+  adapter: GlobalDestinationAdapter,
+  env: NodeJS.ProcessEnv,
+): DestinationRoots {
+  const home = userHome(env);
+  const config = adapter.realConfigRoot(env);
+  return {
+    view: config,
+    config,
+    home,
+    agentsStandard: join(home, '.agents', 'skills'),
+    project: env.PWD?.trim() || process.cwd(),
+  };
+}
+
+/** Resolve one legacy engine surface through its v2 global destination when declared. */
+export function resolveGlobalSurfaceDestination(
+  adapter: GlobalDestinationAdapter,
+  surface: LegacySurfaceDestination,
+  env: NodeJS.ProcessEnv,
+): string {
+  const declared = adapter.definition?.surfaces.find((candidate) => candidate.id === surface.id);
+  if (!declared) return join(adapter.realConfigRoot(env), surface.rootRelativePath);
+  if (!declared.global.supported) {
+    throw new Error(`surface '${surface.id}' has no global destination: ${declared.global.reason}`);
+  }
+  return resolveSurfaceDestination(declared.global, globalDestinationRoots(adapter, env));
+}
+
+/** Every path a harness-scoped global drop may legitimately own, including legacy state. */
+export function globalAdapterTargets(
+  adapter: GlobalDestinationAdapter,
+  env: NodeJS.ProcessEnv,
+): string[] {
+  const roots = globalDestinationRoots(adapter, env);
+  const targets = new Set<string>([roots.config]);
+  for (const item of [
+    ...(adapter.definition?.surfaces ?? []),
+    ...(adapter.definition?.rawMappings ?? []),
+  ]) {
+    if (item.global.supported) targets.add(resolveSurfaceDestination(item.global, roots));
+  }
+  return [...targets];
 }
 
 function replaceView(value: string, viewRoot: string): string {

@@ -53,7 +53,7 @@ function hashTree(root: string): string {
  * mixed `.claude.json` (mcpServers.context7 beside onboarding/identity state), and
  * a bucket-1 `.credentials.json` that global mode must never touch.
  */
-function seedClaudeHome(realHome: string): void {
+function seedClaudeHome(realHome: string, userJson: string): void {
   for (const [dir, item, body] of [
     ['skills', 'user-skill', '# user skill\n'],
     ['agents', 'user-agent.md', '# user agent\n'],
@@ -70,7 +70,7 @@ function seedClaudeHome(realHome: string): void {
   }
   // Mixed internal file: managed mcpServers beside host state (D15).
   writeFileSync(
-    join(realHome, '.claude.json'),
+    userJson,
     `${JSON.stringify(
       {
         hasCompletedOnboarding: true,
@@ -105,18 +105,21 @@ describe('adapter.claude — global materialise/restore (AC)', () => {
   it('use --global materialises ALL surface kinds onto a Claude copy; drop --global restores byte-identical', async () => {
     const th = home();
     const paths = resolvePaths(th.env);
-    const realHome = join(th.home, 'claude-copy');
-    seedClaudeHome(realHome);
+    const userHome = join(th.home, 'user-home');
+    const realHome = join(userHome, '.claude');
+    const userJson = join(userHome, '.claude.json');
+    mkdirSync(userHome, { recursive: true });
+    seedClaudeHome(realHome, userJson);
     seedWritingEnv(paths.envDir('writing'));
     // realConfigRoot(env) reads CLAUDE_CONFIG_DIR → point Claude at the copy.
-    const env: NodeJS.ProcessEnv = { ...th.env, CLAUDE_CONFIG_DIR: realHome };
+    const env: NodeJS.ProcessEnv = { ...th.env, HOME: userHome, CLAUDE_CONFIG_DIR: realHome };
     const opts = { env, adapters: [claudeAdapter] };
 
-    const before = hashTree(realHome);
+    const before = hashTree(userHome);
 
     const used = await run(['use', 'writing', '--global'], opts);
     expect(used.code).toBe(0);
-    expect(hashTree(realHome)).not.toBe(before); // something changed
+    expect(hashTree(userHome)).not.toBe(before); // something changed
 
     // dir-merge: each env item symlinked in beside the user's, user items intact.
     for (const [dir, name, storeSub] of [
@@ -136,7 +139,7 @@ describe('adapter.claude — global materialise/restore (AC)', () => {
 
     // config-keys: linear injected beside context7, shaped to Claude form with a
     // ${VAR}-passthrough Authorization header (D6 rung-1).
-    const cfg = JSON.parse(readFileSync(join(realHome, '.claude.json'), 'utf8'));
+    const cfg = JSON.parse(readFileSync(userJson, 'utf8'));
     expect(Object.keys(cfg.mcpServers).sort()).toEqual(['context7', 'linear']);
     expect(cfg.mcpServers.linear).toEqual({
       type: 'http',
@@ -159,9 +162,9 @@ describe('adapter.claude — global materialise/restore (AC)', () => {
     expect(manifest.items.some((i) => i.surface === 'config-keys' && i.ownerEnv === 'writing')).toBe(true);
 
     // drop --global --all restores the copy byte-for-byte.
-    const dropped = await run(['drop', '--global', '--all'], opts);
+    const dropped = await run(['drop', '--global', '--all', '--harness', 'claude'], opts);
     expect(dropped.code).toBe(0);
-    expect(hashTree(realHome)).toBe(before);
+    expect(hashTree(userHome)).toBe(before);
     const after = await readState(paths);
     expect(after.items).toEqual([]);
     expect(after.globalStack).toEqual([]);

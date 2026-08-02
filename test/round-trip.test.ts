@@ -79,6 +79,7 @@ function hashTree(root: string, exclude: ReadonlySet<string> = new Set()): strin
 interface LivedInHome {
   home: string;
   claudeHome: string;
+  claudeJson: string;
   agentsHome: string;
   agentenvHome: string;
   env: NodeJS.ProcessEnv;
@@ -88,12 +89,14 @@ interface LivedInHome {
 function makeLivedInHome(): LivedInHome {
   const home = mkdtempSync(join(tmpdir(), 'agentenv-round-trip-'));
   const claudeHome = join(home, '.claude');
+  const claudeJson = join(home, '.claude.json');
   const agentsHome = join(home, '.agents');
   const agentenvHome = join(home, '.agentenv');
   mkdirSync(agentenvHome, { recursive: true });
   return {
     home,
     claudeHome,
+    claudeJson,
     agentsHome,
     agentenvHome,
     // CLAUDE_CONFIG_DIR points the adapter's realConfigRoot at the fixture .claude;
@@ -113,7 +116,7 @@ function makeLivedInHome(): LivedInHome {
  * some non-surface bucket-1 state (`projects/`).
  */
 function seedLivedInClaude(h: LivedInHome): void {
-  const { claudeHome, agentsHome } = h;
+  const { claudeHome, claudeJson, agentsHome } = h;
 
   // A foreign manager's registry (~/.agents/skills) + the symlink into it that
   // lives inside Claude's skills dir. agentenv must leave both untouched.
@@ -149,7 +152,7 @@ function seedLivedInClaude(h: LivedInHome): void {
   // a user MCP server beside onboarding/trust state. config-keys must inject into
   // mcpServers and later remove surgically, preserving every byte of this.
   writeFileSync(
-    join(claudeHome, '.claude.json'),
+    claudeJson,
     [
       '// Claude Code config — hand edited, keep these comments!',
       '{',
@@ -235,7 +238,7 @@ describe('round-trip integrity (spec criterion 1) — session variant', () => {
     // The foreign-manager symlink's real target, captured to prove it never moves.
     const foreignLink = join(h.claudeHome, 'skills', 'vendor-linked');
     const foreignTarget = readlinkSync(foreignLink);
-    const realClaudeJson = readFileSync(join(h.claudeHome, '.claude.json'), 'utf8');
+    const realClaudeJson = readFileSync(h.claudeJson, 'utf8');
 
     // --- Bind (session): a registry write, which lands under ~/.agentenv only. ---
     await setBinding(paths, { session, projectRoot, envs: ['writing'] });
@@ -292,7 +295,7 @@ describe('round-trip integrity (spec criterion 1) — session variant', () => {
     // can never alter the user's real internal config.
     viewCfg.sessionOnly = true;
     writeFileSync(join(view, '.mcp.json'), `${JSON.stringify(viewCfg, null, 2)}\n`);
-    expect(readFileSync(join(h.claudeHome, '.claude.json'), 'utf8')).toBe(realClaudeJson);
+    expect(readFileSync(h.claudeJson, 'utf8')).toBe(realClaudeJson);
     expect(hashTree(h.home, exclude)).toBe(step0);
 
     // --- Drop / end the session: discard the view + clear the binding. ---
@@ -301,7 +304,7 @@ describe('round-trip integrity (spec criterion 1) — session variant', () => {
 
     // The discarded user-content drift is gone: the real file never received the
     // trust approval (documented D15 quirk), and the whole real home is unchanged.
-    const finalClaudeJson = readFileSync(join(h.claudeHome, '.claude.json'), 'utf8');
+    const finalClaudeJson = readFileSync(h.claudeJson, 'utf8');
     expect(finalClaudeJson).toBe(realClaudeJson);
     expect(finalClaudeJson.includes('session-trust')).toBe(false);
     // The foreign-manager symlink still points exactly where it did.
@@ -360,7 +363,7 @@ describe('round-trip integrity (spec criterion 1) — global variant', () => {
     // config-keys: linear injected beside context7 (shaped, ${VAR}-passthrough header);
     // the user's onboarding/state keys survive. Read as JSONC — the surgical inject
     // preserved the file's leading comment, so plain JSON.parse would (correctly) choke.
-    const cfg = parseJsonc(readFileSync(join(h.claudeHome, '.claude.json'), 'utf8'));
+    const cfg = parseJsonc(readFileSync(h.claudeJson, 'utf8'));
     expect(Object.keys(cfg.mcpServers).sort()).toEqual(['context7', 'linear']);
     expect(cfg.mcpServers.linear).toEqual({
       type: 'http',

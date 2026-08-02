@@ -20,7 +20,7 @@ or specifications is recorded as behavioral provenance rather than copied code.
 |---|---|---|---|---|
 | Filesystem, backups, lock, Git runner, parsers | Retain the CM safety primitives behind new command-level contracts | CM | Existing Apache-2.0 code | Retained |
 | Claude session | Additional directory, explicit MCP file, and additional-directory instruction environment; never default to `CLAUDE_CONFIG_DIR` | JJ `src/adapters/claude.ts` | Behavioral reimplementation with CM probe/compiler | Implemented |
-| Claude global | Top-level `~/.claude.json`, shared skills/rules, canonical persistence | JJ `src/adapters/claude.ts` | Behavioral reimplementation | Pending |
+| Claude global | Top-level `~/.claude.json`, native skills/rules, canonical persistence | JJ `src/adapters/claude.ts` | Behavioral reimplementation with CM transactional writers | Implemented |
 | Codex | Shared skills, commands-as-skills, child environment, persistence | JJ adapter and tests | Behavioral reimplementation with CM TOML/probe/compiler | Pending |
 | OpenCode | `XDG_CONFIG_HOME` plus `OPENCODE_CONFIG_DIR` isolation | CM adapter and live fixture | Existing Apache-2.0 code | Retained |
 | Pi | Five settings arrays and real probe | CM adapter and fixtures | Existing Apache-2.0 code | Retained pending persistence work |
@@ -38,7 +38,7 @@ leaving the case as a normal regression test.
 
 | Defect or retained safeguard | Executable evidence at the pinned CM base |
 |---|---|
-| Claude root relocation breaks the selected auth model | `test/merge-baseline-known-failures.test.ts` |
+| Claude sessions avoid root relocation and preserve the real auth layer | `test/merge-baseline-known-failures.test.ts` |
 | OpenCode requires both isolation variables | `test/adapter.opencode.test.ts` (`passes the XDG_CONFIG_HOME + OPENCODE_CONFIG_DIR overrides`) |
 | Env-less global drop is a no-op | `test/merge-baseline-known-failures.test.ts` |
 | Session composition records no adoption inventory | `test/merge-baseline-known-failures.test.ts` |

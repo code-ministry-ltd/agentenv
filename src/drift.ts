@@ -1,5 +1,6 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { resolveGlobalSurfaceDestination } from './adapter-v2.js';
 import type { Adapter, ConfigKeysDriftReport, ConfigKeysSurface } from './adapter.js';
 import {
   syncBack as cfgSyncBack,
@@ -278,10 +279,9 @@ function findConfigSurface(
   item: ConfigKeysItem,
 ): { adapter: Adapter; surface: ConfigKeysSurface } | null {
   for (const adapter of adapters) {
-    const realRoot = adapter.realConfigRoot(env);
     for (const surface of adapter.surfaces) {
       if (surface.mechanism !== 'config-keys') continue;
-      if (join(realRoot, surface.rootRelativePath) === item.path) {
+      if (resolveGlobalSurfaceDestination(adapter, surface, env) === item.path) {
         return { adapter, surface };
       }
     }

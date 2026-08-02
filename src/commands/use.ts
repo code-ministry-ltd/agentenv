@@ -1,4 +1,4 @@
-import { join } from 'node:path';
+import { resolveGlobalSurfaceDestination } from '../adapter-v2.js';
 import type { Adapter } from '../adapter.js';
 import { snapshotInventory, type AdoptSurface } from '../adopt.js';
 import { adapters as realAdapters } from '../adapters/index.js';
@@ -174,14 +174,13 @@ function globalDirMergeSurfaces(
 ): AdoptSurface[] {
   const surfaces: AdoptSurface[] = [];
   for (const adapter of adapters) {
-    const root = adapter.realConfigRoot(env);
     for (const surface of adapter.surfaces) {
       if (surface.mechanism !== 'dir-merge' || !surface.supported) continue;
       if (surface.storeKind !== 'skills' && surface.storeKind !== 'agents' && surface.storeKind !== 'commands') {
         continue;
       }
       surfaces.push({
-        dir: join(root, surface.rootRelativePath),
+        dir: resolveGlobalSurfaceDestination(adapter, surface, env),
         scope: 'global',
         storeKind: surface.storeKind,
         ownerEnv,

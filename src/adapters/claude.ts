@@ -1,7 +1,6 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import type {
@@ -16,7 +15,7 @@ import type {
   SelfCheckResult,
   SurfaceDeclaration,
 } from '../adapter.js';
-import { renderSessionLaunch, type AdapterV2 } from '../adapter-v2.js';
+import { renderSessionLaunch, userHome, type AdapterV2 } from '../adapter-v2.js';
 import type { JsonValue } from '../config-keys.js';
 import { resolveBinaryOnPath } from '../session/resolve.js';
 import {
@@ -38,13 +37,10 @@ import {
  * relies on. Nothing here is engine logic — only Claude's surface declarations and
  * format quirks, dispatched by the shared composer/launch.
  *
- * Config root: `~/.claude/` (relocated wholesale — INCLUDING `.claude.json` — by
- * `CLAUDE_CONFIG_DIR`, confirmed live: an empty root drops the user's `context7`
- * server from `claude mcp list`). Two-bucket split (D15): `.credentials.json` is the
- * single bucket-1 pass-through that keeps the view logged in; the surface targets
- * (`skills`/`agents`/`commands`/`rules`/`.claude.json`) are bucket-2 managed; every
- * other entry (history, projects, todos, caches, plugins, shell-snapshots, …)
- * defaults to bucket-1 pass-through — the safe unknown.
+ * Claude's directory surfaces live under `~/.claude/`, while its mixed MCP/state
+ * file is the sibling `~/.claude.json`. Session mode leaves both real locations in
+ * place and adds an isolated view through Claude's launch arguments; global mode
+ * resolves each v2 surface to its explicit physical destination.
  */
 
 /** The config-root env var that relocates Claude's entire config root (D15). */
@@ -63,9 +59,9 @@ const MANAGED_ENTRIES = new Set(['skills', 'agents', 'commands', 'rules', '.clau
 /**
  * Claude's managed surfaces. Skills/agents/commands/rules are per-item dir-merge
  * (rules officially supports symlinks → global instructions need ZERO mutation of
- * the user's CLAUDE.md, D2). MCP is config-keys into `.claude.json`'s top-level
- * `mcpServers` object, keyed style — `.claude.json` is an internal mixed file, so
- * the composer touches only `mcpServers`, seeded from the real file (D15).
+ * the user's CLAUDE.md, D2). MCP is config-keys into `~/.claude.json`'s top-level
+ * `mcpServers` object, keyed style — it is an internal mixed file, so global mode
+ * touches only `mcpServers` and restores it surgically.
  */
 const SURFACES: readonly SurfaceDeclaration[] = [
   {
@@ -450,7 +446,7 @@ export const claudeAdapter: Adapter = {
   realConfigRoot(env) {
     const configured = env[CONFIG_ROOT_ENV];
     if (configured && configured.trim() !== '') return configured;
-    return join(homedir(), '.claude');
+    return join(userHome(env), '.claude');
   },
 
   surfaces: SURFACES,

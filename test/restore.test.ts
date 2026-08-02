@@ -182,9 +182,10 @@ describe('restore (criterion 5) probe 1: use work --global reproduces the env + 
 
     // A pristine ~/.claude-style home (a clean container has no surface dirs yet).
     const realHome = join(th.home, 'claude-copy');
+    const userJson = join(th.home, '.claude.json');
     mkdirSync(realHome, { recursive: true });
-    writeFileSync(join(realHome, '.claude.json'), `${JSON.stringify({ hasCompletedOnboarding: true }, null, 2)}\n`);
-    const env: NodeJS.ProcessEnv = { ...th.env, CLAUDE_CONFIG_DIR: realHome };
+    writeFileSync(userJson, `${JSON.stringify({ hasCompletedOnboarding: true }, null, 2)}\n`);
+    const env: NodeJS.ProcessEnv = { ...th.env, HOME: th.home, CLAUDE_CONFIG_DIR: realHome };
 
     const used = await run(['use', 'work', '--global'], { env, adapters: [claudeAdapter] });
     expect(used.code).toBe(0);
@@ -200,7 +201,7 @@ describe('restore (criterion 5) probe 1: use work --global reproduces the env + 
 
     // config-keys: BOTH servers injected into .claude.json; Claude is passthrough so
     // the ${SOME_TOKEN} placeholder is kept verbatim (no secret written, env reproduced).
-    const cfg = JSON.parse(readFileSync(join(realHome, '.claude.json'), 'utf8'));
+    const cfg = JSON.parse(readFileSync(userJson, 'utf8'));
     expect(Object.keys(cfg.mcpServers).sort()).toEqual(['github', 'notes']);
     expect(cfg.mcpServers.github.env.GITHUB_TOKEN).toBe('${SOME_TOKEN}');
     expect(cfg.hasCompletedOnboarding).toBe(true); // host state preserved

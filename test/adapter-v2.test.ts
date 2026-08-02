@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  globalAdapterTargets,
   renderSessionLaunch,
+  resolveGlobalSurfaceDestination,
   resolveSurfaceDestination,
   validateAdapterV2,
   type AdapterV2,
@@ -74,6 +76,31 @@ describe('Adapter v2 contract', () => {
         project: '/project',
       }),
     ).toBe('/home/.agents/skills');
+  });
+
+  it('resolves home-relative global files and includes them in scoped-drop targets', () => {
+    const definition = claudeLike();
+    definition.surfaces[0] = {
+      ...definition.surfaces[0]!,
+      global: {
+        supported: true,
+        destination: { root: 'home', relativePath: '.claude.json' },
+        writer: 'projection',
+      },
+    };
+    const adapter = {
+      definition,
+      realConfigRoot: () => '/users/jim/.claude',
+    };
+    const surface = { id: 'skills', rootRelativePath: '.claude.json' };
+
+    expect(resolveGlobalSurfaceDestination(adapter, surface, { HOME: '/fixture/home' })).toBe(
+      '/fixture/home/.claude.json',
+    );
+    expect(globalAdapterTargets(adapter, { HOME: '/fixture/home' })).toEqual([
+      '/users/jim/.claude',
+      '/fixture/home/.claude.json',
+    ]);
   });
 
   it('requires every unsupported mode to say why', () => {

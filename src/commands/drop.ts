@@ -1,4 +1,5 @@
 import { adapters as realAdapters } from '../adapters/index.js';
+import { globalAdapterTargets } from '../adapter-v2.js';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
 import { driftSweep } from '../drift.js';
@@ -87,7 +88,9 @@ async function dropGlobal(
   const adapters = selectAdapters(options.adapters ?? realAdapters, harnesses);
   // `--harness` restricts removal to the matching adapters' real roots; without it,
   // every owned item of the dropped envs is removed (dematerialise is adapter-free).
-  const restrictToRoots = harnesses ? adapters.map((a) => a.realConfigRoot(env)) : undefined;
+  const restrictToRoots = harnesses
+    ? adapters.flatMap((adapter) => globalAdapterTargets(adapter, env))
+    : undefined;
 
   const notices: string[] = [];
   // Drift sweep BEFORE removal (D9): reconcile config-key hashes so removal is not

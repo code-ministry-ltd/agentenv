@@ -123,13 +123,14 @@ describe('secrets materialise 7b: passthrough rung strips a baked literal on wri
     const th = gitHome();
     const paths = resolvePaths(th.env);
     const realHome = join(th.home, 'claude-copy');
+    const userJson = join(th.home, '.claude.json');
     mkdirSync(realHome, { recursive: true });
     // A minimal real .claude.json (mixed internal file) with host state to preserve.
     writeFileSync(
-      join(realHome, '.claude.json'),
+      userJson,
       `${JSON.stringify({ hasCompletedOnboarding: true }, null, 2)}\n`,
     );
-    const env: NodeJS.ProcessEnv = { ...th.env, CLAUDE_CONFIG_DIR: realHome };
+    const env: NodeJS.ProcessEnv = { ...th.env, HOME: th.home, CLAUDE_CONFIG_DIR: realHome };
     const opts = { env, adapters: [claudeAdapter] };
 
     await run(['init'], { env });
@@ -144,12 +145,12 @@ describe('secrets materialise 7b: passthrough rung strips a baked literal on wri
     expect(used.code).toBe(0);
 
     // Passthrough: the placeholder is KEPT in the real config (no secret written).
-    const cfg1 = JSON.parse(readFileSync(join(realHome, '.claude.json'), 'utf8'));
+    const cfg1 = JSON.parse(readFileSync(userJson, 'utf8'));
     expect(cfg1.mcpServers.linear.headers.Authorization).toBe('Bearer ${LINEAR_TOKEN}');
 
     // The user BAKES a literal token over the placeholder, mid-session.
     cfg1.mcpServers.linear.headers.Authorization = `Bearer ${BAKED_TOKEN}`;
-    writeFileSync(join(realHome, '.claude.json'), `${JSON.stringify(cfg1, null, 2)}\n`);
+    writeFileSync(userJson, `${JSON.stringify(cfg1, null, 2)}\n`);
 
     // Next invocation: drift sweep write-back restores the placeholder to the store.
     const again = await run(['use', 'writing', '--global'], opts);
@@ -171,12 +172,13 @@ describe('secrets materialise 7c: an array-nested baked literal is stripped on w
     const th = gitHome();
     const paths = resolvePaths(th.env);
     const realHome = join(th.home, 'claude-copy');
+    const userJson = join(th.home, '.claude.json');
     mkdirSync(realHome, { recursive: true });
     writeFileSync(
-      join(realHome, '.claude.json'),
+      userJson,
       `${JSON.stringify({ hasCompletedOnboarding: true }, null, 2)}\n`,
     );
-    const env: NodeJS.ProcessEnv = { ...th.env, CLAUDE_CONFIG_DIR: realHome };
+    const env: NodeJS.ProcessEnv = { ...th.env, HOME: th.home, CLAUDE_CONFIG_DIR: realHome };
     const opts = { env, adapters: [claudeAdapter] };
 
     await run(['init'], { env });
@@ -201,13 +203,13 @@ describe('secrets materialise 7c: an array-nested baked literal is stripped on w
     expect(used.code).toBe(0);
 
     // Passthrough: the placeholder is KEPT verbatim in the real config (no secret).
-    const cfg1 = JSON.parse(readFileSync(join(realHome, '.claude.json'), 'utf8'));
+    const cfg1 = JSON.parse(readFileSync(userJson, 'utf8'));
     expect(cfg1.mcpServers.context7.args).toContain('${CTX_API_KEY}');
 
     // The user BAKES an opaque literal over the array-nested placeholder, mid-session.
     const idx = cfg1.mcpServers.context7.args.indexOf('${CTX_API_KEY}');
     cfg1.mcpServers.context7.args[idx] = OPAQUE_BAKED;
-    writeFileSync(join(realHome, '.claude.json'), `${JSON.stringify(cfg1, null, 2)}\n`);
+    writeFileSync(userJson, `${JSON.stringify(cfg1, null, 2)}\n`);
 
     // Next invocation: drift sweep write-back must restore the placeholder to the store.
     const again = await run(['use', 'research', '--global'], opts);

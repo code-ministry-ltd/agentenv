@@ -1,5 +1,6 @@
 import { lstat, readdir, readFile } from 'node:fs/promises';
 import { join, sep } from 'node:path';
+import { resolveGlobalSurfaceDestination } from './adapter-v2.js';
 import {
   storeToken,
   type Adapter,
@@ -238,7 +239,6 @@ export async function materialiseGlobal(req: MaterialiseGlobalRequest): Promise<
   let applied = 0;
   // dir-merge and file-block: each self-locks + self-journals (one atomic op).
   for (const adapter of adapters) {
-    const realRoot = adapter.realConfigRoot(env);
     for (const surface of adapter.surfaces) {
       if (!surface.supported) {
         skips.push({
@@ -249,10 +249,11 @@ export async function materialiseGlobal(req: MaterialiseGlobalRequest): Promise<
         });
         continue;
       }
+      const target = resolveGlobalSurfaceDestination(adapter, surface, env);
       if (surface.mechanism === 'dir-merge') {
-        applied += await materialiseDirMerge(req, adapter, surface, realRoot, skips, onWarn);
+        applied += await materialiseDirMerge(req, adapter, surface, target, skips, onWarn);
       } else if (surface.mechanism === 'file-block') {
-        applied += await materialiseFileBlock(req, adapter, surface, realRoot);
+        applied += await materialiseFileBlock(req, adapter, surface, target);
       }
       // config-keys handled below, batched under one transaction.
     }
@@ -280,12 +281,11 @@ async function materialiseDirMerge(
   req: MaterialiseGlobalRequest,
   adapter: Adapter,
   surface: DirMergeSurface,
-  realRoot: string,
+  targetDir: string,
   skips: GlobalSkip[],
   onWarn: (m: string) => void,
 ): Promise<number> {
   const { paths, envs } = req;
-  const targetDir = join(realRoot, surface.rootRelativePath);
   const mode: DirMergeMode = surface.mode ?? 'symlink';
   const claimed = new Set<string>();
   let applied = 0;
@@ -335,10 +335,9 @@ async function materialiseFileBlock(
   req: MaterialiseGlobalRequest,
   adapter: Adapter,
   surface: FileBlockSurface,
-  realRoot: string,
+  target: string,
 ): Promise<number> {
   const { paths, envs } = req;
-  const target = join(realRoot, surface.rootRelativePath);
   let applied = 0;
   for (const env of envs) {
     const sources = await instructionSources(paths, adapter, env);
@@ -391,10 +390,9 @@ async function materialiseConfigKeys(
   const planned: Planned[] = [];
 
   for (const adapter of adapters) {
-    const realRoot = adapter.realConfigRoot(env);
     for (const surface of adapter.surfaces) {
       if (surface.mechanism !== 'config-keys' || !surface.supported) continue;
-      const file = join(realRoot, surface.rootRelativePath);
+      const file = resolveGlobalSurfaceDestination(adapter, surface, env);
       const claimedKeys = new Set<string>();
       for (const envName of [...envs].reverse()) {
         let injections;
@@ -826,16 +824,16 @@ export async function describeGlobal(req: {
 
   const out: AdapterStatus[] = [];
   for (const adapter of adapters) {
-    const realRoot = adapter.realConfigRoot(env);
     const surfaces: SurfaceStatus[] = [];
     const skips: GlobalSkip[] = [];
     for (const surface of adapter.surfaces) {
+      const target = resolveGlobalSurfaceDestination(adapter, surface, env);
       surfaces.push({
         surfaceId: surface.id,
         mechanism: surface.mechanism,
         supported: surface.supported,
         ...(surface.unsupportedReason ? { unsupportedReason: surface.unsupportedReason } : {}),
-        ownedItems: countOwned(manifest, surface, realRoot, active),
+        ownedItems: countOwned(manifest, surface, target, active),
       });
       if (!surface.supported) {
         skips.push({
@@ -847,7 +845,7 @@ export async function describeGlobal(req: {
         continue;
       }
       if (stack.length > 0 && surface.mechanism === 'dir-merge') {
-        skips.push(...(await dirMergeStatusSkips(paths, adapter, surface, realRoot, stack, manifest)));
+        skips.push(...(await dirMergeStatusSkips(paths, adapter, surface, target, stack, manifest)));
       }
     }
     out.push({
@@ -871,10 +869,9 @@ export async function describeGlobal(req: {
 function countOwned(
   manifest: StateManifest,
   surface: DirMergeSurface | FileBlockSurface | ConfigKeysSurface,
-  realRoot: string,
+  target: string,
   active: readonly string[],
 ): number {
-  const target = join(realRoot, surface.rootRelativePath);
   return manifest.items.filter((i) => {
     if (!active.includes(i.ownerEnv)) return false;
     if (surface.mechanism === 'dir-merge') return i.path.startsWith(target + sep);
@@ -887,11 +884,10 @@ async function dirMergeStatusSkips(
   paths: Paths,
   adapter: Adapter,
   surface: DirMergeSurface,
-  realRoot: string,
+  targetDir: string,
   stack: readonly string[],
   manifest: StateManifest,
 ): Promise<GlobalSkip[]> {
-  const targetDir = join(realRoot, surface.rootRelativePath);
   const claimed = new Set<string>();
   const skips: GlobalSkip[] = [];
   for (const env of [...stack].reverse()) {

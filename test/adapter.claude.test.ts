@@ -52,6 +52,7 @@ describe('adapter.claude — identity & declarations', () => {
 
   it('realConfigRoot honours a set CLAUDE_CONFIG_DIR, else ~/.claude', () => {
     expect(claudeAdapter.realConfigRoot({ CLAUDE_CONFIG_DIR: '/custom' })).toBe('/custom');
+    expect(claudeAdapter.realConfigRoot({ HOME: '/fixture-home' })).toBe('/fixture-home/.claude');
     expect(claudeAdapter.realConfigRoot({ CLAUDE_CONFIG_DIR: '   ' })).toMatch(/\.claude$/);
     expect(claudeAdapter.realConfigRoot({})).toMatch(/\.claude$/);
   });
