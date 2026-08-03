@@ -11,6 +11,7 @@ import { editCommand } from './edit.js';
 import { initCommand } from './init.js';
 import { listCommand } from './list.js';
 import { remoteCommand } from './remote.js';
+import { resolveCommand } from './resolve.js';
 import { rmCommand } from './rm.js';
 import { runCommand } from './run.js';
 import { secretCommand } from './secret.js';
@@ -44,6 +45,7 @@ export const commands: readonly Command[] = [
   statusCommand,
   remoteCommand,
   syncCommand,
+  resolveCommand,
   doctorCommand,
   runCommand,
   shellInitCommand,
