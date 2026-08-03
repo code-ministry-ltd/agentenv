@@ -113,17 +113,24 @@ function originUrl(storeDir: string): string {
   }
 }
 
+function preparedRefs(storeDir: string): string[] {
+  const refs = g(storeDir, 'for-each-ref', '--format=%(refname)', 'refs/agentenv-prepared');
+  return refs === '' ? [] : refs.split('\n');
+}
+
 /**
  * Record every `git` argv the command runs, so a test can prove NO force-push and
  * NO unrelated-history auto-merge ever happen.
  */
-function recordingRunner(): { run: GitRunner; calls: () => string[][] } {
+function recordingRunner(): { run: GitRunner; calls: () => string[][]; cwds: () => string[] } {
   const calls: string[][] = [];
+  const cwds: string[] = [];
   const run: GitRunner = (args, opts) => {
     calls.push([...args]);
+    cwds.push(opts.cwd);
     return defaultGitRunner(args, opts);
   };
-  return { run, calls: () => calls };
+  return { run, calls: () => calls, cwds: () => cwds };
 }
 
 function assertNoForcePush(calls: string[][]): void {
@@ -242,6 +249,11 @@ describe('remote 2.3: RELATED candidate → integrate then adopt', () => {
 
     assertNoForcePush(rec.calls());
     assertNoUnrelatedMerge(rec.calls());
+    const rebaseIndexes = rec.calls()
+      .map((args, index) => args.includes('rebase') && !args.includes('--abort') ? index : -1)
+      .filter((index) => index >= 0);
+    expect(rebaseIndexes.length).toBeGreaterThan(0);
+    for (const index of rebaseIndexes) expect(rec.cwds()[index]).not.toBe(paths.store);
   });
 
   it('a conflict is aborted: OLD url stays and local content is intact', async () => {
@@ -310,6 +322,7 @@ describe('remote 2.3: RELATED candidate → integrate then adopt', () => {
     expect(originUrl(paths.store)).toBe(oldRemote.url);
     expect(subjects(paths.store)).toEqual(localBefore);
     expect(existsSync(join(paths.store, 'REMOTE.md'))).toBe(false);
+    expect(preparedRefs(paths.store)).toEqual([]);
   });
 });
 
@@ -463,6 +476,33 @@ describe('remote 2.3: UNREACHABLE candidate + the fault-injection matrix', () =>
     // The integrate was rolled back exactly: the remote's commit is NOT present locally.
     expect(subjects(paths.store)).toEqual(localBefore);
     expect(subjects(paths.store)).not.toContain('remote-divergent');
+  });
+
+  it('rolls origin and HEAD back when URL publication faults after changing git config', async () => {
+    const th = gitHome();
+    const paths = resolvePaths(th.env);
+    const oldRemote = emptyBare();
+    await run(['init'], { env: th.env });
+    await run(['remote', oldRemote.url], { env: th.env });
+    const related = relatedBare(paths.store);
+    await run(['create', 'writing'], { env: th.env });
+    const localBefore = subjects(paths.store);
+    const oldRemoteBefore = subjects(oldRemote.dir);
+
+    const changeThenFail: GitRunner = async (args, opts) => {
+      if (args[0] === 'remote' && args[1] === 'set-url' && args.includes(related.url)) {
+        await defaultGitRunner(args, opts);
+        return { code: 1, stdout: '', stderr: 'simulated crash after config write', timedOut: false };
+      }
+      return defaultGitRunner(args, opts);
+    };
+    const result = await run(['remote', related.url], { env: th.env, gitRun: changeThenFail });
+
+    expect(result.code).not.toBe(0);
+    expect(originUrl(paths.store)).toBe(oldRemote.url);
+    expect(subjects(paths.store)).toEqual(localBefore);
+    await run(['list'], { env: th.env });
+    expect(subjects(oldRemote.dir)).toEqual(oldRemoteBefore);
   });
 });
 

@@ -10,16 +10,14 @@ import {
   ensureStoreRepo,
   getRemoteUrl,
   headCommit,
-  integrateCandidate,
+  prepareRelatedCandidate,
   normaliseRemoteUrl,
   pushStore,
-  pushUrl,
   rebaseInProgress,
   redactRemoteUrl,
-  resetHardTo,
-  setRemoteUrl,
   validateRemoteCandidate,
 } from '../git.js';
+import { executeRemoteReplacement } from '../remote-transaction.js';
 import { confirmDefault } from '../prompt.js';
 import { ensureStore } from '../store.js';
 import { closeStoreSync, openStoreSync } from './store-sync.js';
@@ -27,9 +25,9 @@ import { closeStoreSync, openStoreSync } from './store-sync.js';
 /**
  * `agentenv remote <url>` — connect or SAFELY REPLACE the single sync remote
  * (design D14, spec criterion 8). Replacement classifies the candidate's history
- * before committing to it, and the configured URL flips only as the LAST step, after
- * the chosen action succeeds — so a fault at any step (probe, fetch, push, integrate,
- * archive) leaves the OLD remote configured and all local content intact.
+ * before committing to it. Push, origin URL, and local HEAD publish through one
+ * durable cutover plan, so a fault at any step is recovered before another command
+ * can sync to either remote.
  *
  * Classification (via `git ls-remote` + fetch + `merge-base`, against the candidate
  * URL directly so `origin` is never touched mid-flight):
@@ -182,17 +180,25 @@ async function sameRemoteSync(ctx: CommandContext, url: string): Promise<RunResu
 async function adoptEmpty(ctx: CommandContext, url: string, existing: string | null): Promise<RunResult> {
   const { paths, env, options } = ctx;
   const redacted = redactRemoteUrl(url);
-
-  const push = await pushUrl(paths, env, url, options.gitRun ? { run: options.gitRun } : {});
-  if (push.status !== 'ok' && push.status !== 'nothing') {
+  const head = await headCommit(paths, env, options.gitRun);
+  if (!head) return fail('remote: local store has no commit to publish; nothing was changed.\n');
+  try {
+    await executeRemoteReplacement({
+      paths,
+      env,
+      newUrl: url,
+      oldUrl: existing,
+      oldHead: head,
+      newHead: head,
+      pushRevision: head,
+      ...(options.gitRun ? { gitRun: options.gitRun } : {}),
+    });
+  } catch (error) {
     const where = existing
       ? `The old remote (${redactRemoteUrl(existing)}) is unchanged`
       : 'Nothing was connected';
-    return fail(`remote: could not push the local store to ${redacted} (${push.detail ?? push.status}). ${where}.\n`);
+    return fail(`remote: could not publish the local store to ${redacted} (${(error as Error).message}). ${where}.\n`);
   }
-
-  // Push succeeded — flip the configured URL as the final step (design D14).
-  await setRemoteUrl(paths, env, url, options.gitRun);
   const verb = existing ? 'Replaced the remote with' : 'Connected remote';
   return ok(`${verb} ${redacted} and pushed the local store.\n`);
 }
@@ -200,9 +206,8 @@ async function adoptEmpty(ctx: CommandContext, url: string, existing: string | n
 /**
  * RELATED candidate (design D14): integrate under the normal rebase rules, then flip.
  * Transactional — the local `HEAD` is captured first, so a push failure AFTER a
- * successful integrate rolls the local branch back to exactly where it started
- * (`integrateCandidate` already restores it on a conflict/error). The OLD remote is
- * never touched until the final flip; a conflict is aborted and refused (never
+ * successful integrate rolls the local branch back to exactly where it started.
+ * Preparation never mutates canonical HEAD; a conflict is aborted and refused (never
  * auto-resolved — the manual `sync --resolve` seam owns conflict UX). Never force-pushes.
  */
 async function integrateRelated(
@@ -219,10 +224,10 @@ async function integrateRelated(
     return fail(`remote: ${redacted} has no branch to integrate; nothing was changed.\n`);
   }
 
-  // Save-point to roll the local branch back to if the post-integrate push fails.
   const savePoint = await headCommit(paths, env, options.gitRun);
+  if (!savePoint) return fail('remote: local store has no commit to integrate; nothing was changed.\n');
 
-  const integ = await integrateCandidate(paths, env, candidateRef, options.gitRun ? { run: options.gitRun } : {});
+  const integ = await prepareRelatedCandidate(paths, env, candidateRef, options.gitRun ? { run: options.gitRun } : {});
   if (integ.status === 'conflict') {
     return fail(
       `remote: integrating ${redacted} hit a conflict and was aborted — ${target.toLowerCase()} unchanged and your ` +
@@ -233,19 +238,29 @@ async function integrateRelated(
     return fail(`remote: could not integrate ${redacted} (${integ.detail ?? 'integration failed'}). ${target} unchanged.\n`);
   }
 
-  // Integrated locally: push the reconciled history back with a NORMAL non-force push.
-  const push = await pushUrl(paths, env, url, options.gitRun ? { run: options.gitRun } : {});
-  if (push.status !== 'ok' && push.status !== 'nothing') {
-    // Roll the local branch back to its exact pre-integrate state (transactional).
-    if (savePoint) await resetHardTo(paths, env, savePoint, options.gitRun);
+  if (!integ.revision || !integ.preparedRef) {
+    return fail(`remote: could not retain the isolated integration for ${redacted}. ${target} unchanged.\n`);
+  }
+  const rejected = await rejectUnsafeCandidate(ctx, integ.preparedRef);
+  if (rejected) return rejected;
+  try {
+    await executeRemoteReplacement({
+      paths,
+      env,
+      newUrl: url,
+      oldUrl: existing,
+      oldHead: savePoint,
+      newHead: integ.revision,
+      pushRevision: integ.revision,
+      preparedRef: integ.preparedRef,
+      ...(options.gitRun ? { gitRun: options.gitRun } : {}),
+    });
+  } catch (error) {
     return fail(
-      `remote: integrated ${redacted} locally but could not push the reconciled history ` +
-        `(${push.detail ?? push.status}). ${target} unchanged and your local store was restored; retry.\n`,
+      `remote: prepared ${redacted} in isolation but could not publish it ` +
+        `(${(error as Error).message}). ${target} unchanged and your local store was restored; retry.\n`,
     );
   }
-
-  // Push succeeded — flip the configured URL as the final step (design D14).
-  await setRemoteUrl(paths, env, url, options.gitRun);
   return ok(`Integrated the related remote ${redacted} (both histories present) and adopted it.\n`);
 }
 
@@ -257,8 +272,8 @@ async function integrateRelated(
  * - Interactive → DEFAULT to cancel; the ONLY alternative is archive-local-and-adopt,
  *   which ARCHIVES the entire local store to a recoverable copy under `~/.agentenv/`
  *   FIRST, then adopts the remote wholesale (`git reset --hard` to the fetched
- *   candidate ref — a LOCAL operation, never a force-push, never a merge), and flips
- *   the URL LAST. An archive failure aborts BEFORE touching local content.
+ *   candidate ref — a LOCAL operation, never a force-push, never a merge) through
+ *   the durable cutover plan. An archive failure aborts BEFORE touching local content.
  */
 async function adoptUnrelated(
   ctx: CommandContext,
@@ -304,18 +319,24 @@ async function adoptUnrelated(
     );
   }
 
-  // Adopt the remote wholesale: reset the local branch to the fetched candidate ref.
-  // A LOCAL reset — never a force-push, never a merge of unrelated histories.
-  const reset = await resetHardTo(paths, env, candidateRef, options.gitRun);
-  if (reset.code !== 0) {
+  const savePoint = await headCommit(paths, env, options.gitRun);
+  if (!savePoint) return fail('remote: local store has no commit to archive; nothing was changed.\n');
+  try {
+    await executeRemoteReplacement({
+      paths,
+      env,
+      newUrl: url,
+      oldUrl: existing,
+      oldHead: savePoint,
+      newHead: candidateRef,
+      ...(options.gitRun ? { gitRun: options.gitRun } : {}),
+    });
+  } catch (error) {
     return fail(
-      `remote: adopting ${redacted} failed (${firstLine(reset.stderr) || 'reset failed'}). Your local store is ` +
+      `remote: adopting ${redacted} failed (${(error as Error).message}). Your local store is ` +
         `preserved in the archive at ${archive.path}. ${cap(target)} unchanged.\n`,
     );
   }
-
-  // Reset succeeded — flip the configured URL as the final step (design D14).
-  await setRemoteUrl(paths, env, url, options.gitRun);
   return ok(
     `Archived the local store to ${archive.path} and adopted the unrelated remote ${redacted}. ` +
       'Your previous store is fully recoverable from that archive.\n',
@@ -363,11 +384,6 @@ function ok(stdout: string): RunResult {
 }
 function fail(stderr: string): RunResult {
   return { stdout: '', stderr, code: 1 };
-}
-
-/** First non-empty, trimmed line — compact diagnostics without a multi-line dump. */
-function firstLine(text: string): string {
-  return text.split('\n').map((l) => l.trim()).find((l) => l !== '') ?? '';
 }
 
 /** Capitalise the first character (for a sentence-leading fragment). */

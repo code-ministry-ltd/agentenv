@@ -11,6 +11,7 @@ import { recoverPendingGlobalCommands } from './global-command.js';
 import { resolvePaths } from './paths.js';
 import { getVersion } from './version.js';
 import { legacyMigrationRequired, migrationGateClosed } from './migration.js';
+import { recoverPendingRemoteReplacements } from './remote-transaction.js';
 import { readState } from './state.js';
 
 export type { RunResult, RunOptions } from './command.js';
@@ -108,6 +109,7 @@ export async function run(
     // any normal invocation can settle it before doing unrelated work. `status`
     // and `doctor` remain observational/explicit recovery surfaces and therefore
     // intentionally report the pending intent instead.
+    await recoverPendingRemoteReplacements(paths, env, options.gitRun);
     await recoverPendingGlobalCommands(paths);
     const pendingBundle = (await readState(paths)).commands.find(
       (plan) => plan.kind === 'filesystem-bundle',

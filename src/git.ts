@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { access, cp, mkdir, readFile, readdir, rm } from 'node:fs/promises';
-import { join, relative, sep } from 'node:path';
+import { dirname, join, relative, sep } from 'node:path';
 import { parseEnvConfig } from './env-config.js';
 import { writeFileAtomic } from './fs-atomic.js';
 import type { Paths } from './paths.js';
@@ -860,14 +860,8 @@ export async function classifyRemoteHistory(
   const preferred = `${CANDIDATE_REF_NS}/${branch}`;
   const candidateRef = refs.includes(preferred) ? preferred : refs[0]!;
 
-  let related = false;
-  for (const ref of refs) {
-    const mb = await git(ctx, ['merge-base', 'HEAD', ref]);
-    if (mb.code === 0 && mb.stdout.trim() !== '') {
-      related = true;
-      break;
-    }
-  }
+  const mb = await git(ctx, ['merge-base', 'HEAD', candidateRef]);
+  const related = mb.code === 0 && mb.stdout.trim() !== '';
   return { status: related ? 'related' : 'unrelated', candidateRef };
 }
 
@@ -906,12 +900,103 @@ export async function pushUrl(
   return { status: 'rejected', detail: redactRemoteUrl(firstLine(res.stderr)) || 'push failed' };
 }
 
-/**
- * Flip the configured `origin` to `url` (design D14) — the FINAL step of a safe
- * replacement, run only after the chosen action (push / integrate / archive+adopt)
- * has succeeded. `set-url` when `origin` exists; `add` on a first connect. A local
- * git-config write; it does not touch the network or the remote repository.
- */
+/** Push one already-validated revision to the current branch at an explicit URL. */
+export async function pushRevisionUrl(
+  paths: Paths,
+  env: NodeJS.ProcessEnv,
+  url: string,
+  revision: string,
+  opts: { run?: GitRunner; timeoutMs?: number } = {},
+): Promise<PushUrlResult> {
+  const ctx = gitContext(paths, env, opts.run);
+  const branch = await currentBranch(ctx);
+  const res = await git(
+    ctx,
+    ['push', url, `${revision}:refs/heads/${branch}`],
+    opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+  );
+  if (res.code === 0) return { status: 'ok' };
+  const blob = `${res.stdout}\n${res.stderr}`;
+  if (res.timedOut) return { status: 'unreachable', detail: 'network timeout' };
+  if (/\[rejected\]|non-fast-forward|fetch first|Updates were rejected/i.test(blob)) {
+    return { status: 'rejected', detail: redactRemoteUrl(firstLine(res.stderr)) || 'push rejected (non-fast-forward)' };
+  }
+  if (/could not read|unable to access|Could not resolve host|Connection|repository .* not found|does not appear to be a git repository|No such file/i.test(blob)) {
+    return { status: 'unreachable', detail: redactRemoteUrl(firstLine(res.stderr)) };
+  }
+  return { status: 'rejected', detail: redactRemoteUrl(firstLine(res.stderr)) || 'push failed' };
+}
+
+export interface PreparedRelatedCandidate {
+  status: 'ok' | 'conflict' | 'error';
+  revision?: string;
+  preparedRef?: string;
+  detail?: string;
+}
+
+/** Rebase in a detached private worktree. Canonical HEAD and its worktree remain
+ * untouched until the remote replacement transaction publishes the result. */
+export async function prepareRelatedCandidate(
+  paths: Paths,
+  env: NodeJS.ProcessEnv,
+  candidateRef: string,
+  opts: { run?: GitRunner } = {},
+): Promise<PreparedRelatedCandidate> {
+  const ctx = gitContext(paths, env, opts.run);
+  const id = randomUUID();
+  const worktree = join(paths.live, 'remote-preparations', id);
+  const preparedRef = `refs/agentenv-prepared/${id}`;
+  await mkdir(dirname(worktree), { recursive: true });
+  const added = await git(ctx, ['worktree', 'add', '--detach', worktree, 'HEAD']);
+  if (added.code !== 0) return { status: 'error', detail: 'could not construct isolated integration worktree' };
+  try {
+    const identity = await resolveGitIdentity(ctx);
+    const rebaseEnv: NodeJS.ProcessEnv = {
+      ...env,
+      GIT_EDITOR: 'true',
+      GIT_SEQUENCE_EDITOR: 'true',
+    };
+    const rebased = await ctx.run([...commitArgs(identity), 'rebase', candidateRef], {
+      cwd: worktree,
+      env: rebaseEnv,
+      timeoutMs: DEFAULT_TIMEOUT_MS,
+    });
+    if (rebased.code !== 0) {
+      await ctx.run(['rebase', '--abort'], { cwd: worktree, env, timeoutMs: DEFAULT_TIMEOUT_MS });
+      const blob = `${rebased.stdout}\n${rebased.stderr}`;
+      return /CONFLICT|could not apply|needs merge|Resolve all conflicts/i.test(blob)
+        ? { status: 'conflict', detail: 'store history diverged from the candidate remote' }
+        : { status: 'error', detail: redactRemoteUrl(firstLine(rebased.stderr)) || 'integration failed' };
+    }
+    const head = await ctx.run(['rev-parse', '--verify', 'HEAD'], {
+      cwd: worktree,
+      env,
+      timeoutMs: DEFAULT_TIMEOUT_MS,
+    });
+    const revision = head.stdout.trim();
+    if (head.code !== 0 || revision === '') return { status: 'error', detail: 'could not identify prepared revision' };
+    const retained = await git(ctx, ['update-ref', preparedRef, revision]);
+    if (retained.code !== 0) return { status: 'error', detail: 'could not retain prepared revision' };
+    return { status: 'ok', revision, preparedRef };
+  } finally {
+    await git(ctx, ['worktree', 'remove', '--force', worktree]);
+    await rm(worktree, { recursive: true, force: true });
+    await git(ctx, ['worktree', 'prune']);
+  }
+}
+
+export async function deletePreparedRemoteRef(
+  paths: Paths,
+  env: NodeJS.ProcessEnv,
+  ref: string,
+  run?: GitRunner,
+): Promise<void> {
+  const ctx = gitContext(paths, env, run);
+  await git(ctx, ['update-ref', '-d', ref]);
+}
+
+/** Set `origin` during a durable remote cutover. `set-url` when it exists;
+ * `add` on first connect. This only writes local Git config. */
 export async function setRemoteUrl(paths: Paths, env: NodeJS.ProcessEnv, url: string, run?: GitRunner): Promise<void> {
   const ctx = gitContext(paths, env, run);
   const res = await git(ctx, ['remote', 'set-url', 'origin', url]);
