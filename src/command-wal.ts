@@ -27,6 +27,8 @@ export interface CommandWalRequest {
   effects: ReadonlyMap<string, CommandEffect>;
   /** Required local Git commit/bookkeeping; queued fail-soft push belongs after this callback. */
   gitBookkeeping?: () => Promise<void>;
+  /** Test/diagnostic seam invoked after each durable plan transition. */
+  afterPersist?: (plan: CommandPlan) => Promise<void>;
 }
 
 export interface RecoverCommandWalRequest {
@@ -34,6 +36,8 @@ export interface RecoverCommandWalRequest {
   transactionId: string;
   effects: ReadonlyMap<string, CommandEffect>;
   gitBookkeeping?: () => Promise<void>;
+  /** Test/diagnostic seam invoked after each durable plan transition. */
+  afterPersist?: (plan: CommandPlan) => Promise<void>;
 }
 
 function replacePlan(manifest: StateManifest, plan: CommandPlan): void {
@@ -46,9 +50,11 @@ async function persistPlan(
   paths: Paths,
   manifest: StateManifest,
   plan: CommandPlan,
+  afterPersist?: (plan: CommandPlan) => Promise<void>,
 ): Promise<void> {
   replacePlan(manifest, plan);
   await writeState(paths, manifest);
+  await afterPersist?.(plan);
 }
 
 async function clearPlan(
@@ -88,15 +94,16 @@ async function rollBackPlan(
   manifest: StateManifest,
   initial: CommandPlan,
   effects: ReadonlyMap<string, CommandEffect>,
+  afterPersist?: (plan: CommandPlan) => Promise<void>,
 ): Promise<CommandPlan> {
   let plan = initial;
   if (plan.phase === 'planned') {
     plan = advanceCommand(plan, 'applying');
-    await persistPlan(paths, manifest, plan);
+    await persistPlan(paths, manifest, plan, afterPersist);
   }
   if (plan.phase === 'applying') {
     plan = advanceCommand(plan, 'rolling-back');
-    await persistPlan(paths, manifest, plan);
+    await persistPlan(paths, manifest, plan, afterPersist);
   }
   if (plan.phase !== 'rolling-back') {
     throw new Error(`cannot roll back command '${plan.transactionId}' while ${plan.phase}`);
@@ -108,7 +115,7 @@ async function rollBackPlan(
     const effect = requireEffect(effects, operation);
     if (operation.state !== 'undoing') {
       plan = advanceOperation(plan, operation.id, 'undoing');
-      await persistPlan(paths, manifest, plan);
+      await persistPlan(paths, manifest, plan, afterPersist);
     }
 
     const current = plan.operations[index]!;
@@ -123,11 +130,11 @@ async function rollBackPlan(
     if (decision.action !== 'skip-pre-state') await effect.undo();
 
     plan = advanceOperation(plan, operation.id, 'undone');
-    await persistPlan(paths, manifest, plan);
+    await persistPlan(paths, manifest, plan, afterPersist);
   }
 
   plan = advanceCommand(plan, 'rolled-back');
-  await persistPlan(paths, manifest, plan);
+  await persistPlan(paths, manifest, plan, afterPersist);
   await clearPlan(paths, manifest, plan.transactionId);
   return plan;
 }
@@ -136,6 +143,7 @@ async function finishGitPending(
   paths: Paths,
   transactionId: string,
   gitBookkeeping: (() => Promise<void>) | undefined,
+  afterPersist?: (plan: CommandPlan) => Promise<void>,
 ): Promise<void> {
   const exists = await withLock(paths, async () => {
     const manifest = await readState(paths);
@@ -157,7 +165,7 @@ async function finishGitPending(
       throw new Error(`command '${transactionId}' is not awaiting Git bookkeeping`);
     }
     const complete = advanceCommand(pending, 'complete');
-    replacePlan(manifest, complete);
+    await persistPlan(paths, manifest, complete, afterPersist);
     await clearPlan(paths, manifest, transactionId);
   });
 }
@@ -178,26 +186,26 @@ export async function executeCommandPlan(req: CommandWalRequest): Promise<void> 
     }
 
     let plan = requestedPlan;
-    await persistPlan(req.paths, manifest, plan);
+    await persistPlan(req.paths, manifest, plan, req.afterPersist);
     try {
       plan = advanceCommand(plan, 'applying');
-      await persistPlan(req.paths, manifest, plan);
+      await persistPlan(req.paths, manifest, plan, req.afterPersist);
       for (const operation of plan.operations) {
         const effect = requireEffect(req.effects, operation);
         plan = advanceOperation(plan, operation.id, 'applying');
-        await persistPlan(req.paths, manifest, plan);
+        await persistPlan(req.paths, manifest, plan, req.afterPersist);
         await effect.apply();
         plan = advanceOperation(plan, operation.id, 'applied');
-        await persistPlan(req.paths, manifest, plan);
+        await persistPlan(req.paths, manifest, plan, req.afterPersist);
       }
       plan = advanceCommand(plan, 'committed');
-      await persistPlan(req.paths, manifest, plan);
+      await persistPlan(req.paths, manifest, plan, req.afterPersist);
       plan = advanceCommand(plan, 'git-pending');
-      await persistPlan(req.paths, manifest, plan);
+      await persistPlan(req.paths, manifest, plan, req.afterPersist);
     } catch (error) {
       if (plan.commitPoint) throw error;
       try {
-        await rollBackPlan(req.paths, manifest, plan, req.effects);
+        await rollBackPlan(req.paths, manifest, plan, req.effects, req.afterPersist);
       } catch (rollbackError) {
         throw new AggregateError(
           [error, rollbackError],
@@ -209,7 +217,7 @@ export async function executeCommandPlan(req: CommandWalRequest): Promise<void> 
     }
   });
 
-  await finishGitPending(req.paths, requestedPlan.transactionId, req.gitBookkeeping);
+  await finishGitPending(req.paths, requestedPlan.transactionId, req.gitBookkeeping, req.afterPersist);
 }
 
 /** Resume either pre-commit rollback or post-commit Git bookkeeping in a fresh process. */
@@ -225,13 +233,15 @@ export async function recoverCommandPlan(req: RecoverCommandWalRequest): Promise
     if (plan.commitPoint) {
       if (plan.phase === 'committed') {
         plan = advanceCommand(plan, 'git-pending');
-        await persistPlan(req.paths, manifest, plan);
+        await persistPlan(req.paths, manifest, plan, req.afterPersist);
       }
       return true;
     }
-    await rollBackPlan(req.paths, manifest, plan, req.effects);
+    await rollBackPlan(req.paths, manifest, plan, req.effects, req.afterPersist);
     return false;
   });
 
-  if (needsGit) await finishGitPending(req.paths, req.transactionId, req.gitBookkeeping);
+  if (needsGit) {
+    await finishGitPending(req.paths, req.transactionId, req.gitBookkeeping, req.afterPersist);
+  }
 }
