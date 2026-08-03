@@ -75,6 +75,39 @@ describe('secrets session: substitute rung composes literals into the private vi
     expect(cfg.mcpServers.gh.env.TOKEN).toBe('from-shell');
   });
 
+  it('invalidates a reused view when a relevant resolved secret changes without persisting it', async () => {
+    const th = home();
+    const paths = resolvePaths(th.env);
+    writeServers(paths.envDir('writing'), 'gh:\n  env:\n    TOKEN: ${SESSION_TOKEN}\n');
+    await writeSecrets(paths, new Map([['SESSION_TOKEN', 'first-private-value']]));
+    const request = {
+      paths,
+      adapter: makeFixtureAdapter({ substituteMcp: true }),
+      envs: ['writing'],
+      session: 'sess-secret-stale',
+      realConfigRoot: join(th.home, 'no-real-root'),
+      env: {} as NodeJS.ProcessEnv,
+      onWarn: () => {},
+    };
+
+    const first = await composeView(request);
+    expect(first.rebuilt).toBe(true);
+    await writeSecrets(paths, new Map([['SESSION_TOKEN', 'second-private-value']]));
+    const second = await composeView(request);
+
+    expect(second.rebuilt).toBe(true);
+    expect(second.generation).toBe(2);
+    expect(second.fingerprint).not.toBe(first.fingerprint);
+    const cfg = JSON.parse(readFileSync(join(second.viewRoot, 'config.json'), 'utf8'));
+    expect(cfg.mcpServers.gh.env.TOKEN).toBe('second-private-value');
+    const meta = readFileSync(
+      join(paths.live, request.session, `${request.adapter.id}.meta.json`),
+      'utf8',
+    );
+    expect(meta).not.toContain('first-private-value');
+    expect(meta).not.toContain('second-private-value');
+  });
+
   it('a passthrough surface keeps the ${VAR} in the view (no substitution)', async () => {
     const th = home();
     const paths = resolvePaths(th.env);

@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import {
   copyFile,
   lstat,
@@ -9,6 +9,7 @@ import {
   rename,
   rm,
   symlink,
+  writeFile,
 } from 'node:fs/promises';
 import { basename, dirname, extname, join } from 'node:path';
 import { parse as parseJsonc } from 'jsonc-parser';
@@ -852,6 +853,7 @@ async function fingerprintInputs(req: ComposeRequest): Promise<string> {
     [...envs],
     req.projectRoot ?? null,
     await dirSignature(realConfigRoot),
+    await relevantSecretFingerprint(req),
   ];
 
   for (const surface of adapter.surfaces) {
@@ -894,6 +896,93 @@ async function fingerprintInputs(req: ComposeRequest): Promise<string> {
     parts.push([mapping.id, 'raw', storeSigs, realSig]);
   }
   return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+}
+
+function placeholderNames(template: string): string[] {
+  const names: string[] = [];
+  for (const match of template.matchAll(/\$\{([^}]+)\}/g)) {
+    const name = match[1]!.trim();
+    if (name && !names.includes(name)) names.push(name);
+  }
+  return names;
+}
+
+async function secretFingerprintKey(paths: Paths): Promise<Buffer> {
+  const file = join(paths.base, '.secret-fingerprint-key');
+  try {
+    const existing = await readFile(file);
+    if (existing.length >= 32) return existing;
+    throw new Error(`secret fingerprint key is malformed: ${file}`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+
+  await mkdir(dirname(file), { recursive: true });
+  const generated = randomBytes(32);
+  try {
+    await writeFile(file, generated, { flag: 'wx', mode: 0o600 });
+    return generated;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    const winner = await readFile(file);
+    if (winner.length < 32) {
+      throw new Error(`secret fingerprint key is malformed: ${file}`, { cause: error });
+    }
+    return winner;
+  }
+}
+
+/** Keyed digests of only values a substitute-mode session would bake into its view. */
+async function relevantSecretFingerprint(req: ComposeRequest): Promise<unknown[]> {
+  const relevant: Array<{
+    context: readonly unknown[];
+    name: string;
+    value: string | undefined;
+  }> = [];
+  for (const plan of sessionSurfacePlans(req.adapter)) {
+    const surface = plan.surface;
+    if (surface.mechanism !== 'config-keys' || !surface.supported || !surface.substitutePlaceholders) {
+      continue;
+    }
+    for (const env of req.envs) {
+      let injections: ConfigKeysInjection[];
+      try {
+        injections = await req.adapter.compileConfigKeys(surface, {
+          envContentDir: req.paths.envDir(env),
+          projectRoot: req.projectRoot ?? null,
+          onWarn: () => {},
+        });
+      } catch {
+        continue; // composition reports the compile failure; no literal is emitted
+      }
+      const resolver = await loadResolver(req.paths, req.env ?? process.env);
+      for (const injection of injections) {
+        if (injection.style !== 'keyed' || !injection.secretFields) continue;
+        for (const [field, template] of Object.entries(injection.secretFields)) {
+          for (const name of placeholderNames(template)) {
+            relevant.push({
+              context: [req.adapter.id, surface.id, env, injection.keyPath, field],
+              name,
+              value: resolver.resolve(name),
+            });
+          }
+        }
+      }
+    }
+  }
+  if (relevant.length === 0) return [];
+
+  const key = await secretFingerprintKey(req.paths);
+  return relevant.map(({ context, name, value }) => {
+    const digest = createHmac('sha256', key)
+      .update(JSON.stringify(context))
+      .update('\0')
+      .update(name)
+      .update('\0')
+      .update(value === undefined ? 'unresolved\0' : `resolved\0${value}`)
+      .digest('hex');
+    return [context, name, digest];
+  });
 }
 
 async function rawTreeSignature(root: string, allowExternalSymlinks = false): Promise<string> {
