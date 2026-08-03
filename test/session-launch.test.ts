@@ -2,6 +2,8 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { run } from '../src/cli.js';
+import { defaultGitRunner, type GitRunner } from '../src/git.js';
 import { resolvePaths } from '../src/paths.js';
 import { writeSecrets } from '../src/secrets.js';
 import type { ExecHarness, ExecSpec } from '../src/session/exec.js';
@@ -153,6 +155,55 @@ describe('session launch', () => {
       (candidate) => candidate.id === result.generationId,
     );
     expect(generation?.phase).toBe('swept');
+  });
+
+  it('quarantines a generation when its required final drift commit fails', async () => {
+    const th = home();
+    const { paths, env } = scenario(th);
+    const storeInstruction = join(paths.envDir('writing'), 'instructions', 'base.md');
+    mkdirSync(join(storeInstruction, '..'), { recursive: true });
+    writeFileSync(storeInstruction, 'ORIGINAL INSTRUCTION\n');
+    await run(['init'], { env });
+
+    const failingCommit: GitRunner = (args, options) =>
+      args.includes('commit')
+        ? Promise.resolve({
+            code: 1,
+            stdout: '',
+            stderr: 'fatal: injected session commit failure',
+            timedOut: false,
+          })
+        : defaultGitRunner(args, options);
+    const exec: ExecHarness = async (spec) => {
+      await spec.onSpawn?.({
+        processGroupId: 4300,
+        pid: 4301,
+        processStart: 'fixture-start-4301',
+      });
+      const viewRoot = spec.env[FIXTURE_CONFIG_ENV]!;
+      const instructions = join(viewRoot, 'INSTRUCTIONS.md');
+      writeFileSync(
+        instructions,
+        readFileSync(instructions, 'utf8').replace(
+          'ORIGINAL INSTRUCTION',
+          'UNCOMMITTED HARNESS EDIT',
+        ),
+      );
+      return 0;
+    };
+
+    const request = {
+      ...req({ paths, adapter: makeFixtureAdapter(), env, execHarness: exec }),
+      gitRun: failingCommit,
+    } as LaunchRequest & { gitRun: GitRunner };
+    const result = await launchHarness(request);
+
+    const generation = (await readState(paths)).generations.find(
+      (candidate) => candidate.id === result.generationId,
+    );
+    expect(generation?.phase).toBe('quarantined');
+    expect(result.notices.join(' ')).toMatch(/final generation sweep failed|commit failed/i);
+    expect(readFileSync(storeInstruction, 'utf8')).toBe('UNCOMMITTED HARNESS EDIT\n');
   });
 
   it('uses Adapter v2 launch arguments, environment, and optional root override', async () => {

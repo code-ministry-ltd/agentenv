@@ -97,6 +97,7 @@ export const shimCommand: Command = {
         execHarness: options.execHarness,
         capture: options.capture,
         now: options.now,
+        gitRun: options.gitRun,
       });
     } catch (err) {
       // Belt-and-suspenders (M2): launchHarness already fails open internally, but

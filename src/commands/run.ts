@@ -70,6 +70,7 @@ export const runCommand: Command = {
       execHarness: options.execHarness,
       capture: options.capture,
       now: options.now,
+      gitRun: options.gitRun,
     });
     return toRunResult(result);
   },

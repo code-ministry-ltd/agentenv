@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import type { Adapter, SelfCheckContext } from '../adapter.js';
 import { renderSessionLaunch } from '../adapter-v2.js';
 import { driftSweep } from '../drift.js';
+import { commitStore, pushStore, type CommitResult, type GitRunner } from '../git.js';
 import type { Paths } from '../paths.js';
 import { loadSecrets } from '../secrets.js';
 import { readState } from '../state.js';
@@ -81,6 +82,19 @@ export interface LaunchRequest {
   execHarness?: ExecHarness;
   capture?: CaptureFn;
   now?: () => number;
+  /** Store Git seam; final sweep must commit before the generation becomes swept. */
+  gitRun?: GitRunner;
+}
+
+function requireFinalCommit(commit: CommitResult): void {
+  if (commit.status === 'blocked') {
+    throw new Error(
+      `required drift commit blocked by ${commit.findings?.length ?? 0} suspected secret finding(s)`,
+    );
+  }
+  if (commit.status === 'rebase-in-progress') {
+    throw new Error('required drift commit blocked by an in-progress rebase');
+  }
 }
 
 export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
@@ -285,6 +299,7 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
     });
   } finally {
     if (!lifecycleFailed) {
+      let sweepCompleted = false;
       try {
         await closeSessionGeneration(paths, generationId, reservationId, now());
         await beginSessionGenerationSweep(paths, generationId);
@@ -295,7 +310,15 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
           generationIds: [generationId],
           onWarn: (message) => notices.push(message),
         });
+        const commit = await commitStore(
+          paths,
+          execEnv,
+          `agentenv: sweep session generation ${generationId}`,
+          req.gitRun,
+        );
+        requireFinalCommit(commit);
         await completeSessionGenerationSweep(paths, generationId, now());
+        sweepCompleted = true;
       } catch (err) {
         notices.push(
           `agentenv: final generation sweep failed; retained for resolution ` +
@@ -305,6 +328,24 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
           await quarantineSessionGeneration(paths, generationId, (err as Error).message);
         } catch {
           // Preserve the original sweep failure; state may itself be unavailable.
+        }
+      }
+      if (sweepCompleted) {
+        try {
+          const push = await pushStore(paths, execEnv, {
+            ...(req.gitRun ? { run: req.gitRun } : {}),
+            now,
+          });
+          if (push.status === 'queued') {
+            notices.push(
+              `agentenv: final generation push deferred (${push.detail ?? 'offline'}); queued for retry`,
+            );
+          }
+        } catch (err) {
+          notices.push(
+            `agentenv: final generation push skipped; local commit is safe ` +
+              `(${(err as Error).message})`,
+          );
         }
       }
     }
