@@ -165,7 +165,17 @@ describe('sync: post-pull safeguards quarantine a bad pulled tree (D9)', () => {
     expect(existsSync(join(realHome, 'skills', 'w-skill'))).toBe(false);
   });
 
-  it('quarantines a clean candidate tip whose newly reachable history contains a secret', async () => {
+  it.each([
+    ['plain text', Buffer.from('api_key: AKIAZ7Q2W9E4R6T1Y8U3\n')],
+    ['NUL-bearing bytes', Buffer.from('prefix\0api_key: AKIAZ7Q2W9E4R6T1Y8U3\n')],
+    [
+      'an oversized blob',
+      Buffer.concat([
+        Buffer.alloc(2 * 1024 * 1024, 0x61),
+        Buffer.from('\napi_key: AKIAZ7Q2W9E4R6T1Y8U3\n'),
+      ]),
+    ],
+  ])('quarantines a clean candidate tip whose history contains a secret in %s', async (_kind, payload) => {
     const th = gitHome();
     const { paths, realHome, env } = localWithWork(th);
     const opts = { env, adapters: [makeFixtureAdapter()] };
@@ -180,7 +190,7 @@ describe('sync: post-pull safeguards quarantine a bad pulled tree (D9)', () => {
     dirs.push(wd);
     const clone = join(wd, 'clone');
     quietGit(['clone', remote, clone]);
-    writeFileSync(join(clone, 'temporary-leak.txt'), 'api_key: AKIAZ7Q2W9E4R6T1Y8U3\n');
+    writeFileSync(join(clone, 'temporary-leak.txt'), payload);
     quietGit(['add', '-A'], clone);
     quietGit(['commit', '-m', 'temporarily add leaked credential', '--no-verify'], clone);
     rmSync(join(clone, 'temporary-leak.txt'));

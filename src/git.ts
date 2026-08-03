@@ -509,12 +509,19 @@ export async function scanRevisionRangeForSecrets(
     if (size.code !== 0 || !Number.isSafeInteger(byteLength) || byteLength < 0) {
       throw new Error('could not size a newly reachable candidate blob');
     }
-    // Store content is intentionally small. Skip large/binary blobs while still
-    // scanning extensionless text; NUL is a stronger binary signal than a suffix.
-    if (byteLength > 2 * 1024 * 1024) continue;
+    // Candidate history is hostile input. The bounded scanner must fail closed
+    // instead of silently trusting a blob it declines to load.
+    if (byteLength > 2 * 1024 * 1024) {
+      const label = objectPath || `<blob-${objectId.slice(0, 12)}>`;
+      findings.push({
+        file: `history:${label}@${objectId.slice(0, 12)}`,
+        line: 1,
+        reason: 'candidate blob exceeds the bounded secret-scan limit',
+      });
+      continue;
+    }
     const blob = await git(ctx, ['cat-file', 'blob', objectId]);
     if (blob.code !== 0) throw new Error('could not read a newly reachable candidate blob');
-    if (blob.stdout.includes('\0')) continue;
     const label = objectPath || `<blob-${objectId.slice(0, 12)}>`;
     for (const hit of scanTextForSecrets(blob.stdout)) {
       findings.push({
