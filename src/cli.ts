@@ -2,6 +2,7 @@ import type { Command, RunOptions, RunResult } from './command.js';
 import { commands, findCommand } from './commands/index.js';
 import { resolvePaths } from './paths.js';
 import { getVersion } from './version.js';
+import { legacyMigrationRequired, migrationGateClosed } from './migration.js';
 
 export type { RunResult, RunOptions } from './command.js';
 
@@ -70,9 +71,28 @@ export async function run(
     };
   }
 
+  const paths = resolvePaths(env);
+  const recoveryCommands = new Set(['__shim', 'doctor', 'migrate', 'status']);
+  if (!recoveryCommands.has(command.name)) {
+    if (await migrationGateClosed(paths)) {
+      return {
+        stdout: '',
+        stderr: `agentenv: migration gate is closed; only migrate, status, and doctor are available\n`,
+        code: 2,
+      };
+    }
+    if (await legacyMigrationRequired(paths)) {
+      return {
+        stdout: '',
+        stderr: `agentenv: this v1 installation must be migrated before mutation; run 'agentenv migrate'\n`,
+        code: 2,
+      };
+    }
+  }
+
   return command.run({
     args: argv.slice(1),
-    paths: resolvePaths(env),
+    paths,
     env,
     cwd,
     options,

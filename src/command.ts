@@ -2,6 +2,7 @@ import type { Adapter } from './adapter.js';
 import type { ConflictedFile, GitRunner } from './git.js';
 import type { Paths } from './paths.js';
 import type { CaptureFn, ExecHarness } from './session/exec.js';
+import type { MigrationRequest } from './migration.js';
 
 /** Outcome of a CLI invocation: text to print and a process exit code. */
 export interface RunResult {
@@ -70,6 +71,8 @@ export interface RunOptions {
    * re-run to continue).
    */
   resolveConflicts?: (files: readonly ConflictedFile[]) => Promise<boolean>;
+  /** Hermetic migration seams for quiescence, probes, clocks, and fault tests. */
+  migration?: Omit<MigrationRequest, 'paths' | 'adapters'>;
 }
 
 /** Everything a command handler receives for one invocation. */

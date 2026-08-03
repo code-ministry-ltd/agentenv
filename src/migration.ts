@@ -201,6 +201,21 @@ export async function migrationGateClosed(paths: Paths): Promise<boolean> {
   }
 }
 
+/** Whether an on-disk state file is one of the two v1 formats awaiting migration. */
+export async function legacyMigrationRequired(paths: Paths): Promise<boolean> {
+  try {
+    const raw = JSON.parse(await readFile(paths.state, 'utf8')) as { version?: unknown };
+    return (
+      typeof raw.version === 'string' &&
+      Number.parseInt(raw.version.split('.')[0] ?? '', 10) === 1
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    // Corrupt state belongs to doctor/recovery, not implicit migration detection.
+    return false;
+  }
+}
+
 async function snapshot(path: string, backupPath: string): Promise<Snapshot> {
   let metadata;
   try {

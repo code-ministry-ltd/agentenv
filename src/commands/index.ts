@@ -10,6 +10,7 @@ import { dropCommand } from './drop.js';
 import { editCommand } from './edit.js';
 import { initCommand } from './init.js';
 import { listCommand } from './list.js';
+import { migrateCommand } from './migrate.js';
 import { remoteCommand } from './remote.js';
 import { resolveCommand } from './resolve.js';
 import { rmCommand } from './rm.js';
@@ -29,6 +30,7 @@ import { useCommand } from './use.js';
  */
 export const commands: readonly Command[] = [
   initCommand,
+  migrateCommand,
   createCommand,
   listCommand,
   showCommand,

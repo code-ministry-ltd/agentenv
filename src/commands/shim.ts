@@ -8,6 +8,7 @@ import { launchHarness, type LaunchResult } from '../session/launch.js';
 import { resolveProjectRoot, resolveSessionBinding } from '../session/registry.js';
 import { resolveBinaryOnPath, sanitisePath } from '../session/resolve.js';
 import { environmentExists } from '../store.js';
+import { legacyMigrationRequired, migrationGateClosed } from '../migration.js';
 
 /**
  * `agentenv __shim <harness> -- <args…>` — the Node side of the PATH shim (D15).
@@ -41,6 +42,16 @@ export const shimCommand: Command = {
     }
 
     const notices: string[] = [];
+    if ((await migrationGateClosed(paths)) || (await legacyMigrationRequired(paths))) {
+      notices.push(
+        'agentenv: migration gate is closed — launching the real harness without environment overrides',
+      );
+      const passthrough = await execUnmanaged(paths, binaryName, harnessArgs, env, cwd, options);
+      return {
+        ...passthrough,
+        stderr: `${notices.join('\n')}\n${passthrough.stderr ?? ''}`,
+      };
+    }
     const session = env.AGENTENV_SESSION;
     let envs: string[] | null = null;
     try {

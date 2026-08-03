@@ -111,7 +111,17 @@ describe('engine: init', () => {
     await mkdir(paths.base, { recursive: true });
     writeFileSync(
       paths.state,
-      JSON.stringify({ version: '1.0', items: [{ surface: 'dir-merge', path: '/x', ownerEnv: 'writing' }] }),
+      JSON.stringify({
+        version: '2.0',
+        items: [{ surface: 'dir-merge', action: 'symlink', path: '/x', ownerEnv: 'writing' }],
+        commands: [],
+        generations: [],
+        globalProjections: [],
+        projectionRecords: [],
+        candidates: [],
+        quarantine: [],
+        migration: null,
+      }),
     );
 
     const res = await run(['init'], { env: th.env });
