@@ -106,6 +106,8 @@ export interface SyncBeforeRequest {
   skipAdopt?: boolean;
   /** Pull network budget (ms). Defaults to git.ts's ~3s. */
   pullTimeoutMs?: number;
+  /** Run local sweep/adoption/commit only; never contact a remote. */
+  offline?: boolean;
 }
 
 /**
@@ -191,6 +193,11 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
       } catch (err) {
         onNotice(`agentenv: auto-adopt sweep skipped — ${(err as Error).message}`);
       }
+    }
+
+    if (req.offline) {
+      onNotice('agentenv: offline mode — remote fetch and candidate promotion were skipped.');
+      return { synced: true, pulled: false, quarantined: false, conflicted: false, paused: false };
     }
 
     // 3. Fetch into a private ref and detached worktree. The canonical store is
@@ -315,6 +322,8 @@ export interface SyncAfterRequest {
   onNotice: (message: string) => void;
   gitRun?: GitRunner;
   now?: () => number;
+  /** Never contact a remote or flush the pending push queue. */
+  offline?: boolean;
 }
 
 /**
@@ -327,6 +336,7 @@ export interface SyncAfterRequest {
 export async function endStoreSync(req: SyncAfterRequest): Promise<PushResult | undefined> {
   const { paths, env, onNotice, gitRun, now } = req;
   if (!(await storeIsRepo(paths))) return undefined;
+  if (req.offline) return undefined;
   // Symmetric to {@link beginStoreSync}'s held-rebase guard (D9, Task 2.2): never
   // push while a `sync --resolve` two-step is HELD in progress. No garbage commit can
   // exist (commitStore refuses mid-rebase), and the completing `sync --resolve` runs

@@ -83,6 +83,7 @@ export async function openStoreSync(
     adapters: inScopeAdapters(options),
     onNotice: (n) => notices.push(n),
     ...(options.gitRun ? { gitRun: options.gitRun } : {}),
+    ...(options.globals?.offline ? { offline: true } : {}),
     ...(opts.alreadySwept ? { alreadySwept: true } : {}),
     ...(opts.skipAdopt ? { skipAdopt: true } : {}),
   });
@@ -97,6 +98,7 @@ export async function closeStoreSync(ctx: SyncCtx, notices: string[]): ReturnTyp
     env,
     onNotice: (n) => notices.push(n),
     ...(options.gitRun ? { gitRun: options.gitRun } : {}),
+    ...(options.globals?.offline ? { offline: true } : {}),
   });
   try {
     await collectLifecycleGarbage(paths, { limit: 4 });

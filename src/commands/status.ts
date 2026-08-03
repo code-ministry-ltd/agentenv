@@ -22,9 +22,78 @@ export const statusCommand: Command = {
     lines.push(...(await sessionSection(ctx)));
     lines.push('');
     lines.push(...(await globalSection(ctx)));
-    return { stdout: `${lines.join('\n')}\n`, code: 0 };
+    return { stdout: `${lines.join('\n')}\n`, code: 0, data: await statusData(ctx) };
   },
 };
+
+async function statusData(ctx: CommandContext): Promise<unknown> {
+  const { paths, env, cwd, options } = ctx;
+  const manifest = await readState(paths);
+  const projectRoot = await resolveProjectRoot(cwd);
+  const sessionId = env.AGENTENV_SESSION?.trim() || null;
+  const binding = sessionId
+    ? findBinding(await readSessionRegistry(paths), sessionId, projectRoot)
+    : undefined;
+  const global = await describeGlobal({ paths, adapters: options.adapters ?? realAdapters, env });
+  const conflict = await readConflictMarker(paths);
+  return {
+    session: {
+      projectRoot,
+      sessionId,
+      mode: binding ? 'bound' : 'unbound',
+      envs: binding?.envs ?? [],
+      harnesses: binding?.harnesses ?? [],
+    },
+    global,
+    sync: {
+      blocked: conflict.pending,
+      candidates: manifest.candidates
+        .filter((candidate) => candidate.phase !== 'promoted' && candidate.phase !== 'abandoned')
+        .map((candidate) => ({
+          id: candidate.id,
+          phase: candidate.phase,
+          blockers: [...candidate.blockers],
+          fetchedAt: candidate.fetchedAt,
+        })),
+    },
+    lifecycle: {
+      commands: manifest.commands.map((command) => ({
+        id: command.transactionId,
+        kind: command.kind,
+        phase: command.phase,
+        gitRequired: command.gitRequired === true,
+      })),
+      generations: manifest.generations
+        .filter((generation) => generation.phase !== 'collected')
+        .map((generation) => ({
+          id: generation.id,
+          phase: generation.phase,
+          envs: [...generation.envs],
+          reservations: generation.reservations.length,
+          leases: generation.leases.length,
+        })),
+      projections: manifest.globalProjections
+        .filter((projection) => projection.phase !== 'collected')
+        .map((projection) => ({
+          id: projection.id,
+          phase: projection.phase,
+          ownerEnv: projection.ownerEnv ?? null,
+        })),
+      rescues: manifest.quarantine
+        .filter((rescue) => !rescue.resolved)
+        .map((rescue) => ({ id: rescue.id, kind: rescue.kind })),
+      migration: manifest.migration
+        ? {
+            id: manifest.migration.id,
+            sourceFormat: manifest.migration.sourceFormat,
+            phase: manifest.migration.phase,
+            gate: manifest.migration.gate,
+            commitPoint: manifest.migration.commitPoint,
+          }
+        : null,
+    },
+  };
+}
 
 async function lifecycleSection(ctx: CommandContext): Promise<string[]> {
   const manifest = await readState(ctx.paths);

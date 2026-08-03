@@ -1,4 +1,4 @@
-import type { Command, RunOptions, RunResult } from './command.js';
+import type { Command, GlobalCliOptions, RunOptions, RunResult } from './command.js';
 import { commands, findCommand } from './commands/index.js';
 import { resolvePaths } from './paths.js';
 import { getVersion } from './version.js';
@@ -27,8 +27,11 @@ function helpText(): string {
 
   lines.push(
     'Options:',
-    '  -v, --version   Print the version and exit',
-    '  -h, --help      Show this help and exit',
+    '  --json           Emit one machine-readable JSON result',
+    '  --offline        Disable fetch, pull, push, and remote probes',
+    '  --verbose        Include safe command diagnostics',
+    '  -v, --version    Print the version and exit',
+    '  -h, --help       Show this help and exit',
     '',
   );
   return lines.join('\n');
@@ -51,7 +54,10 @@ export async function run(
   const env = options.env ?? process.env;
   const cwd = options.cwd ?? process.cwd();
 
-  const first = argv[0];
+  const parsed = parseGlobalOptions(argv);
+  if ('error' in parsed) return parsed.error;
+  const { globals, rest } = parsed;
+  const first = rest[0];
 
   if (first === '--version' || first === '-v') {
     return { stdout: `${getVersion()}\n`, code: 0 };
@@ -64,37 +70,95 @@ export async function run(
 
   const command = findCommand(first);
   if (!command) {
-    return {
+    return formatResult(first, globals, resolvePaths(env), {
       stderr: `agentenv: unknown command '${first}'\nRun 'agentenv --help' for usage.\n`,
       stdout: '',
       code: 1,
-    };
+    });
   }
 
   const paths = resolvePaths(env);
   const recoveryCommands = new Set(['__shim', 'doctor', 'migrate', 'status']);
   if (!recoveryCommands.has(command.name)) {
     if (await migrationGateClosed(paths)) {
-      return {
+      return formatResult(command.name, globals, paths, {
         stdout: '',
         stderr: `agentenv: migration gate is closed; only migrate, status, and doctor are available\n`,
         code: 2,
-      };
+      });
     }
     if (await legacyMigrationRequired(paths)) {
-      return {
+      return formatResult(command.name, globals, paths, {
         stdout: '',
         stderr: `agentenv: this v1 installation must be migrated before mutation; run 'agentenv migrate'\n`,
         code: 2,
-      };
+      });
     }
   }
 
-  return command.run({
-    args: argv.slice(1),
+  const result = await command.run({
+    args: rest.slice(1),
     paths,
     env,
     cwd,
-    options,
+    options: { ...options, globals },
   });
+  return formatResult(command.name, globals, paths, result);
+}
+
+function parseGlobalOptions(
+  argv: readonly string[],
+): { globals: GlobalCliOptions; rest: readonly string[] } | { error: RunResult } {
+  const globals: GlobalCliOptions = { json: false, offline: false, verbose: false };
+  let index = 0;
+  while (index < argv.length) {
+    const arg = argv[index]!;
+    if (arg === '--json') globals.json = true;
+    else if (arg === '--offline') globals.offline = true;
+    else if (arg === '--verbose') globals.verbose = true;
+    else if (arg.startsWith('--') && arg !== '--help' && arg !== '--version') {
+      const result: RunResult = {
+        stdout: '',
+        stderr: `agentenv: unknown global option '${arg}'\nRun 'agentenv --help' for usage.\n`,
+        code: 1,
+      };
+      if (!globals.json) return { error: result };
+      return {
+        error: formatResult('(root)', globals, resolvePaths({}), result),
+      };
+    } else break;
+    index += 1;
+  }
+  return { globals, rest: argv.slice(index) };
+}
+
+function formatResult(
+  command: string,
+  globals: GlobalCliOptions,
+  paths: ReturnType<typeof resolvePaths>,
+  result: RunResult,
+): RunResult {
+  const warnings = (result.stderr ?? '').trimEnd();
+  const output = result.stdout.trimEnd();
+  if (globals.json) {
+    const payload = {
+      schemaVersion: 1,
+      ok: result.code === 0,
+      command,
+      code: result.code,
+      data: result.data ?? { output },
+      warnings: warnings === '' ? [] : warnings.split('\n'),
+      ...(globals.verbose
+        ? { diagnostics: { offline: globals.offline, agentenvHome: paths.base } }
+        : {}),
+    };
+    return { stdout: `${JSON.stringify(payload, null, 2)}\n`, code: result.code };
+  }
+  if (!globals.verbose) return result;
+  const diagnostic =
+    `agentenv: command=${command} home=${paths.base} offline=${globals.offline ? 'yes' : 'no'}`;
+  return {
+    ...result,
+    stderr: `${result.stderr ?? ''}${diagnostic}\n`,
+  };
 }

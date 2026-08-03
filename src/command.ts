@@ -9,6 +9,14 @@ export interface RunResult {
   stdout: string;
   stderr?: string;
   code: number;
+  /** Optional semantic payload used by root --json instead of wrapping rendered text. */
+  data?: unknown;
+}
+
+export interface GlobalCliOptions {
+  json: boolean;
+  offline: boolean;
+  verbose: boolean;
 }
 
 /** One skill offered by the `add skills` checklist: a name and its description. */
@@ -73,6 +81,8 @@ export interface RunOptions {
   resolveConflicts?: (files: readonly ConflictedFile[]) => Promise<boolean>;
   /** Hermetic migration seams for quiescence, probes, clocks, and fault tests. */
   migration?: Omit<MigrationRequest, 'paths' | 'adapters'>;
+  /** Root CLI flags parsed before dispatch; commands treat this as read-only. */
+  globals?: GlobalCliOptions;
 }
 
 /** Everything a command handler receives for one invocation. */
