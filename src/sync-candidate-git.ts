@@ -1,5 +1,10 @@
-import { mkdir, rm } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { cp, mkdir, rm } from 'node:fs/promises';
+import { dirname, join, relative, resolve, sep } from 'node:path';
+import {
+  publishStagedBundle,
+  recoverPendingFilesystemBundles,
+  type StagedBundleEntry,
+} from './filesystem-bundle.js';
 import {
   getRemoteUrl,
   gitContext,
@@ -9,6 +14,8 @@ import {
   type GitRunner,
 } from './git.js';
 import type { Paths } from './paths.js';
+import { capturePathIdentity, identitiesEqual } from './path-identity.js';
+import { readState } from './state.js';
 import { createSyncCandidate, type SyncCandidate } from './sync-candidate.js';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -156,30 +163,145 @@ export interface PromoteCandidateResult {
   detail?: string;
 }
 
-/** Promote only if the canonical branch still has the identity we prepared from. */
-export async function promoteSyncCandidate(req: {
+export interface PromoteCandidateRequest {
   paths: Paths;
   env: NodeJS.ProcessEnv;
+  id: string;
+  worktree: string;
+  touchedCanonicalPaths: readonly string[];
   expectedHead: string;
   revision: string;
   run?: GitRunner;
-}): Promise<PromoteCandidateResult> {
+  /** Fault injection after one canonical path has been applied. */
+  afterApply?: (entry: StagedBundleEntry) => Promise<void>;
+}
+
+function containedBy(root: string, candidate: string): boolean {
+  const rel = relative(resolve(root), resolve(candidate));
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !rel.startsWith(sep);
+}
+
+async function advanceCandidateHead(req: PromoteCandidateRequest): Promise<void> {
   const current = await headCommit(req.paths, req.env, req.run);
+  if (current !== req.expectedHead && current !== req.revision) {
+    throw new Error('candidate Git bookkeeping found an unexpected canonical HEAD');
+  }
+  const reset = await runAt(req, req.paths.store, ['reset', '--mixed', req.revision]);
+  if (reset.code !== 0) {
+    throw new Error(
+      `candidate promotion Git bookkeeping failed (${firstLine(reset.stderr) || 'git reset --mixed failed'})`,
+    );
+  }
+  const advanced = await headCommit(req.paths, req.env, req.run);
+  const status = await runAt(req, req.paths.store, ['status', '--porcelain']);
+  if (advanced !== req.revision || status.code !== 0 || status.stdout.trim() !== '') {
+    throw new Error('candidate promotion Git bookkeeping did not produce the validated clean revision');
+  }
+}
+
+async function verifyCandidateWorktree(req: PromoteCandidateRequest): Promise<void> {
+  const revision = await runAt(req, req.worktree, ['rev-parse', '--verify', 'HEAD']);
+  if (revision.code !== 0 || revision.stdout.trim() !== req.revision) {
+    throw new Error('retained candidate worktree no longer has its validated revision');
+  }
+  const status = await runAt(req, req.worktree, ['status', '--porcelain']);
+  if (status.code !== 0 || status.stdout.trim() !== '') {
+    throw new Error('retained candidate worktree changed after validation');
+  }
+}
+
+/** Promote only if the canonical branch still has the identity we prepared from. */
+export async function promoteSyncCandidate(
+  req: PromoteCandidateRequest,
+): Promise<PromoteCandidateResult> {
+  const transactionId = `candidate-${req.id}`;
+  const existing = (await readState(req.paths)).commands.find(
+    (plan) => plan.transactionId === transactionId,
+  );
+  if (existing) {
+    if (existing.kind !== 'filesystem-bundle') {
+      return { status: 'error', detail: 'candidate transaction id belongs to another command' };
+    }
+    await recoverPendingFilesystemBundles(
+      req.paths,
+      () => advanceCandidateHead(req),
+      transactionId,
+    );
+    if (existing.commitPoint) return { status: 'promoted' };
+  }
+
+  const current = await headCommit(req.paths, req.env, req.run);
+  if (current === req.revision) {
+    const status = await runAt(req, req.paths.store, ['status', '--porcelain']);
+    return status.code === 0 && status.stdout.trim() === ''
+      ? { status: 'promoted' }
+      : { status: 'error', detail: 'canonical store changed after candidate HEAD advanced' };
+  }
   if (current !== req.expectedHead) {
     return { status: 'deferred', blocker: 'canonical-head-changed' };
   }
   const dirty = await runAt(req, req.paths.store, ['status', '--porcelain']);
   if (dirty.code !== 0) return { status: 'error', detail: 'could not inspect canonical store' };
   if (dirty.stdout.trim() !== '') return { status: 'deferred', blocker: 'canonical-worktree-dirty' };
+  await verifyCandidateWorktree(req);
 
-  const reset = await runAt(req, req.paths.store, ['reset', '--hard', req.revision]);
-  if (reset.code !== 0) {
-    return {
-      status: 'error',
-      detail: `candidate promotion failed (${firstLine(reset.stderr) || 'git reset failed'})`,
-    };
+  const stagingRoot = join(req.paths.live, 'commands', transactionId);
+  await mkdir(stagingRoot, { recursive: true });
+  try {
+    const entries: StagedBundleEntry[] = [];
+    const sources: Array<{ path: string; staged: string }> = [];
+    const paths = [...new Set(req.touchedCanonicalPaths)].sort();
+    for (const [index, path] of paths.entries()) {
+      const target = resolve(req.paths.store, path);
+      const source = resolve(req.worktree, path);
+      if (!containedBy(req.paths.store, target) || !containedBy(req.worktree, source)) {
+        throw new Error(`candidate path escapes its isolated or canonical store: '${path}'`);
+      }
+      const staged = join(stagingRoot, `candidate-${index}`);
+      const sourceBefore = await capturePathIdentity(source);
+      if (sourceBefore.kind !== 'absent') {
+        await cp(source, staged, {
+          recursive: true,
+          dereference: false,
+          errorOnExist: true,
+          force: false,
+          preserveTimestamps: true,
+        });
+      }
+      const sourceAfter = await capturePathIdentity(source);
+      const stagedIdentity = await capturePathIdentity(staged);
+      if (
+        !identitiesEqual(sourceBefore, sourceAfter) ||
+        !identitiesEqual(sourceBefore, stagedIdentity)
+      ) {
+        throw new Error(`candidate path changed or was not staged byte-for-byte: '${path}'`);
+      }
+      entries.push({ id: `candidate-${index}`, target, staged });
+      sources.push({ path: source, staged });
+    }
+    await verifyCandidateWorktree(req);
+    for (const source of sources) {
+      if (
+        !identitiesEqual(
+          await capturePathIdentity(source.path),
+          await capturePathIdentity(source.staged),
+        )
+      ) {
+        throw new Error('candidate source changed after its canonical copy was staged');
+      }
+    }
+    await publishStagedBundle({
+      paths: req.paths,
+      transactionId,
+      stagingRoot,
+      entries,
+      gitBookkeeping: () => advanceCandidateHead(req),
+      ...(req.afterApply ? { afterApply: req.afterApply } : {}),
+    });
+    return { status: 'promoted' };
+  } finally {
+    await rm(stagingRoot, { recursive: true, force: true });
   }
-  return { status: 'promoted' };
 }
 
 /** Resolve the normal Paths facade against an isolated store worktree. */

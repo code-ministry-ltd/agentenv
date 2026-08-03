@@ -273,6 +273,9 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
     const promoted = await promoteSyncCandidate({
       paths,
       env,
+      id: candidate.id,
+      worktree: candidate.worktree,
+      touchedCanonicalPaths: candidate.touchedCanonicalPaths,
       expectedHead: prepared.expectedHead,
       revision: prepared.revision,
       ...(gitRun ? { run: gitRun } : {}),
@@ -379,12 +382,47 @@ export async function resolveRetainedCandidate(
     const index = manifest.candidates.findIndex((entry) => entry.id === req.id);
     if (index < 0) throw new Error(`unknown candidate '${req.id}'`);
     const current = manifest.candidates[index]!;
-    const next = req.action === 'abandon' ? abandonCandidate(current) : retryCandidate(current);
+    const next = req.action === 'abandon'
+      ? abandonCandidate(current)
+      : current.phase === 'promoting'
+        ? current
+        : retryCandidate(current);
     manifest.candidates[index] = next;
     await writeState(req.paths, manifest);
     return next;
   });
   if (req.action === 'abandon') return { phase: candidate.phase, blockerCount: 0 };
+
+  if (candidate.phase === 'promoting') {
+    if (!candidate.expectedCanonicalRevision || !candidate.candidateRevision) {
+      throw new Error('candidate promotion provenance is incomplete; refetch required');
+    }
+    const promoted = await promoteSyncCandidate({
+      paths: req.paths,
+      env: req.env,
+      id: candidate.id,
+      worktree: candidate.worktree,
+      touchedCanonicalPaths: candidate.touchedCanonicalPaths,
+      expectedHead: candidate.expectedCanonicalRevision,
+      revision: candidate.candidateRevision,
+      ...(req.gitRun ? { run: req.gitRun } : {}),
+    });
+    if (promoted.status !== 'promoted') {
+      candidate = {
+        ...candidate,
+        phase: promoted.status === 'deferred' ? 'deferred' : 'rejected',
+        blockers: promoted.blocker ? [promoted.blocker] : [],
+        reason: promoted.detail ?? null,
+      };
+      await persistCandidate(req.paths, candidate);
+      return { phase: candidate.phase, blockerCount: candidate.blockers.length };
+    }
+    candidate = completeCandidatePromotion(candidate, candidate.candidateRevision);
+    await persistCandidate(req.paths, candidate);
+    await clearConflictMarker(req.paths);
+    await reconcileManifest(req.paths, await activeEnvNames(req.paths));
+    return { phase: candidate.phase, blockerCount: 0 };
+  }
 
   const validation = await validatePulledStore(candidatePaths(req.paths, candidate.worktree));
   if (!validation.ok) {
@@ -417,6 +455,9 @@ export async function resolveRetainedCandidate(
   const promoted = await promoteSyncCandidate({
     paths: req.paths,
     env: req.env,
+    id: candidate.id,
+    worktree: candidate.worktree,
+    touchedCanonicalPaths: candidate.touchedCanonicalPaths,
     expectedHead: expectedCanonicalRevision,
     revision: candidateRevision,
     ...(req.gitRun ? { run: req.gitRun } : {}),

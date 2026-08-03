@@ -45,7 +45,9 @@ function validateRequest(req: PublishStagedBundleRequest): void {
   if (resolve(req.stagingRoot) !== resolve(join(req.paths.live, 'commands', req.transactionId))) {
     throw new Error('filesystem bundle staging root does not match its transaction id');
   }
-  if (req.entries.length === 0) throw new Error('filesystem bundle requires at least one entry');
+  if (req.entries.length === 0 && !req.gitBookkeeping) {
+    throw new Error('empty filesystem bundle requires Git bookkeeping');
+  }
   const ids = new Set<string>();
   const targets = new Set<string>();
   for (const entry of req.entries) {
@@ -219,7 +221,7 @@ export async function publishStagedBundle(req: PublishStagedBundleRequest): Prom
         }
         await mkdir(dirname(item.entry.target), { recursive: true });
         await rm(item.entry.target, { recursive: true, force: true });
-        await rename(item.entry.staged, item.entry.target);
+        if (item.post.kind !== 'absent') await rename(item.entry.staged, item.entry.target);
         await req.afterApply?.(item.entry);
       },
     });
