@@ -35,6 +35,7 @@ describe('adapter.cursor — identity & declarations', () => {
   it('declares Cursor identity, session-UNSUPPORTED, and the config-root override', () => {
     expect(cursorAdapter.id).toBe('cursor');
     expect(cursorAdapter.binaryName).toBe('agent');
+    expect(cursorAdapter.aliases).toContain('cursor-agent');
     // The whole reason for sessionSupported:false in the frozen contract.
     expect(cursorAdapter.sessionSupported).toBe(false);
     expect(cursorAdapter.sessionUnsupportedReason).toMatch(/--global/);

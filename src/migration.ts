@@ -328,7 +328,7 @@ async function installGate(
   wal: MigrationWal,
   adapters: readonly Adapter[],
 ): Promise<void> {
-  const names = new Set(adapters.map((adapter) => adapter.binaryName));
+  const names = new Set(adapters.flatMap((adapter) => [adapter.binaryName, ...(adapter.aliases ?? [])]));
   if (await exists(paths.shims)) {
     for (const entry of await readdir(paths.shims, { withFileTypes: true })) {
       if (entry.isFile() || entry.isSymbolicLink()) names.add(entry.name);
@@ -1022,7 +1022,7 @@ async function openGate(
   manifest: StateManifest,
 ): Promise<void> {
   await generateShims(req.paths, adapters);
-  const current = new Set(adapters.map((adapter) => adapter.binaryName));
+  const current = new Set(adapters.flatMap((adapter) => [adapter.binaryName, ...(adapter.aliases ?? [])]));
   for (const entry of wal.gateEntries) {
     if (!current.has(entry.name)) await restoreSnapshot(entry.path, entry.snapshot);
   }

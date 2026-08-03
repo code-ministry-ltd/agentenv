@@ -1,6 +1,8 @@
 # Cursor adapter
 
 Adapter id: `cursor`; binary: `agent` (the current official Cursor CLI command).
+The previous `cursor-agent` command remains a compatibility alias and receives
+the same fail-open/global-only shim behavior.
 
 ## Modes
 

@@ -62,6 +62,7 @@ export const runCommand: Command = {
     const result = await launchHarness({
       paths,
       adapter,
+      binaryName: harness,
       envs,
       session,
       args: harnessArgs,

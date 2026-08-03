@@ -84,6 +84,8 @@ export interface LaunchResult {
 export interface LaunchRequest {
   paths: Paths;
   adapter: Adapter;
+  /** Exact primary/alias command that led to this launch. */
+  binaryName?: string;
   /** The env stack to compose, or `null`/empty for an unbound launch. */
   envs: readonly string[] | null;
   /** The `live/<session>/` key the view is published under. */
@@ -180,9 +182,10 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
     PATH: sanitisePath(env.PATH ?? '', [paths.shims]),
   };
 
-  const binaryPath = await resolveBinaryOnPath(adapter.binaryName, env, [paths.shims]);
+  const binaryName = req.binaryName ?? adapter.binaryName;
+  const binaryPath = await resolveBinaryOnPath(binaryName, env, [paths.shims]);
   if (!binaryPath) {
-    notices.push(`agentenv: '${adapter.binaryName}' not found on PATH — cannot launch`);
+    notices.push(`agentenv: '${binaryName}' not found on PATH — cannot launch`);
     return { code: 127, mode: 'unbound', applied: false, skipped: [], notices };
   }
 

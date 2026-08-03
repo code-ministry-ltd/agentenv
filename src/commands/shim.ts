@@ -100,6 +100,7 @@ export const shimCommand: Command = {
       result = await launchHarness({
         paths,
         adapter,
+        binaryName,
         envs,
         session: session ?? 'no-session',
         args: harnessArgs,
@@ -126,9 +127,16 @@ export const shimCommand: Command = {
 };
 
 /** Whether a binding's optional --harness scoping includes this harness. */
-function appliesToHarness(harnesses: string[] | undefined, adapter: { id: string; binaryName: string }): boolean {
+function appliesToHarness(
+  harnesses: string[] | undefined,
+  adapter: { id: string; binaryName: string; aliases?: readonly string[] },
+): boolean {
   if (!harnesses || harnesses.length === 0) return true;
-  return harnesses.includes(adapter.id) || harnesses.includes(adapter.binaryName);
+  return (
+    harnesses.includes(adapter.id) ||
+    harnesses.includes(adapter.binaryName) ||
+    (adapter.aliases?.some((alias) => harnesses.includes(alias)) ?? false)
+  );
 }
 
 /** Exec a harness we have no adapter for: real binary, untouched, shims off PATH. */

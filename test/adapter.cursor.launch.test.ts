@@ -27,6 +27,13 @@ function installFakeCursorAgent(binDir: string): void {
   chmodSync(p, 0o755);
 }
 
+function installLegacyFakeCursorAgent(binDir: string): void {
+  mkdirSync(binDir, { recursive: true });
+  const p = join(binDir, 'cursor-agent');
+  writeFileSync(p, '#!/bin/sh\nexit 0\n');
+  chmodSync(p, 0o755);
+}
+
 /** An injected exec that records the spec and really spawns the (fake) binary. */
 function capturingExec(): { exec: ExecHarness; calls: ExecSpec[] } {
   const calls: ExecSpec[] = [];
@@ -70,6 +77,32 @@ describe('adapter.cursor — session-unsupported launch (AC)', () => {
     // The one-line notice points the user at --global.
     expect(result.notices.join(' ')).toContain('--global');
     expect(result.notices.join(' ')).toContain('does not support session mode');
+  });
+
+  it('launches the legacy cursor-agent alias untouched when that shim was invoked', async () => {
+    const th = home();
+    const paths = resolvePaths(th.env);
+    const binDir = join(th.home, 'bin');
+    installLegacyFakeCursorAgent(binDir);
+    mkdirSync(join(paths.envDir('writing'), 'skills', 'w-skill'), { recursive: true });
+    writeFileSync(join(paths.envDir('writing'), 'skills', 'w-skill', 'SKILL.md'), '# w\n');
+    const env: NodeJS.ProcessEnv = { ...th.env, PATH: `${binDir}${delimiter}${process.env.PATH ?? ''}` };
+    const { exec, calls } = capturingExec();
+
+    const result = await launchHarness({
+      paths,
+      adapter: cursorAdapter,
+      binaryName: 'cursor-agent',
+      envs: ['writing'],
+      session: 'sess-legacy',
+      args: [],
+      cwd: th.home,
+      env,
+      execHarness: exec,
+    });
+
+    expect(result.mode).toBe('session-unsupported');
+    expect(calls[0]?.binaryPath).toBe(join(binDir, 'cursor-agent'));
   });
 });
 

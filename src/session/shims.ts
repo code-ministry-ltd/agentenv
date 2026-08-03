@@ -23,10 +23,12 @@ export async function generateShims(
   await mkdir(paths.shims, { recursive: true });
   const written: string[] = [];
   for (const adapter of adapters) {
-    const shimPath = join(paths.shims, adapter.binaryName);
-    await writeFile(shimPath, shimScript(adapter.binaryName, paths.shims), 'utf8');
-    await chmod(shimPath, 0o755);
-    written.push(shimPath);
+    for (const binaryName of [adapter.binaryName, ...(adapter.aliases ?? [])]) {
+      const shimPath = join(paths.shims, binaryName);
+      await writeFile(shimPath, shimScript(binaryName, paths.shims), 'utf8');
+      await chmod(shimPath, 0o755);
+      written.push(shimPath);
+    }
   }
   return written;
 }

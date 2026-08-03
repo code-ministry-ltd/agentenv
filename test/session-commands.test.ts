@@ -73,6 +73,20 @@ describe('session shim generation', () => {
     expect(body).toContain('command -v agentenv');
     expect(shimScript('claude', paths.shims)).toContain('agentenv __shim');
   });
+
+  it('writes executable shims for a harness primary command and its compatibility aliases', async () => {
+    const th = home();
+    const paths = resolvePaths(th.env);
+    const adapter: Adapter = { ...makeFixtureAdapter(), aliases: ['fixture-harness-old'] };
+
+    const written = await generateShims(paths, [adapter]);
+
+    expect(written).toEqual([
+      join(paths.shims, 'fixture-harness'),
+      join(paths.shims, 'fixture-harness-old'),
+    ]);
+    expect(readFileSync(written[1]!, 'utf8')).toContain("__shim \"$bin\"");
+  });
 });
 
 describe('session run command', () => {

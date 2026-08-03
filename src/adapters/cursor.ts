@@ -443,6 +443,7 @@ function isValidCursorServer(entry: unknown): boolean {
 export const cursorAdapter: Adapter = {
   id: 'cursor',
   binaryName: 'agent',
+  aliases: ['cursor-agent'],
   definition: cursorDefinition,
 
   // GUI/IDE + a CLI whose config-root override does not isolate mcp.json → no session
