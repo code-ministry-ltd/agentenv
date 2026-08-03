@@ -70,8 +70,8 @@ export function deferCandidate(candidate: SyncCandidate, blockers: readonly stri
 }
 
 export function retryCandidate(candidate: SyncCandidate): SyncCandidate {
-  if (candidate.phase !== 'deferred' && candidate.phase !== 'rejected') {
-    throw new Error(`only a deferred or rejected candidate can be retried; it is ${candidate.phase}`);
+  if (!['fetched', 'validating', 'approved', 'deferred', 'rejected'].includes(candidate.phase)) {
+    throw new Error(`candidate cannot be retried while it is ${candidate.phase}`);
   }
   return { ...candidate, phase: 'validating', blockers: [], reason: null };
 }
@@ -90,8 +90,8 @@ export function completeCandidatePromotion(
 }
 
 export function abandonCandidate(candidate: SyncCandidate): SyncCandidate {
-  if (candidate.phase !== 'deferred' && candidate.phase !== 'rejected') {
-    throw new Error(`only a rejected or deferred candidate can be abandoned; it is ${candidate.phase}`);
+  if (!['fetched', 'validating', 'approved', 'deferred', 'rejected'].includes(candidate.phase)) {
+    throw new Error(`candidate cannot be abandoned while it is ${candidate.phase}`);
   }
   return { ...candidate, phase: 'abandoned' };
 }

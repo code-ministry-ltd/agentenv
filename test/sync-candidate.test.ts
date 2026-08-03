@@ -56,6 +56,30 @@ describe('isolated remote candidate lifecycle', () => {
 
   it('cannot abandon a candidate while promotion is applying', () => {
     const candidate = beginCandidatePromotion(approveCandidate(beginCandidateValidation(fetched())));
-    expect(() => abandonCandidate(candidate)).toThrow(/rejected|deferred/i);
+    expect(() => abandonCandidate(candidate)).toThrow(/cannot be abandoned/i);
   });
+
+  it.each(['fetched', 'validating', 'approved'] as const)(
+    'can abandon a process-killed candidate left %s',
+    (phase) => {
+      let candidate = fetched();
+      if (phase !== 'fetched') candidate = beginCandidateValidation(candidate);
+      if (phase === 'approved') candidate = approveCandidate(candidate);
+      expect(abandonCandidate(candidate)).toMatchObject({ phase: 'abandoned' });
+    },
+  );
+
+  it.each(['fetched', 'validating', 'approved'] as const)(
+    'revalidates a process-killed candidate left %s',
+    (phase) => {
+      let candidate = fetched();
+      if (phase !== 'fetched') candidate = beginCandidateValidation(candidate);
+      if (phase === 'approved') candidate = approveCandidate(candidate);
+      expect(retryCandidate(candidate)).toMatchObject({
+        phase: 'validating',
+        blockers: [],
+        reason: null,
+      });
+    },
+  );
 });
