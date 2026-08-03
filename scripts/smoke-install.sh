@@ -14,7 +14,7 @@
 #   3. machine A: init → create → add skill/instructions/mcp → remote → sync
 #   4. machine B: init --remote → list → use --global
 #   5. assert the env materialised on TWO harnesses (Claude Code and Codex)
-#   6. drop --all --global and assert the surfaces were handed back
+#   6. env-less drop --global and assert the surfaces were handed back
 #
 # SAFETY. Every agentenv invocation runs with BOTH `AGENTENV_HOME` and `HOME`
 # pointed at throwaway temp directories, so:
@@ -114,10 +114,10 @@ TGZ="$(ls "$WORK"/code-ministry-agentenv-*.tgz)"
 [ -f "$TGZ" ] || die "npm pack produced no tarball"
 ok "packed $(basename "$TGZ")"
 
-# The artifact must carry the built CLI, the README and the licence — and NOT
-# tests, docs, spike notes or CI config.
+# The artifact must carry the built CLI, README, licence, and third-party notice
+# — and NOT tests, docs, spike notes or CI config.
 TOP="$(tar -tzf "$TGZ" | sed 's|^package/||' | cut -d/ -f1 | sort -u)"
-for want in dist LICENSE README.md package.json; do
+for want in dist LICENSE README.md THIRD_PARTY_NOTICES.md package.json; do
   echo "$TOP" | grep -qx "$want" || die "tarball is missing $want"
 done
 for unwanted in test docs spike .github node_modules src; do
@@ -201,11 +201,11 @@ echo "  -- harness 1: Claude Code"
 assert_exists    "$B_HOME/.claude/skills/tone-of-voice"
 assert_contains  "$B_HOME/.claude/skills/tone-of-voice/SKILL.md" 'SMOKE-SKILL-MARKER'
 assert_contains  "$B_HOME/.claude/rules/base.md" 'SMOKE-INSTRUCTIONS-MARKER'
-assert_contains  "$B_HOME/.claude/.claude.json" 'filesystem'
+assert_contains  "$B_HOME/.claude.json" 'filesystem'
 
 echo "  -- harness 2: Codex"
-assert_exists    "$B_HOME/.codex/skills/tone-of-voice"
-assert_contains  "$B_HOME/.codex/skills/tone-of-voice/SKILL.md" 'SMOKE-SKILL-MARKER'
+assert_exists    "$B_HOME/.agents/skills/tone-of-voice"
+assert_contains  "$B_HOME/.agents/skills/tone-of-voice/SKILL.md" 'SMOKE-SKILL-MARKER'
 assert_contains  "$B_HOME/.codex/AGENTS.md" 'SMOKE-INSTRUCTIONS-MARKER'
 assert_contains  "$B_HOME/.codex/config.toml" 'filesystem'
 
@@ -217,21 +217,30 @@ assert_no_home_fallback
 # --- 6. hand it all back ------------------------------------------------------
 
 step "6. machine B — drop the stack and check the surfaces came back"
-b drop --all --global >/dev/null
+b drop --global >/dev/null
 
 assert_missing "$B_HOME/.claude/skills/tone-of-voice"
-assert_missing "$B_HOME/.codex/skills/tone-of-voice"
+assert_missing "$B_HOME/.agents/skills/tone-of-voice"
 if grep -qF 'SMOKE-INSTRUCTIONS-MARKER' "$B_HOME/.codex/AGENTS.md" 2>/dev/null; then
   die "drop left the managed instructions region in ~/.codex/AGENTS.md"
 fi
 ok "managed surfaces handed back"
 
-# `drop` removes the manifest items, which leaves each item's pre-mutation backup
-# referenced by nothing — so `doctor` correctly reports them as orphans and exits
-# 1. That is housekeeping, not damage: assert nothing STRUCTURAL is reported, then
-# let `--repair` garbage-collect and prove the machine ends up clean.
+# Global COW deliberately retains every detached projection after drop: an
+# unsupervised harness might still hold the old inode open. This smoke owns the
+# whole sandbox, so it can assert quiescence explicitly and reconcile each one.
+PROJECTION_IDS="$(b status | awk '/^  projection / { sub(":", "", $2); print $2 }')"
+while IFS= read -r projection_id; do
+  [ -n "$projection_id" ] || continue
+  b resolve projection "$projection_id" --quiescent >/dev/null
+done <<< "$PROJECTION_IDS"
+ok "retired global projections reconciled under explicit quiescence"
+
+# Dropping also leaves pre-mutation backups referenced by nothing. That is
+# housekeeping, not damage: assert nothing structural is reported, then let
+# `doctor --repair` collect orphaned backups and prove the machine ends clean.
 DOCTOR_OUT="$(b doctor || true)"
-if echo "$DOCTOR_OUT" | grep -qE '\[(journal-pending|dangling-symlink|store-drift|mangled-markers|reserialised-config)\]'; then
+if echo "$DOCTOR_OUT" | grep -qE '\[(journal-pending|dangling-symlink|store-drift|mangled-markers|reserialised-config|projection-pending)\]'; then
   echo "$DOCTOR_OUT" >&2
   die "doctor reports a structural problem after a clean drop"
 fi

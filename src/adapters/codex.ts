@@ -660,34 +660,38 @@ export const codexAdapter: Adapter = {
     const bin = await ctx.resolveBinary();
     if (!bin) return { ok: false, detail: 'codex not found on PATH' };
 
-    // Prove the child observes THIS root: `codex mcp list` reads `[mcp_servers.*]`
-    // from `$CODEX_HOME/config.toml` and prints each server's NAME (live-verified),
-    // regardless of connect/auth status — an offline, login-independent signal.
+    // Prove the child observes THIS root with one targeted, non-connecting config
+    // read. `mcp list` becomes slow on a lived-in config because it computes status
+    // for every server; `mcp get <name> --json` reads exactly one entry.
     const viewServers = await readViewMcpServerNames(viewRoot);
-
-    const res = await ctx.capture(bin, ['mcp', 'list'], {
+    const expected = viewServers[0];
+    const args = expected
+      ? ['mcp', 'get', expected, '--json']
+      : ['mcp', 'list', '--json'];
+    const res = await ctx.capture(bin, args, {
       ...ctx.env,
       ...overrideEnv(viewRoot),
     });
-    const out = `${res.stdout}\n${res.stderr}`;
 
-    if (viewServers.length === 0) {
+    if (!expected) {
       // Env contributed no MCP server to key off: fall back to a mechanism check —
-      // the child ran `mcp list` against the view and returned cleanly.
+      // the child read the view's MCP configuration and returned cleanly.
       return res.code === 0
         ? { ok: true }
-        : { ok: false, detail: `codex mcp list exited ${res.code} against ${viewRoot}` };
+        : { ok: false, detail: `codex mcp list --json exited ${res.code} against ${viewRoot}` };
     }
 
-    const seen = viewServers.some((name) =>
-      new RegExp(`(^|\\n)\\s*${escapeRegExp(name)}\\b`).test(out),
-    );
-    return seen
-      ? { ok: true }
-      : {
-          ok: false,
-          detail: `child did not list any of the view's servers [${viewServers.join(', ')}] under ${viewRoot}`,
-        };
+    let observedName: unknown;
+    try {
+      observedName = (JSON.parse(res.stdout) as { name?: unknown }).name;
+    } catch {
+      observedName = undefined;
+    }
+    if (res.code === 0 && observedName === expected) return { ok: true };
+    return {
+      ok: false,
+      detail: `child did not return the view server '${expected}' under ${viewRoot}`,
+    };
   },
 };
 
@@ -700,9 +704,4 @@ async function readViewMcpServerNames(viewRoot: string): Promise<string[]> {
   } catch {
     return [];
   }
-}
-
-/** Escape a string for literal use inside a RegExp. */
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

@@ -6,7 +6,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.12"
   },
   "bin": {
     "agentenv": "dist/bin.js"
@@ -14,13 +14,18 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.typecheck.json",
     "lint": "eslint .",
     "test": "vitest run",
+    "test:offline": "GIT_CONFIG_GLOBAL=/dev/null vitest run --exclude 'test/*.live.test.ts'",
+    "test:migration": "GIT_CONFIG_GLOBAL=/dev/null vitest run test/legacy-state.test.ts test/migration-state.test.ts test/migration.test.ts test/migration-command.test.ts",
+    "test:restore:container": "bash scripts/test-restore-container.sh",
+    "test:live": "vitest run test/adapter.claude.live.test.ts test/adapter.codex.live.test.ts test/adapter.opencode.live.test.ts test/adapter.pi.live.test.ts",
     "ci": "npm run lint && npm run typecheck && npm run test",
     "prepare": "npm run build",
     "smoke:install": "bash scripts/smoke-install.sh",

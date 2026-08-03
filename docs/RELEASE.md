@@ -1,196 +1,116 @@
 # Releasing agentenv
 
-`agentenv` is distributed **from GitHub only**: an annotated tag, a GitHub
-release, and a packed npm tarball attached to it.
+agentenv is released from GitHub as an npm-format tarball. It is not published
+to the npm registry: `private: true` and the failing `prepublishOnly` script are
+deliberate safeguards.
 
-**It is never published to npm.** The npm name `@code-ministry/agentenv` is a
-parked placeholder at `0.0.1` and is deliberately left that way. Do not run
-`npm publish`. `npm pack` — which only builds a tarball locally — is the whole
-of the packaging step.
+## Supported release matrix
 
-Two guards in `package.json` enforce this:
+- Node.js 22.12 and the current Node 24 line.
+- Ubuntu and macOS CI.
+- No native runtime dependencies.
+- Five adapters: Claude Code, Codex, OpenCode, Pi, and Cursor. Cursor remains
+  global-only; Pi has no native MCP surface.
 
-- `"private": true`;
-- a `prepublishOnly` script that prints the reason and exits 1.
+The CLI version is in `package.json`. Canonical `env.yaml` uses schema 1.x;
+machine-local `state.json` and its lifecycle records use schema 2.x. A newer
+major is rejected before mutation; unknown fields and newer minor fields are
+preserved.
 
-`npm publish` therefore fails; `npm pack`, `npm install -g <tgz>` and
-`npm install -g .` from a checkout are all unaffected. Do not remove either
-guard to "just try it".
+## Required gates
 
-Note that `npm install -g github:code-ministry-ltd/agentenv` does **not** work
-— npm runs the `prepare` build without the dev dependencies and fails with
-`tsc: not found`. The two supported install paths are the release tarball and a
-built checkout, and the README says so.
-
----
-
-## Versioning
-
-Semantic versioning of the **CLI**, which is separate from the two on-disk
-schema versions:
-
-| Version           | Where                                      | Meaning |
-|-------------------|--------------------------------------------|---------|
-| CLI version       | `package.json` `version`, `agentenv --version` | What you release. |
-| Env schema        | `SCHEMA_VERSION` in `src/env-config.ts`    | The shape of `environments/<name>/env.yaml`. |
-| Manifest schema   | `STATE_SCHEMA_VERSION` in `src/state.ts`   | The shape of `~/.agentenv/state.json`. |
-
-Both schemas are currently `1.0`. Both tolerate skew the same way: unknown
-fields and a newer **minor** load fine; a newer **major** is refused with
-`store newer than CLI — upgrade agentenv` / `state newer than CLI — upgrade
-agentenv`. **This is the constraint that governs rollback** — see
-[Rolling back](#rolling-back).
-
-Bump the CLI version when you release. Bump a schema major only when you must,
-and never in a patch release.
-
-## Cutting a release
-
-Everything below runs on `main`, after the PR is merged.
-
-### 1. Green gate
+Run from a clean checkout with Node 22.12 or newer:
 
 ```sh
-git checkout main && git pull
 npm ci
-npm run lint
-npm run typecheck
-npx vitest run
-```
-
-All three must pass on their own exit codes. Do not pipe them through
-`tail`/`head`/`grep`.
-
-### 2. Pack-and-install smoke
-
-```sh
+GIT_CONFIG_GLOBAL=/dev/null npm run ci
+npm run test:offline
+npm run test:migration
 npm run smoke:install
+npm run test:restore:container
+AGENTENV_LIVE=1 npm run test:live
 ```
 
-This packs a tarball, installs it into a throwaway prefix, and drives the whole
-acceptance criterion against the installed binary: build an environment on a
-simulated machine A, push it to a bare git remote, restore it on a simulated
-machine B with `agentenv init --remote`, activate it, and assert the content
-landed on two harnesses. It uses a temp `AGENTENV_HOME` and a temp `HOME`
-throughout and never touches real harness config.
+What each extra gate proves:
 
-### 3. Bump the version
+| Gate | Evidence |
+|---|---|
+| `test:offline` | The non-live suite completes without depending on hosted services or a user home. |
+| `test:migration` | Both pinned v1 readers, closed-gate cutover, rollback, probes, and fault boundaries. |
+| `smoke:install` | A packed artifact installs in a clean prefix, syncs through a local bare remote, restores to a second machine, materialises Claude/Codex, drops, reconciles projections, and finishes doctor-clean. |
+| `test:restore:container` | The same packed restore proof in a clean Node 22 Linux container. Docker is required. |
+| `test:live` | Current installed Claude, Codex, OpenCode, and Pi binaries accept isolated views. These checks are intentionally opt-in because they depend on local binaries/login state. Cursor has no session probe. |
 
-Edit `package.json` `version`, then:
+Do not replace a missing live or container result with the default unit suite.
+Record the OS, Node version, and harness versions used in the release evidence.
+
+## Cut a release
+
+1. Confirm every required gate above is green and the worktree is clean.
+2. Review `README.md`, every `docs/harness-*.md`, migration instructions, and
+   known limitations against observed behavior.
+3. Bump `package.json` and `package-lock.json` to the intended semver.
+4. Build and verify the version:
+
+   ```sh
+   npm run build
+   node dist/bin.js --version
+   ```
+
+5. Commit through the normal PR workflow, merge, and create an annotated tag:
+
+   ```sh
+   git tag -a v1.0.0 -m "agentenv v1.0.0"
+   git push origin v1.0.0
+   ```
+
+6. Pack and inspect the allowlisted artifact:
+
+   ```sh
+   npm ci
+   npm pack
+   tar -tzf code-ministry-agentenv-1.0.0.tgz
+   ```
+
+   The top level must contain only `dist/`, `README.md`, `LICENSE`,
+   `THIRD_PARTY_NOTICES.md`, and `package.json`. Tests, sources, docs, CI
+   configuration, and local notes must not ship.
+
+7. Create the GitHub release and attach the tarball:
+
+   ```sh
+   gh release create v1.0.0 \
+     --title "agentenv v1.0.0" \
+     --notes-file RELEASE-NOTES.md \
+     code-ministry-agentenv-1.0.0.tgz
+   ```
+
+Release notes must include migration requirements, harness limitations, any
+retained-data/recovery behavior that changed, and links to the README and exact
+adapter notes.
+
+## Rollback and recovery
+
+### Before a v1 migration opens
+
+The migration gate is closed and mutation is blocked. Use:
 
 ```sh
-npm run build
-node dist/bin.js --version   # must print the new version
+agentenv migrate --rollback
 ```
 
-Nothing else hardcodes the version: `agentenv --version` reads `package.json`
-at runtime, and the smoke test compares the installed binary against
-`package.json` rather than a literal. So the bump is a one-line change.
+This restores the pinned v1 root and managed entry points from the migration
+backup. Keep the backup until the merged installation has been exercised.
 
-Commit it on a branch and merge it through a PR like any other change.
+### After a migration opens
 
-### 4. Tag
+Do not run a destructive “downgrade.” Post-cutover work may exist and the old
+format cannot represent schema-2 lifecycle state. Reinstall the newer CLI or
+perform a new forward migration from an explicitly reviewed snapshot.
 
-An **annotated** tag on the merged commit:
+### Roll back a canonical store change
 
-```sh
-git checkout main && git pull
-git tag -a v1.0.0 -m "agentenv v1.0.0"
-git push origin v1.0.0
-```
-
-Tags are `v<semver>`. Never move or delete a published tag — cut a new patch
-release instead.
-
-### 5. Build the artifact
-
-```sh
-npm ci
-npm run build
-npm pack
-# → code-ministry-agentenv-1.0.0.tgz
-```
-
-Check the contents before attaching it:
-
-```sh
-tar -tzf code-ministry-agentenv-1.0.0.tgz | sed 's|^package/||' | cut -d/ -f1 | sort -u
-# dist
-# LICENSE
-# package.json
-# README.md
-```
-
-The `files` field in `package.json` is the allowlist. `test/`, `docs/`,
-`spike/`, `.github/` and any local notes must **not** appear.
-
-### 6. Create the GitHub release
-
-```sh
-gh release create v1.0.0 \
-  --title "agentenv v1.0.0" \
-  --notes-file RELEASE-NOTES.md \
-  code-ministry-agentenv-1.0.0.tgz
-```
-
-Release notes should state, at minimum: what changed, which harnesses are
-supported, and a link to the README's
-[Known limitations](../README.md#known-limitations) section. Do not paper over
-the limitations in the notes — a user who is surprised by MCP drift being
-report-only after reading the release notes is a user the notes failed.
-
-### 7. Verify the artifact a stranger would download
-
-From a clean directory, on a machine that is not the build machine if possible:
-
-```sh
-gh release download v1.0.0 --repo code-ministry-ltd/agentenv --pattern '*.tgz'
-npm install -g ./code-ministry-agentenv-1.0.0.tgz
-agentenv --version
-```
-
-## Rolling back
-
-### Rolling back the CLI
-
-The CLI is a stateless binary; downgrading is just reinstalling an older
-artifact.
-
-```sh
-PREV=v1.0.0   # the tag you want back; `gh release list` shows them
-npm uninstall -g @code-ministry/agentenv
-gh release download "$PREV" --repo code-ministry-ltd/agentenv --pattern '*.tgz'
-npm install -g ./code-ministry-agentenv-*.tgz
-agentenv --version
-```
-
-**The one thing that can block a rollback is a schema major bump.** If the newer
-CLI wrote a `state.json` or an `env.yaml` at a higher major version, the older
-CLI refuses to read it:
-
-```
-…/state.json: state newer than CLI — upgrade agentenv (state.json is v2.0, this agentenv supports up to v1.x)
-```
-
-That is a deliberate fail-closed refusal, not a bug. Recovery options, in order
-of preference:
-
-1. **Reinstall the newer CLI.** The refusal is telling you the on-disk state is
-   ahead of the tool.
-2. **Roll the store back in git.** The store is an ordinary git repo:
-   `git -C ~/.agentenv/store log` and `git -C ~/.agentenv/store revert <sha>`.
-   Every mutation is its own commit, so you can revert precisely one change.
-3. **Rebuild the manifest.** `state.json` is machine-local, not synced. Running
-   `agentenv drop --all --global` under the *newer* CLI, then reinstalling the
-   older one and re-activating, gets you a manifest the older CLI understands —
-   at the cost of re-activating your environments.
-
-Within a single schema major, downgrade and upgrade are both safe: a newer minor
-and unknown fields are tolerated by design.
-
-### Rolling back a bad store change
-
-The store is git. Nothing special is needed:
+Use a normal Git revert; never rewrite shared history:
 
 ```sh
 git -C ~/.agentenv/store log --oneline
@@ -198,100 +118,36 @@ git -C ~/.agentenv/store revert <sha>
 agentenv sync
 ```
 
-`agentenv` never force-pushes and never rewrites store history, so a revert is
-always the right move — do not reset a pushed branch.
-
-### Rolling back an activation
+### Hand back global surfaces
 
 ```sh
-agentenv drop --all --global
+agentenv drop --global
+agentenv status
 ```
 
-This removes exactly what `state.json` records `agentenv` as having added, and
-nothing else. Content you wrote yourself is untouched.
-
-## What `doctor` can and cannot recover
-
-`agentenv doctor` is the repair tool, not a backup system. Be precise about what
-it covers.
-
-### `doctor --repair` CAN recover
-
-| Situation | What repair does |
-|-----------|------------------|
-| A mutation interrupted mid-flight (kill, crash, power loss) | Rolls the write-ahead journal forward or back to a consistent state. |
-| A managed symlink whose store target is gone | Removes the dangling link and its ownership record. |
-| A manifest item whose store source was deleted | Drops the orphaned materialisation and the record. |
-| A managed instruction region a harness mangled (duplicated / relabelled / split / CRLF-rewritten) | Rolls the file back to its activation-time bytes and re-materialises from the manifest + store. **Lossy — see below.** |
-| A managed instruction region a harness deleted outright | Re-inserts the region into the file as it currently stands, preserving your later edits. |
-| An owned config key a harness rewrote to a different value | Reconciles the manifest hash to the current value and restores `${VAR}` placeholders. |
-| Backups no manifest item references | Deletes them. |
-
-`--repair` is idempotent and crash-safe: it reuses the same journalled,
-lock-guarded mechanisms as normal activation. A kill mid-repair leaves at most
-one pending journal that the next run rolls back. A second run reports clean.
-
-### `doctor --repair` CANNOT recover
-
-- **Edits you made to a composed instruction file outside the managed region,
-  when that region is repaired from a `conflict`.** The rollback restores the
-  file's activation-time bytes and those later edits are gone. They are captured
-  nowhere, so `--restore` cannot offer them back either. This is a known,
-  unfixed gap, pinned by
-  `test/doctor.hardening.mangled-markers.test.ts`.
-- **A harness DELETING an owned config key.** `doctor` reports
-  `no problems found` and exits 0. Re-run `agentenv use … --global` to put it
-  back.
-- **Partial store loss.** If an environment contributes two instruction sources
-  to one region and one is deleted from the store, `doctor` stays silent and
-  exits 0 — deliberately, so the still-good sub-block is not thrown away with
-  it. You get no warning that the environment is incomplete.
-- **Anything outside the manifest.** `doctor` only knows what `state.json`
-  records. Content `agentenv` never owned is neither checked nor repaired.
-- **A lost store.** If `~/.agentenv/store` is deleted and there is no sync
-  remote, `doctor` can report the sourceless surfaces and hand them back to you,
-  but the content itself is gone. Connect a remote (`agentenv remote <url>`)
-  before you need it.
-
-### `doctor --restore <backup>` CAN recover
-
-One content-addressed pre-mutation backup, written back to the path the manifest
-records for it:
+Close all unsupervised harness writers, then reconcile each retained projection:
 
 ```sh
-agentenv doctor --restore <backup-id>
+agentenv resolve projection <id> --quiescent
+agentenv doctor
 ```
 
-Constraints, all enforced:
-
-- The backup must be **referenced by a manifest item**. An unreferenced backup
-  is an orphan, and `--repair` garbage-collects orphans — so a rescue copy that
-  no item points at will not survive to be restored.
-- The backup must still be present under `~/.agentenv/backups/`.
-- The destination is the manifest-recorded path. You cannot redirect it.
-- `--restore` and `--repair` are mutually exclusive in one invocation.
-
-Backup ids appear in `doctor` output (the `orphaned-backup` detector names
-them) and in `state.json`.
-
-### `doctor --restore` CANNOT recover
-
-- Anything without a `backupRef` on a live manifest item.
-- Anything discarded by the `conflict` rollback described above — that path
-  overwrites without capturing first.
-- Store content. Backups are of **real surface files before agentenv mutated
-  them**, not of your environments. Your environments' backup is the git remote.
+`doctor --repair` handles deterministic repairable inconsistencies. It does not
+erase ambiguous ownership or retained lifecycle bytes. Use the explicit
+`resolve` command named by `status`/`doctor` for commands, generations,
+projections, candidates, and rescues.
 
 ## Release checklist
 
-```
-[ ] main is green: lint, typecheck, vitest — bare, exit codes checked
-[ ] npm run smoke:install passes
-[ ] package.json version bumped
-[ ] README limitations still accurate for this build
-[ ] annotated tag v<semver> pushed
-[ ] npm pack contents = dist/, README.md, LICENSE, package.json only
-[ ] gh release created with the tarball attached
-[ ] downloaded artifact installs and reports the right version
-[ ] NOT published to npm
+```text
+[ ] package and lockfile versions agree
+[ ] Node >=22.12 engine floor and Linux/macOS CI are green
+[ ] hermetic CI, offline, migration, packed smoke, and container restore pass
+[ ] live harness evidence is recorded with versions
+[ ] README and adapter limitations match the build
+[ ] no resolved secret appears in output, Git refs, fixtures, or artifacts
+[ ] annotated v<semver> tag points at the reviewed commit
+[ ] tarball contents match the package allowlist
+[ ] GitHub release contains the tarball and migration/recovery notes
+[ ] nothing was published to npm
 ```

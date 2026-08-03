@@ -138,7 +138,7 @@ async function waitForProcessGroupExit(processGroupId: number): Promise<void> {
  * harness call. On timeout the child is killed and the capture resolves with
  * `code: null`, so the self-check sees no matching root → `ok: false` → fail-open.
  */
-export const CAPTURE_TIMEOUT_MS = 10_000;
+export const CAPTURE_TIMEOUT_MS = 20_000;
 
 /**
  * Build a spawn-and-capture that kills the child and resolves after `timeoutMs`,

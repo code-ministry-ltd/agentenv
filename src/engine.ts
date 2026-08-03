@@ -875,7 +875,9 @@ async function materialiseConfigKeys(
           .flatMap((adapter) => adapter.surfaces.map((surface) => ({ adapter, surface })))
           .find(
             ({ adapter, surface }) =>
+              surface.supported &&
               surface.mechanism === 'config-keys' &&
+              (adapter.definition?.surfaces.find((declared) => declared.id === surface.id)?.global.supported ?? true) &&
               resolveGlobalSurfaceDestination(adapter, surface, env) === file &&
               surface.style === item.mode &&
               surface.keyPath.every((segment, index) => item.keyPath[index] === segment),

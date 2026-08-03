@@ -1,7 +1,7 @@
 /**
  * Task 4.1 — LIVE re-verification for the Codex adapter (gated on `codex` present).
  *
- * Codex config ISOLATION is fully verifiable while UNAUTHENTICATED (`codex mcp list`
+ * Codex config ISOLATION is fully verifiable while UNAUTHENTICATED (`codex mcp get`
  * reads `[mcp_servers.*]` from `$CODEX_HOME/config.toml` and prints each server's
  * name regardless of auth), so unlike Claude's live test this runs whenever `codex`
  * is installed — it is offline and deterministic (a stdio probe server never
@@ -70,7 +70,7 @@ function realConfigSha(): string {
 
 describe.skipIf(!hasCodex)('adapter.codex — live config isolation on a COPY of real ~/.codex', () => {
   it(
-    'composes a session view whose child (`codex mcp list`) observes only the view',
+    'composes a session view whose child (`codex mcp get`) observes only the view',
     async () => {
       // Prove the real config is untouched by the whole test.
       const realBefore = realConfigSha();
@@ -89,7 +89,7 @@ describe.skipIf(!hasCodex)('adapter.codex — live config isolation on a COPY of
       }
 
       // A store env contributing one distinctive stdio MCP server (present ONLY in
-      // the view). stdio + /bin/echo → `codex mcp list` lists it without connecting.
+      // the view). `codex mcp get` reads it without connecting.
       const probeName = `agentenv_live_${process.pid}`;
       const paths = resolvePaths({ AGENTENV_HOME: join(root, 'agentenv') });
       mkdirSync(join(paths.envDir('live-writing'), 'mcp'), { recursive: true });
@@ -122,9 +122,9 @@ describe.skipIf(!hasCodex)('adapter.codex — live config isolation on a COPY of
       const check = await codexAdapter.selfCheck(viewRoot, ctx);
       expect(check).toEqual({ ok: true });
 
-      // (3) Directly confirm isolation: `codex mcp list` on the view lists the probe
-      // server (which exists ONLY in the view).
-      const out = spawnSync('codex', ['mcp', 'list'], {
+      // (3) Directly confirm isolation: a targeted read on the view returns the
+      // probe server (which exists ONLY in the view).
+      const out = spawnSync('codex', ['mcp', 'get', probeName, '--json'], {
         env: { ...process.env, CODEX_HOME: viewRoot },
         encoding: 'utf8',
         timeout: PROBE_TIMEOUT_MS,
@@ -135,6 +135,6 @@ describe.skipIf(!hasCodex)('adapter.codex — live config isolation on a COPY of
       // (4) The real config was never written.
       expect(realConfigSha()).toBe(realBefore);
     },
-    PROBE_TIMEOUT_MS + 10_000,
+    PROBE_TIMEOUT_MS * 2 + 10_000,
   );
 });

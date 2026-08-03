@@ -316,34 +316,34 @@ describe('adapter.codex — selfCheck (injected capture, no real harness)', () =
     };
   }
 
-  it('ok when the child lists a view server by NAME (connect/auth status irrelevant)', async () => {
+  it('ok when the child gets a view server by exact NAME (connect/auth status irrelevant)', async () => {
     const view = viewWith(['agentenv_probe']);
-    // Codex mcp list prints the server name in the first column even when it can't connect.
-    const ctx = ctxCapturing(
-      'Name            Command  Status   Auth\nagentenv_probe  x        enabled  Unsupported\n',
-    );
+    const ctx = ctxCapturing('{"name":"agentenv_probe","enabled":true}');
     expect(await codexAdapter.selfCheck(view, ctx)).toEqual({ ok: true });
   });
 
-  it('passes the CODEX_HOME override to the probe', async () => {
+  it('targets one server and passes the CODEX_HOME override to the probe', async () => {
     const view = viewWith(['srv']);
     let seenEnv: NodeJS.ProcessEnv = {};
+    let seenArgs: readonly string[] = [];
     const ctx: SelfCheckContext = {
       resolveBinary: async () => '/fake/codex',
-      capture: async (_bin, _args, env) => {
+      capture: async (_bin, args, env) => {
+        seenArgs = args;
         seenEnv = env;
-        return { code: 0, stdout: 'srv  x  enabled\n', stderr: '' };
+        return { code: 0, stdout: '{"name":"srv"}', stderr: '' };
       },
       env: { EXISTING: '1' },
     };
     await codexAdapter.selfCheck(view, ctx);
+    expect(seenArgs).toEqual(['mcp', 'get', 'srv', '--json']);
     expect(seenEnv.CODEX_HOME).toBe(view);
     expect(seenEnv.EXISTING).toBe('1');
   });
 
   it('fails when NONE of the view servers appear (child did not observe the view)', async () => {
     const view = viewWith(['agentenv_probe']);
-    const ctx = ctxCapturing('context7  https://...  enabled  Not logged in\n'); // only the real server
+    const ctx = ctxCapturing('{"name":"context7"}'); // only the real server
     const res = await codexAdapter.selfCheck(view, ctx);
     expect(res.ok).toBe(false);
     expect(res.detail).toContain('agentenv_probe');
@@ -351,7 +351,7 @@ describe('adapter.codex — selfCheck (injected capture, no real harness)', () =
 
   it('does not match a name that is only a prefix of a listed server', async () => {
     const view = viewWith(['probe']);
-    const ctx = ctxCapturing('probe_other  x  enabled\n'); // 'probe' must NOT match 'probe_other'
+    const ctx = ctxCapturing('{"name":"probe_other"}'); // 'probe' must NOT match 'probe_other'
     expect((await codexAdapter.selfCheck(view, ctx)).ok).toBe(false);
   });
 
@@ -371,7 +371,7 @@ describe('adapter.codex — selfCheck (injected capture, no real harness)', () =
   it('with no view servers, falls back to a mechanism check on the exit code', async () => {
     const view = tmp(); // no config.toml → zero declared servers
     expect(
-      await codexAdapter.selfCheck(view, ctxCapturing('No MCP servers configured yet', 0)),
+      await codexAdapter.selfCheck(view, ctxCapturing('[]', 0)),
     ).toEqual({ ok: true });
     const bad = await codexAdapter.selfCheck(view, ctxCapturing('', 1));
     expect(bad.ok).toBe(false);

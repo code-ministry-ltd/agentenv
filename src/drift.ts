@@ -282,7 +282,9 @@ function findConfigSurface(
 ): { adapter: Adapter; surface: ConfigKeysSurface } | null {
   for (const adapter of adapters) {
     for (const surface of adapter.surfaces) {
-      if (surface.mechanism !== 'config-keys') continue;
+      if (surface.mechanism !== 'config-keys' || !surface.supported) continue;
+      const declared = adapter.definition?.surfaces.find((candidate) => candidate.id === surface.id);
+      if (declared && !declared.global.supported) continue;
       if (resolveGlobalSurfaceDestination(adapter, surface, env) === item.path) {
         return { adapter, surface };
       }

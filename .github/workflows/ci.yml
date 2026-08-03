@@ -12,7 +12,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        node: [20, 22]
+        node: ['22.12', 24]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,6 +29,12 @@ jobs:
       - name: Lint, typecheck and test
         run: npm run ci
 
+      - name: Offline suite
+        run: npm run test:offline
+
+      - name: Migration suite
+        run: npm run test:migration
+
       # Packs the release artifact, installs it into a clean prefix, and drives the
       # README's own instructions against the INSTALLED binary: build an env on a
       # simulated machine A, push it to a bare remote, restore it on machine B with
@@ -37,3 +43,7 @@ jobs:
       - name: Pack and install smoke test
         shell: bash
         run: npm run smoke:install
+
+      - name: Clean Node 22 container restore
+        if: matrix.os == 'ubuntu-latest' && matrix.node == '22.12'
+        run: npm run test:restore:container
