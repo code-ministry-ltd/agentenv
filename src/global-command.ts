@@ -25,6 +25,10 @@ import {
   type CommandEffect,
 } from './command-wal.js';
 import { recoverState } from './journal.js';
+import {
+  selectGlobalCowRetainedPath,
+  selectSameFilesystemRetainedPath,
+} from './global-cow.js';
 import { withLock } from './lock.js';
 import {
   capturePathIdentity,
@@ -72,6 +76,12 @@ interface GlobalStateSlice {
   globalStack?: string[];
 }
 
+interface InodeLineage {
+  dev: number;
+  ino: number;
+  kind: 'file' | 'directory';
+}
+
 type GlobalUndo =
   | {
       schemaVersion: 1;
@@ -87,6 +97,7 @@ type GlobalUndo =
       retained: string;
       sourceBackup: BackupRef;
       sourceIdentity: PathIdentity;
+      sourceLineage: InodeLineage;
     }
   | {
       schemaVersion: 1;
@@ -106,6 +117,7 @@ function isWithin(parent: string, child: string): boolean {
 }
 
 function mapUnder(path: string, pairs: readonly PathPair[]): string {
+  if (!isAbsolute(path)) return path;
   const match = [...pairs]
     .filter((pair) => isWithin(pair.actual, path))
     .sort((left, right) => right.actual.length - left.actual.length)[0];
@@ -113,6 +125,7 @@ function mapUnder(path: string, pairs: readonly PathPair[]): string {
 }
 
 function mapBack(path: string, pairs: readonly PathPair[]): string {
+  if (!isAbsolute(path)) return path;
   const match = [...pairs]
     .filter((pair) => isWithin(pair.staged, path))
     .sort((left, right) => right.staged.length - left.staged.length)[0];
@@ -185,6 +198,33 @@ async function movePath(source: string, destination: string): Promise<void> {
     if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error;
     await copyPath(source, destination);
     await rm(source, { recursive: true, force: true });
+  }
+}
+
+async function captureInodeLineage(path: string): Promise<InodeLineage> {
+  const stats = await lstat(path);
+  const kind = stats.isFile() ? 'file' : stats.isDirectory() ? 'directory' : null;
+  if (!kind) throw new Error(`global COW handoff source has unsupported inode type: ${path}`);
+  return { dev: stats.dev, ino: stats.ino, kind };
+}
+
+function sameInode(left: InodeLineage, right: InodeLineage): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.kind === right.kind;
+}
+
+/** Handoffs and their undo must preserve the exact inode. EXDEV is a planning
+ * invariant failure, never permission to copy/delete a live writer. */
+async function renameRetainedInode(source: string, destination: string): Promise<void> {
+  await mkdir(dirname(destination), { recursive: true });
+  try {
+    await rename(source, destination);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EXDEV') {
+      throw new Error(`global COW retained path is not on the surface filesystem: ${destination}`, {
+        cause: error,
+      });
+    }
+    throw error;
   }
 }
 
@@ -340,13 +380,20 @@ async function retainThirdIdentity(
   suffix = '',
 ): Promise<QuarantineRecord> {
   const id = `global-${plan.transactionId}-${operation.id}${suffix}`;
-  const retainedPath = join(paths.live, 'quarantine', id, 'content');
+  const preferredPath = join(paths.live, 'quarantine', id, 'content');
+  const observed = await capturePathIdentity(target);
+  const retainedPath = observed.kind === 'absent'
+    ? preferredPath
+    : await selectSameFilesystemRetainedPath(
+        preferredPath,
+        target,
+        `.agentenv-quarantine-${id}`,
+      );
   const existing = await capturePathIdentity(retainedPath);
   if (existing.kind === 'absent') {
     await mkdir(dirname(retainedPath), { recursive: true });
-    const observed = await capturePathIdentity(target);
     if (observed.kind === 'absent') await writeFile(retainedPath, 'ABSENT third identity\n', 'utf8');
-    else await movePath(target, retainedPath);
+    else await renameRetainedInode(target, retainedPath);
   }
   return {
     schemaVersion: 2,
@@ -417,8 +464,11 @@ function recoveryEffect(paths: Paths, plan: CommandPlan, operation: PlannedOpera
       } else if (sourceIdentity.kind !== 'absent') {
         await rm(undo.source, { recursive: true, force: true });
       }
-      if (identitiesEqual(retainedIdentity, undo.sourceIdentity)) {
-        await movePath(undo.retained, undo.source);
+      const retainedLineage = retainedIdentity.kind === 'absent'
+        ? null
+        : await captureInodeLineage(undo.retained);
+      if (retainedLineage && sameInode(retainedLineage, undo.sourceLineage)) {
+        await renameRetainedInode(undo.retained, undo.source);
       } else {
         if (retainedIdentity.kind !== 'absent') {
           await appendQuarantine(
@@ -572,8 +622,10 @@ export async function executeGlobalCommand<T>(req: ExecuteGlobalCommandRequest<T
   for (const [index, projection] of handoffs.entries()) {
     const post = postByProjection.get(projection.id)!;
     const source = projection.surfacePath!;
-    const retained = post.retainedPath!;
+    const retained = await selectGlobalCowRetainedPath(req.paths, source, projection.id);
+    post.retainedPath = retained;
     const sourceIdentity = await capturePathIdentity(source);
+    const sourceLineage = await captureInodeLineage(source);
     const retainedIdentity = await capturePathIdentity(retained);
     if (retainedIdentity.kind !== 'absent') {
       throw new Error(`retained handoff target already exists: ${retained}`);
@@ -596,6 +648,7 @@ export async function executeGlobalCommand<T>(req: ExecuteGlobalCommandRequest<T
         retained,
         sourceBackup,
         sourceIdentity,
+        sourceLineage,
       } satisfies GlobalUndo),
       state: 'pending',
     };
@@ -611,7 +664,7 @@ export async function executeGlobalCommand<T>(req: ExecuteGlobalCommandRequest<T
           throw new Error(`global handoff target changed before apply: ${retained}`);
         }
         await movePath(seed, marker);
-        await movePath(source, retained);
+        await renameRetainedInode(source, retained);
         await req.hooks?.afterPublish?.(source);
       },
     });

@@ -1,6 +1,7 @@
 import {
   closeSync,
   ftruncateSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -14,6 +15,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { dematerialiseGlobal, materialiseGlobal } from '../src/engine.js';
 import {
   globalCowRetainedPath,
+  globalCowRetainedPathForDevices,
   reconcileRetiredGlobalCows,
   retireActiveGlobalCowSurface,
 } from '../src/global-cow.js';
@@ -28,6 +30,18 @@ afterEach(() => {
 });
 
 describe('retained global COW integration', () => {
+  it('places the retained inode beside the live surface when agent storage is cross-filesystem', () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const surface = join(home.home, 'real', 'skills', 'w-skill');
+
+    expect(globalCowRetainedPathForDevices(paths, surface, 'cow-id', 7, 7))
+      .toBe(globalCowRetainedPath(paths, 'cow-id'));
+    expect(globalCowRetainedPathForDevices(paths, surface, 'cow-id', 7, 9))
+      .toBe(join(home.home, 'real', 'skills', '.agentenv-retained-cow-id'));
+  });
+
   it('resumes an interrupted live-to-retained handoff without deleting its only bytes', async () => {
     const home = makeTempHome();
     homes.push(home);
@@ -114,6 +128,7 @@ describe('retained global COW integration', () => {
     expect(lstatSync(liveSkill).isDirectory()).toBe(true);
     expect(lstatSync(liveSkill).isSymbolicLink()).toBe(false);
     const descriptor = openSync(join(liveSkill, 'SKILL.md'), 'r+');
+    const writerInode = fstatSync(descriptor).ino;
 
     await dematerialiseGlobal({
       paths,
@@ -134,6 +149,7 @@ describe('retained global COW integration', () => {
       phase: 'retired',
       canonicalPath: join(envDir, 'skills', 'w-skill'),
     });
+    expect(lstatSync(join(projection!.retainedPath!, 'SKILL.md')).ino).toBe(writerInode);
     expect(readFileSync(join(projection!.retainedPath!, 'SKILL.md'), 'utf8')).toBe(
       '# LATE WRITE\n',
     );

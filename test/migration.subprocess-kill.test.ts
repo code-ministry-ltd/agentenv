@@ -1,5 +1,5 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -64,7 +64,8 @@ async function fixture(): Promise<Fixture> {
   write(join(paths.base, 'sessions.json'), '{"version":"1.0","bindings":[]}\n');
   write(join(paths.live, 'S1', 'fixture', 'config.txt'), 'legacy view bytes\n');
   write(join(paths.shims, 'fixture-harness'), '#!/bin/sh\nprintf old-shim\n', 0o755);
-  write(external, 'owned external bytes\n');
+  mkdirSync(join(external, '..'), { recursive: true });
+  symlinkSync(join(paths.envDir('work'), 'skills', 'review'), external);
 
   return {
     root,

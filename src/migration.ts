@@ -24,6 +24,7 @@ import type { ConfigKeysItem, RetainedConfigKeysItem } from './config-keys.js';
 import type { DirMergeItem } from './dir-merge.js';
 import type { FileBlockItem, RetainedFileBlockItem } from './file-block.js';
 import { writeFileAtomic } from './fs-atomic.js';
+import { globalCowRetainedPath } from './global-cow.js';
 import {
   createGlobalProjection,
   publishProjection,
@@ -108,8 +109,11 @@ interface GateEntry {
 
 interface ExternalEntry {
   path: string;
-  identity: PathIdentity;
+  preIdentity: PathIdentity;
+  postIdentity?: PathIdentity;
   snapshot: Snapshot;
+  status: 'backed-up' | 'converting' | 'converted' | 'restoring' | 'restored';
+  rescueSnapshot?: Snapshot;
 }
 
 interface MigrationWal {
@@ -205,7 +209,27 @@ async function readWal(paths: Paths): Promise<MigrationWal | null> {
   ) {
     throw new Error(`${walPath(paths)}: invalid migration WAL`);
   }
-  return raw as MigrationWal;
+  const wal = raw as MigrationWal;
+  for (const value of wal.externalEntries as Array<ExternalEntry & { identity?: PathIdentity }>) {
+    if (!value.preIdentity) value.preIdentity = await snapshotIdentity(value.snapshot);
+    if (!value.status) {
+      const afterCutover = wal.cutover === 'pointer-switched';
+      if (afterCutover && value.identity) value.postIdentity = value.identity;
+      value.status = afterCutover ? 'converted' : 'backed-up';
+    }
+    delete value.identity;
+  }
+  return wal;
+}
+
+async function snapshotIdentity(saved: Snapshot): Promise<PathIdentity> {
+  if (saved.kind === 'absent') return { kind: 'absent' };
+  if (saved.kind === 'symlink') return { kind: 'symlink', target: saved.target };
+  const identity = await capturePathIdentity(saved.backup);
+  if (identity.kind !== saved.kind) {
+    throw new Error('migration external snapshot type no longer matches its WAL');
+  }
+  return { ...identity, mode: saved.mode };
 }
 
 /** Fail-safe gate query used by the current CLI and its shim path. */
@@ -627,7 +651,7 @@ function migrationProjectionId(migrationId: string, mechanism: string, path: str
 }
 
 function retainedProjectionPath(paths: Paths, id: string): string {
-  return join(paths.live, 'global-projections', id, 'content');
+  return globalCowRetainedPath(paths, id);
 }
 
 function requirePresentIdentity(identity: PathIdentity, label: string): PathIdentity {
@@ -848,6 +872,11 @@ async function convertImportedGlobalOwnership(
   }
   for (const group of grouped.values()) {
     const first = group[0]!;
+    const external = wal.externalEntries.find((entry) => entry.path === resolve(first.path));
+    if (external) {
+      external.status = 'converting';
+      await writeWal(req.paths, wal);
+    }
     if (first.surface === 'dir-merge') {
       for (const original of group) {
         const index = manifest.items.indexOf(original);
@@ -885,12 +914,15 @@ async function convertImportedGlobalOwnership(
     } else {
       throw new Error(`unsupported legacy global surface '${first.surface}' at ${first.path}`);
     }
+    if (external) {
+      external.postIdentity = await capturePathIdentity(external.path);
+      external.status = 'converted';
+      await writeWal(req.paths, wal);
+    }
   }
   manifest.items = converted;
   manifest.globalProjections = projections;
   await writeState(req.paths, manifest);
-  for (const entry of wal.externalEntries) entry.identity = await capturePathIdentity(entry.path);
-  await writeWal(req.paths, wal);
 }
 
 async function probeCutover(req: MigrationRequest, wal: MigrationWal): Promise<StateManifest> {
@@ -905,7 +937,7 @@ async function probeCutover(req: MigrationRequest, wal: MigrationWal): Promise<S
   if (!(await exists(req.paths.environments))) throw new Error('migrated store environments directory is missing');
   for (const entry of wal.externalEntries) {
     const observed = await capturePathIdentity(entry.path);
-    if (!identitiesEqual(observed, entry.identity)) {
+    if (!entry.postIdentity || !identitiesEqual(observed, entry.postIdentity)) {
       throw new Error(`manifest-owned external path changed during migration: ${entry.path}`);
     }
   }
@@ -1025,6 +1057,37 @@ async function restoreOriginalRoot(paths: Paths, wal: MigrationWal): Promise<voi
   }
 }
 
+async function restoreExternalEntries(paths: Paths, wal: MigrationWal): Promise<void> {
+  for (const [index, entry] of [...wal.externalEntries.entries()].reverse()) {
+    if (entry.status === 'restored') continue;
+    const observed = await capturePathIdentity(entry.path);
+    if (identitiesEqual(observed, entry.preIdentity)) {
+      entry.status = 'restored';
+      await writeWal(paths, wal);
+      continue;
+    }
+
+    const isRecordedPost = entry.postIdentity
+      ? identitiesEqual(observed, entry.postIdentity)
+      : false;
+    if (!isRecordedPost && observed.kind !== 'absent' && !entry.rescueSnapshot) {
+      entry.rescueSnapshot = await snapshot(
+        entry.path,
+        join(migrationWorkspace(paths), 'external-rescues', String(index)),
+      );
+    }
+    entry.status = 'restoring';
+    await writeWal(paths, wal);
+    await restoreSnapshot(entry.path, entry.snapshot);
+    const restored = await capturePathIdentity(entry.path);
+    if (!identitiesEqual(restored, entry.preIdentity)) {
+      throw new Error(`migration rollback could not restore external path: ${entry.path}`);
+    }
+    entry.status = 'restored';
+    await writeWal(paths, wal);
+  }
+}
+
 /** Core rollback used while migrateV1 still owns the legacy lock. */
 async function rollbackMigrationUnderHeldLock(paths: Paths, wal: MigrationWal): Promise<void> {
   const current = wal;
@@ -1035,6 +1098,7 @@ async function rollbackMigrationUnderHeldLock(paths: Paths, wal: MigrationWal): 
     current.migration = beginMigrationRollback(current.migration, 'migration failed before gate opening');
     await writeWal(paths, current);
   }
+  await restoreExternalEntries(paths, current);
   await restoreOriginalRoot(paths, current);
   for (const entry of current.gateEntries) await restoreSnapshot(entry.path, entry.snapshot);
   if (current.migration.phase !== 'rolled-back') {
@@ -1138,7 +1202,12 @@ export async function migrateV1(req: MigrationRequest): Promise<MigrationResult>
         if (!identitiesEqual(identity, observed)) {
           throw new Error(`manifest-owned external path changed while being backed up: ${path}`);
         }
-        wal.externalEntries.push({ path, identity, snapshot: saved });
+        wal.externalEntries.push({
+          path,
+          preIdentity: identity,
+          snapshot: saved,
+          status: 'backed-up',
+        });
         await writeWal(req.paths, wal);
       }
       wal.migration = completeMigrationBackup(wal.migration, migrationWorkspace(req.paths));

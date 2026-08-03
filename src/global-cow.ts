@@ -1,4 +1,4 @@
-import { join } from 'node:path';
+import { dirname, join, parse } from 'node:path';
 import { chmod, cp, lstat, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import {
   beginProjectionReconciliation,
@@ -45,6 +45,80 @@ export interface BeginGlobalCowRequest {
 
 export function globalCowRetainedPath(paths: Paths, id: string): string {
   return join(paths.live, 'global-projections', id, 'content');
+}
+
+export function globalCowRetainedPathForDevices(
+  paths: Paths,
+  surfacePath: string,
+  id: string,
+  surfaceDevice: number,
+  retainedDevice: number,
+): string {
+  return sameFilesystemRetainedPathForDevices(
+    globalCowRetainedPath(paths, id),
+    surfacePath,
+    `.agentenv-retained-${id}`,
+    surfaceDevice,
+    retainedDevice,
+  );
+}
+
+export function sameFilesystemRetainedPathForDevices(
+  preferredPath: string,
+  sourcePath: string,
+  sourceLocalName: string,
+  sourceDevice: number,
+  preferredDevice: number,
+): string {
+  return sourceDevice === preferredDevice
+    ? preferredPath
+    : join(dirname(sourcePath), sourceLocalName);
+}
+
+async function nearestExistingAncestor(path: string): Promise<string> {
+  let current = path;
+  const root = parse(path).root;
+  for (;;) {
+    try {
+      await lstat(current);
+      return current;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    if (current === root) throw new Error(`no existing ancestor for retained path: ${path}`);
+    current = dirname(current);
+  }
+}
+
+export async function selectSameFilesystemRetainedPath(
+  preferredPath: string,
+  sourcePath: string,
+  sourceLocalName: string,
+): Promise<string> {
+  const source = await lstat(sourcePath);
+  const preferredDevice = await lstat(await nearestExistingAncestor(dirname(preferredPath)));
+  return sameFilesystemRetainedPathForDevices(
+    preferredPath,
+    sourcePath,
+    sourceLocalName,
+    source.dev,
+    preferredDevice.dev,
+  );
+}
+
+/** Prefer machine-local retained storage when it shares the surface filesystem;
+ * otherwise choose a source-local hidden name so inode-preserving rename remains possible. */
+export async function selectGlobalCowRetainedPath(
+  paths: Paths,
+  surfacePath: string,
+  id: string,
+): Promise<string> {
+  const normal = globalCowRetainedPath(paths, id);
+  return selectSameFilesystemRetainedPath(
+    normal,
+    surfacePath,
+    `.agentenv-retained-${id}`,
+  );
 }
 
 async function updateProjection(
@@ -159,7 +233,15 @@ export async function retireActiveGlobalCowSurface(
     if (index === -1) return null;
     let projection = manifest.globalProjections[index]!;
     if (!projection.retainedPath) throw new Error(`projection '${projection.id}' lacks a retained path`);
-    const retainedPath = projection.retainedPath;
+    const selectedRetainedPath = projection.phase === 'active'
+      ? await selectGlobalCowRetainedPath(paths, surfacePath, projection.id)
+      : projection.retainedPath;
+    if (selectedRetainedPath !== projection.retainedPath) {
+      projection = { ...projection, retainedPath: selectedRetainedPath };
+      manifest.globalProjections[index] = projection;
+      await writeState(paths, manifest);
+    }
+    const retainedPath = selectedRetainedPath;
 
     if (projection.phase === 'active') {
       const retainedBefore = await capturePathIdentity(retainedPath);

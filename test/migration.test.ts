@@ -310,6 +310,30 @@ describe('gated v1 migration', () => {
     expect(await capturePathIdentity(external)).toEqual(externalBefore);
   });
 
+  it('restores an exact legacy external symlink when post-conversion migration fails', async () => {
+    const th = home();
+    const { external, paths } = cmFixture(th);
+    const canonical = join(paths.envDir('work'), 'skills', 'review');
+    rmSync(external, { force: true });
+    symlinkSync(canonical, external);
+    const rootBefore = await capturePathIdentity(paths.base);
+    const externalBefore = await capturePathIdentity(external);
+
+    await expect(
+      migrateV1({
+        paths,
+        ...quiet,
+        afterBoundary: (observed) => {
+          if (observed === 'global-cow-converted') throw new Error('fault after external conversion');
+        },
+      }),
+    ).rejects.toThrow(/fault after external conversion/);
+
+    expect(await capturePathIdentity(paths.base)).toEqual(rootBefore);
+    expect(await capturePathIdentity(external)).toEqual(externalBefore);
+    expect(lstatSync(external).isSymbolicLink()).toBe(true);
+  });
+
   it.each<MigrationBoundary>([
     'gate-installed',
     'quiescent',
