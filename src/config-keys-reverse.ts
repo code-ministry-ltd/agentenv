@@ -7,7 +7,6 @@ import {
   type JsonValue,
   type RetainedConfigKeysProvenance,
 } from './config-keys.js';
-import { writeFileAtomic } from './fs-atomic.js';
 import { scanTextForSecrets } from './git.js';
 import { capturePathIdentity, identitiesEqual, type PathIdentity } from './path-identity.js';
 import type { Paths } from './paths.js';
@@ -22,6 +21,12 @@ interface CanonicalFilePlan {
   baseline: PathIdentity;
   patches: CanonicalPatch[];
   text?: string;
+}
+
+export interface RetainedConfigCanonicalWrite {
+  path: string;
+  text: string;
+  mode?: number;
 }
 
 function containedPath(root: string, candidate: string): boolean {
@@ -48,7 +53,7 @@ export async function reconcileRetainedConfigKeysProjection(
   retainedPath: string,
   provenance: RetainedConfigKeysProvenance,
   adapters: readonly Adapter[],
-): Promise<string[]> {
+): Promise<RetainedConfigCanonicalWrite[]> {
   const plans = new Map<string, CanonicalFilePlan>();
 
   for (const entry of provenance.items) {
@@ -120,15 +125,9 @@ export async function reconcileRetainedConfigKeysProjection(
     }
   }
 
-  // Revalidate every destination before the first write, then publish the
-  // independently prepared documents. The command-WAL wrapper owns crash recovery.
-  for (const plan of plans.values()) {
-    if (!identitiesEqual(await capturePathIdentity(plan.path), plan.baseline)) {
-      throw new Error(`canonical config changed before write at '${plan.path}'`);
-    }
-  }
-  for (const plan of plans.values()) {
-    await writeFileAtomic(plan.path, plan.text!);
-  }
-  return [...plans.keys()];
+  return [...plans.values()].map((plan) => ({
+    path: plan.path,
+    text: plan.text!,
+    ...(plan.baseline.kind === 'file' ? { mode: plan.baseline.mode } : {}),
+  }));
 }

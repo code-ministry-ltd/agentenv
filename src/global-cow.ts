@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { lstat, readdir, readFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import {
   beginProjectionReconciliation,
   completeProjectionReconciliation,
@@ -14,9 +14,13 @@ import { mirrorCowToCanonical } from './cow-files.js';
 import { retainGlobalCowBytes } from './cow-files.js';
 import {
   reconcileRetainedFileBlockProjection,
+  type RetainedCanonicalWrite,
   type RetainedFileBlockProvenance,
 } from './file-block.js';
-import { reconcileRetainedConfigKeysProjection } from './config-keys-reverse.js';
+import {
+  reconcileRetainedConfigKeysProjection,
+  type RetainedConfigCanonicalWrite,
+} from './config-keys-reverse.js';
 import type { RetainedConfigKeysProvenance } from './config-keys.js';
 import type { Adapter } from './adapter.js';
 import { scanTextForSecrets } from './git.js';
@@ -24,6 +28,7 @@ import { withLock } from './lock.js';
 import { capturePathIdentity, identitiesEqual } from './path-identity.js';
 import type { Paths } from './paths.js';
 import { readState, writeState } from './state.js';
+import { publishStagedBundle, type StagedBundleEntry } from './filesystem-bundle.js';
 
 export interface BeginGlobalCowRequest {
   id: string;
@@ -164,6 +169,8 @@ export interface ReconcileGlobalCowRequest {
   /** Callers assert every unsupervised writer for these ids is closed. */
   quiescent: boolean;
   adapters?: readonly Adapter[];
+  /** Fault-injection seam for canonical WAL tests. */
+  afterCanonicalApply?: (entry: StagedBundleEntry) => Promise<void>;
 }
 
 export interface ReconcileGlobalCowResult {
@@ -189,6 +196,32 @@ async function suspectedSecretCount(path: string): Promise<number> {
   let count = 0;
   for (const entry of await readdir(path)) count += await suspectedSecretCount(join(path, entry));
   return count;
+}
+
+async function publishCanonicalWrites(
+  paths: Paths,
+  projectionId: string,
+  writes: readonly (RetainedCanonicalWrite | RetainedConfigCanonicalWrite)[],
+  afterApply?: (entry: StagedBundleEntry) => Promise<void>,
+): Promise<void> {
+  if (writes.length === 0) return;
+  const transactionId = `projection-${projectionId}`;
+  const stagingRoot = join(paths.live, 'commands', transactionId);
+  await mkdir(stagingRoot, { recursive: true });
+  const entries: StagedBundleEntry[] = [];
+  for (const [index, write] of writes.entries()) {
+    const staged = join(stagingRoot, `canonical-${index}`);
+    await writeFile(staged, write.text, 'utf8');
+    if (write.mode !== undefined) await chmod(staged, write.mode);
+    entries.push({ id: `canonical-${index}`, target: write.path, staged });
+  }
+  await publishStagedBundle({
+    paths,
+    transactionId,
+    stagingRoot,
+    entries,
+    ...(afterApply ? { afterApply } : {}),
+  });
 }
 
 /** Explicit, three-way reverse projection for retained global writer copies. */
@@ -220,6 +253,7 @@ export async function reconcileRetiredGlobalCows(
       beginProjectionReconciliation(observeProjection(projection, observed)),
     );
     try {
+      let canonicalWrites: Array<RetainedCanonicalWrite | RetainedConfigCanonicalWrite> = [];
       if (!identitiesEqual(observed, current.baseline)) {
         const source = current.transform === 'command-skill'
           ? join(current.retainedPath, 'SKILL.md')
@@ -235,7 +269,10 @@ export async function reconcileRetiredGlobalCows(
           if (!current.fileBlockProvenance) {
             throw new Error('retained file-block projection provenance is incomplete');
           }
-          await reconcileRetainedFileBlockProjection(source, current.fileBlockProvenance);
+          canonicalWrites = await reconcileRetainedFileBlockProjection(
+            source,
+            current.fileBlockProvenance,
+          );
         } else {
           if (!identitiesEqual(canonicalNow, current.canonicalBaseline)) {
             throw new Error('canonical changed concurrently with retained projection');
@@ -245,7 +282,7 @@ export async function reconcileRetiredGlobalCows(
               throw new Error('retained config-keys projection provenance is incomplete');
             }
             if (!req.adapters) throw new Error('config-key reconciliation requires adapters');
-            await reconcileRetainedConfigKeysProjection(
+            canonicalWrites = await reconcileRetainedConfigKeysProjection(
               paths,
               source,
               current.configKeysProvenance,
@@ -256,6 +293,7 @@ export async function reconcileRetiredGlobalCows(
           }
         }
       }
+      await publishCanonicalWrites(paths, id, canonicalWrites, req.afterCanonicalApply);
       const revision = JSON.stringify(await capturePathIdentity(current.canonicalPath));
       await updateProjection(paths, id, (projection) =>
         completeProjectionReconciliation(projection, revision),

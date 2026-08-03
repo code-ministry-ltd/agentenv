@@ -118,6 +118,12 @@ export interface RetainedFileBlockProvenance {
   items: RetainedFileBlockItem[];
 }
 
+export interface RetainedCanonicalWrite {
+  path: string;
+  text: string;
+  mode?: number;
+}
+
 /** Inputs to {@link dematerialise} and {@link syncBack}. */
 export interface FileBlockTargetOptions {
   /** Absolute path to the target user instruction file. */
@@ -906,7 +912,7 @@ export async function syncBack(paths: Paths, opts: FileBlockTargetOptions): Prom
 export async function reconcileRetainedFileBlockProjection(
   retainedPath: string,
   provenance: RetainedFileBlockProvenance,
-): Promise<string[]> {
+): Promise<RetainedCanonicalWrite[]> {
   const content = await readFileOrEmpty(retainedPath);
   const writes: { path: string; body: string; baseline: PathIdentity }[] = [];
 
@@ -948,13 +954,11 @@ export async function reconcileRetainedFileBlockProjection(
     }
   }
 
-  for (const write of writes) {
-    if (!identitiesEqual(await capturePathIdentity(write.path), write.baseline)) {
-      throw new Error(`canonical source changed before write for '${write.path}'`);
-    }
-  }
-  for (const write of writes) await writeFileAtomic(write.path, write.body);
-  return writes.map((write) => write.path);
+  return writes.map((write) => ({
+    path: write.path,
+    text: write.body,
+    ...(write.baseline.kind === 'file' ? { mode: write.baseline.mode } : {}),
+  }));
 }
 
 // ---------------------------------------------------------------------------

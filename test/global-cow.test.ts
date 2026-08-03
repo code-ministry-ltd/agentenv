@@ -365,6 +365,53 @@ describe('retained global COW integration', () => {
     expect(readFileSync(projection.retainedPath!, 'utf8')).toBe(edited);
   });
 
+  it('rolls every canonical field back when a multi-source projection publish faults', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const realRoot = join(home.home, 'real');
+    const instructionFile = join(realRoot, 'INSTRUCTIONS.md');
+    const instructionDir = join(paths.envDir('writing'), 'instructions');
+    const base = join(instructionDir, 'base.md');
+    const fixture = join(instructionDir, 'fixture.md');
+    mkdirSync(instructionDir, { recursive: true });
+    mkdirSync(realRoot, { recursive: true });
+    writeFileSync(instructionFile, '# USER\n');
+    writeFileSync(base, '# BASE ONE\n');
+    writeFileSync(fixture, '# BASE TWO\n');
+    const env = { ...home.env, [FIXTURE_CONFIG_ENV]: realRoot };
+    const adapter = makeFixtureAdapter();
+
+    await materialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], env });
+    const edited = readFileSync(instructionFile, 'utf8')
+      .replace('# BASE ONE', '# EDIT ONE')
+      .replace('# BASE TWO', '# EDIT TWO');
+    const descriptor = openSync(instructionFile, 'r+');
+    await dematerialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], all: true, env });
+    ftruncateSync(descriptor, 0);
+    writeSync(descriptor, edited, 0, 'utf8');
+    closeSync(descriptor);
+
+    const projection = (await readState(paths)).globalProjections.find(
+      (candidate) => candidate.surfacePath === instructionFile,
+    )!;
+    let applied = 0;
+    expect(
+      await reconcileRetiredGlobalCows(paths, {
+        ids: [projection.id],
+        quiescent: true,
+        afterCanonicalApply: async () => {
+          applied += 1;
+          if (applied === 2) throw new Error('injected second canonical failure');
+        },
+      }),
+    ).toEqual({ reconciled: 0, quarantined: 1 });
+    expect(readFileSync(base, 'utf8')).toBe('# BASE ONE\n');
+    expect(readFileSync(fixture, 'utf8')).toBe('# BASE TWO\n');
+    expect((await readState(paths)).commands).toEqual([]);
+    expect(readFileSync(projection.retainedPath!, 'utf8')).toBe(edited);
+  });
+
   it('requires an explicit quiescent assertion before reverse projection', async () => {
     const home = makeTempHome();
     homes.push(home);
