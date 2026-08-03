@@ -53,6 +53,15 @@ describe('add.source: resolveSkillSource — shorthand and URLs', () => {
     expect(s.subpath).toBe('skills/x');
   });
 
+  it('preserves the SSH username in a scheme URL', async () => {
+    const s = expectSource(
+      await resolveSkillSource('ssh://deploy@code.example.com/acme/tools/skills/x'),
+    );
+    expect(s.repo).toBe('acme/tools');
+    expect(s.cloneUrl).toBe('ssh://deploy@code.example.com/acme/tools.git');
+    expect(s.subpath).toBe('skills/x');
+  });
+
   it('rejects an argument with fewer than owner/repo segments', async () => {
     const r = await resolveSkillSource('justowner');
     expect('error' in r).toBe(true);

@@ -180,10 +180,11 @@ export async function resolveSkillSource(arg: string): Promise<ParseSkillSourceR
       return { error: `invalid skill source URL '${arg}'` };
     }
     const host = url.host;
+    const authority = proto === 'ssh' && url.username ? `${url.username}@${host}` : host;
     const segments = url.pathname.split('/');
     return fromOwnerRepoPath(
       segments,
-      (owner, repo) => `${proto}://${host}/${owner}/${repo}.git`,
+      (owner, repo) => `${proto}://${authority}/${owner}/${repo}.git`,
       ref,
       arg,
     );
