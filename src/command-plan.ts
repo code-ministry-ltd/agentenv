@@ -28,6 +28,8 @@ export interface CommandPlan {
   schemaVersion: 2;
   transactionId: string;
   kind: string;
+  /** True when the committed filesystem effects cannot complete without Git bookkeeping. */
+  gitRequired: boolean;
   phase: CommandPhase;
   commitPoint: boolean;
   operations: PlannedOperation[];
@@ -36,6 +38,7 @@ export interface CommandPlan {
 export interface CreateCommandPlanInput {
   transactionId: string;
   kind: string;
+  gitRequired?: boolean;
   operations: PlannedOperationInput[];
 }
 
@@ -53,6 +56,7 @@ export function createCommandPlan(input: CreateCommandPlanInput): CommandPlan {
     schemaVersion: 2,
     transactionId: input.transactionId,
     kind: input.kind,
+    gitRequired: input.gitRequired ?? false,
     phase: 'planned',
     commitPoint: false,
     operations: input.operations.map((operation) => ({ ...operation, state: 'pending' })),

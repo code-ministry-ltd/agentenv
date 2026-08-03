@@ -263,7 +263,7 @@ export async function reconcileRetiredGlobalCows(
       if (pending.commitPoint && !req.gitBookkeeping) {
         throw new Error('projection has required Git bookkeeping pending');
       }
-      await recoverPendingFilesystemBundles(paths, req.gitBookkeeping);
+      await recoverPendingFilesystemBundles(paths, req.gitBookkeeping, transactionId);
       if (!pending.commitPoint) {
         await updateProjection(paths, id, (projection) =>
           failProjectionReconciliation(

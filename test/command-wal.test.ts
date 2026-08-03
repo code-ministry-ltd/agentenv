@@ -153,6 +153,19 @@ describe('whole-command WAL executor', () => {
     ).rejects.toThrow(/git unavailable/);
     expect((await readState(paths)).commands[0]?.phase).toBe('git-pending');
 
+    await expect(
+      recoverCommandPlan({
+        paths,
+        transactionId: 'tx-1',
+        effects,
+      }),
+    ).rejects.toThrow(/requires Git bookkeeping/i);
+    expect((await readState(paths)).commands[0]).toMatchObject({
+      transactionId: 'tx-1',
+      phase: 'git-pending',
+      gitRequired: true,
+    });
+
     await recoverCommandPlan({
       paths,
       transactionId: 'tx-1',

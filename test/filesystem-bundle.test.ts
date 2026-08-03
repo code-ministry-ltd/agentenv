@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   publishStagedBundle,
@@ -87,6 +87,64 @@ describe('whole-command staged filesystem publication', () => {
     });
     expect(retried).toBe(1);
     expect(readFileSync(target, 'utf8')).toBe('new\n');
+    expect((await readState(paths)).commands).toEqual([]);
+  });
+
+  it('never applies one transaction Git callback to an unrelated pending bundle', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const firstTarget = join(paths.store, 'environments', 'work', 'first.md');
+    const secondTarget = join(paths.store, 'environments', 'work', 'second.md');
+    mkdirSync(dirname(firstTarget), { recursive: true });
+    writeFileSync(firstTarget, 'first-old\n');
+    writeFileSync(secondTarget, 'second-old\n');
+
+    const firstRoot = join(paths.live, 'commands', 'first-bundle');
+    const firstStaged = join(firstRoot, 'first.md');
+    mkdirSync(firstRoot, { recursive: true });
+    writeFileSync(firstStaged, 'first-new\n');
+    await expect(
+      publishStagedBundle({
+        paths,
+        transactionId: 'first-bundle',
+        stagingRoot: firstRoot,
+        entries: [{ id: 'first', target: firstTarget, staged: firstStaged }],
+        gitBookkeeping: async () => {
+          throw new Error('first Git callback failed');
+        },
+      }),
+    ).rejects.toThrow(/first Git callback failed/);
+
+    let wrongCallbackCalls = 0;
+    const secondRoot = join(paths.live, 'commands', 'second-bundle');
+    const secondStaged = join(secondRoot, 'second.md');
+    mkdirSync(secondRoot, { recursive: true });
+    writeFileSync(secondStaged, 'second-new\n');
+    await expect(
+      publishStagedBundle({
+        paths,
+        transactionId: 'second-bundle',
+        stagingRoot: secondRoot,
+        entries: [{ id: 'second', target: secondTarget, staged: secondStaged }],
+        gitBookkeeping: async () => {
+          wrongCallbackCalls += 1;
+        },
+      }),
+    ).rejects.toThrow(/first-bundle|unfinished/i);
+
+    expect(wrongCallbackCalls).toBe(0);
+    expect(readFileSync(firstTarget, 'utf8')).toBe('first-new\n');
+    expect(readFileSync(secondTarget, 'utf8')).toBe('second-old\n');
+    expect((await readState(paths)).commands).toMatchObject([
+      { transactionId: 'first-bundle', phase: 'git-pending', gitRequired: true },
+    ]);
+
+    let correctCallbackCalls = 0;
+    await recoverPendingFilesystemBundles(paths, async () => {
+      correctCallbackCalls += 1;
+    }, 'first-bundle');
+    expect(correctCallbackCalls).toBe(1);
     expect((await readState(paths)).commands).toEqual([]);
   });
 });

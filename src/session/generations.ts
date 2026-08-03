@@ -200,7 +200,7 @@ export async function resumeSessionGenerationSweep(
   }
   const pending = before.commands.find((plan) => plan.transactionId === transactionId);
   if (!pending) throw new Error('generation has no retained final-sweep command');
-  await recoverPendingFilesystemBundles(paths, gitBookkeeping);
+  await recoverPendingFilesystemBundles(paths, gitBookkeeping, transactionId);
   if (!pending.commitPoint) {
     throw new Error('interrupted final-sweep publication was rolled back; retained generation remains');
   }

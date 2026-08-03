@@ -128,10 +128,19 @@ function recoveryEffects(paths: Paths, plan: CommandPlan): Map<string, CommandEf
 export async function recoverPendingFilesystemBundles(
   paths: Paths,
   gitBookkeeping?: () => Promise<void>,
+  transactionId?: string,
 ): Promise<void> {
   const pending = (await readState(paths)).commands.filter(
-    (plan) => plan.kind === 'filesystem-bundle',
+    (plan) =>
+      plan.kind === 'filesystem-bundle' &&
+      (transactionId === undefined || plan.transactionId === transactionId),
   );
+  if (transactionId !== undefined && pending.length === 0) {
+    throw new Error(`no pending filesystem bundle '${transactionId}'`);
+  }
+  if (transactionId === undefined && gitBookkeeping && pending.length > 1) {
+    throw new Error('transaction id is required to recover more than one filesystem bundle');
+  }
   for (const plan of pending) {
     await recoverCommandPlan({
       paths,
@@ -146,7 +155,26 @@ export async function recoverPendingFilesystemBundles(
 /** Publish a complete staged bundle under one durable, identity-checked command plan. */
 export async function publishStagedBundle(req: PublishStagedBundleRequest): Promise<void> {
   validateRequest(req);
-  await recoverPendingFilesystemBundles(req.paths, req.gitBookkeeping);
+  const pending = (await readState(req.paths)).commands;
+  const same = pending.find((plan) => plan.transactionId === req.transactionId);
+  if (same) {
+    if (same.kind !== 'filesystem-bundle') {
+      throw new Error(`command '${req.transactionId}' is not a filesystem bundle`);
+    }
+    await recoverPendingFilesystemBundles(req.paths, req.gitBookkeeping, req.transactionId);
+    if (!same.commitPoint) {
+      throw new Error(
+        `interrupted filesystem bundle '${req.transactionId}' was rolled back; retry with fresh intent`,
+      );
+    }
+    return;
+  }
+  const unrelated = pending[0];
+  if (unrelated) {
+    throw new Error(
+      `unfinished command '${unrelated.transactionId}' must be resolved before '${req.transactionId}'`,
+    );
+  }
 
   const planned: Array<{
     entry: StagedBundleEntry;
@@ -167,6 +195,7 @@ export async function publishStagedBundle(req: PublishStagedBundleRequest): Prom
   const plan = createCommandPlan({
     transactionId: req.transactionId,
     kind: 'filesystem-bundle',
+    gitRequired: req.gitBookkeeping !== undefined,
     operations: planned.map(({ entry, pre, post, undo }) => ({
       id: entry.id,
       kind: 'replace-path',

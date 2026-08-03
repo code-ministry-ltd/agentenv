@@ -137,6 +137,16 @@ async function finishGitPending(
   transactionId: string,
   gitBookkeeping: (() => Promise<void>) | undefined,
 ): Promise<void> {
+  const exists = await withLock(paths, async () => {
+    const manifest = await readState(paths);
+    const stored = manifest.commands.find((plan) => plan.transactionId === transactionId);
+    if (!stored) return false;
+    if (stored.gitRequired === true && !gitBookkeeping) {
+      throw new Error(`command '${transactionId}' requires Git bookkeeping before completion`);
+    }
+    return true;
+  });
+  if (!exists) return;
   await gitBookkeeping?.();
   await withLock(paths, async () => {
     const manifest = await readState(paths);
@@ -154,13 +164,20 @@ async function finishGitPending(
 
 /** Execute one complete inert plan, retaining it durably until Git bookkeeping succeeds. */
 export async function executeCommandPlan(req: CommandWalRequest): Promise<void> {
+  const requestedPlan: CommandPlan = {
+    ...req.plan,
+    gitRequired: req.plan.gitRequired || req.gitBookkeeping !== undefined,
+  };
+  if (requestedPlan.gitRequired && !req.gitBookkeeping) {
+    throw new Error(`command '${requestedPlan.transactionId}' requires Git bookkeeping`);
+  }
   await withLock(req.paths, async () => {
     const manifest = await readState(req.paths);
-    if (manifest.commands.some((plan) => plan.transactionId !== req.plan.transactionId)) {
+    if (manifest.commands.some((plan) => plan.transactionId !== requestedPlan.transactionId)) {
       throw new Error('another whole-command WAL is unfinished — recover it first');
     }
 
-    let plan = req.plan;
+    let plan = requestedPlan;
     await persistPlan(req.paths, manifest, plan);
     try {
       plan = advanceCommand(plan, 'applying');
@@ -192,7 +209,7 @@ export async function executeCommandPlan(req: CommandWalRequest): Promise<void> 
     }
   });
 
-  await finishGitPending(req.paths, req.plan.transactionId, req.gitBookkeeping);
+  await finishGitPending(req.paths, requestedPlan.transactionId, req.gitBookkeeping);
 }
 
 /** Resume either pre-commit rollback or post-commit Git bookkeeping in a fresh process. */

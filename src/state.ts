@@ -222,6 +222,9 @@ const MIGRATION_PHASES = new Set(['planned', 'backing-up', 'backed-up', 'importi
 function validateCommand(record: Record<string, unknown>, label: string): string | null {
   const required = requireString(record, 'transactionId', label) ?? requireString(record, 'kind', label);
   if (required) return required;
+  if (record.gitRequired !== undefined && typeof record.gitRequired !== 'boolean') {
+    return `${label}.gitRequired must be boolean`;
+  }
   if (!COMMAND_PHASES.has(record.phase as string)) return `${label}.phase is invalid`;
   if (typeof record.commitPoint !== 'boolean') return `${label}.commitPoint must be boolean`;
   if (!Array.isArray(record.operations)) return `${label}.operations must be an array`;
