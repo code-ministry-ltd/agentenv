@@ -662,10 +662,9 @@ async function restoreOriginalRoot(paths: Paths, wal: MigrationWal): Promise<voi
   }
 }
 
-/** Idempotent pre-commit rollback. It never writes an external path migration did not mutate. */
-export async function rollbackMigration(paths: Paths, wal?: MigrationWal): Promise<void> {
-  const current = wal ?? (await readWal(paths));
-  if (!current) return;
+/** Core rollback used while migrateV1 still owns the legacy lock. */
+async function rollbackMigrationUnderHeldLock(paths: Paths, wal: MigrationWal): Promise<void> {
+  const current = wal;
   if (current.migration.commitPoint || (await currentMigrationIsOpened(paths, current.migration.id))) {
     throw new Error('cannot roll back migration after the gate-open commit point');
   }
@@ -679,6 +678,17 @@ export async function rollbackMigration(paths: Paths, wal?: MigrationWal): Promi
     current.migration = completeMigrationRollback(current.migration);
     await writeWal(paths, current);
   }
+}
+
+/** Idempotent fresh-process rollback. It never writes an external path migration did not mutate. */
+export async function rollbackMigration(paths: Paths, wal?: MigrationWal): Promise<void> {
+  const current = wal ?? (await readWal(paths));
+  if (!current) return;
+  await rollbackMigrationUnderHeldLock(paths, current);
+  // A killed migration cannot run the lock's finally block. Re-acquiring the
+  // format-specific legacy lock safely reclaims that dead holder, then releases
+  // our own acquisition, restoring the source root byte-for-byte.
+  await withLegacyLock(paths, current.migration.sourceFormat, async () => {});
 }
 
 async function resumeInterrupted(paths: Paths, wal: MigrationWal): Promise<MigrationResult | null> {
@@ -805,7 +815,7 @@ export async function migrateV1(req: MigrationRequest): Promise<MigrationResult>
         await writeWal(req.paths, wal);
         return { id, sourceFormat: source.format, status: 'opened', backup: migrationWorkspace(req.paths) };
       }
-      await rollbackMigration(req.paths, wal);
+      await rollbackMigrationUnderHeldLock(req.paths, wal);
       throw error;
     }
   });

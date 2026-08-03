@@ -289,9 +289,10 @@ surface backups are not a replacement for it.
 - A global drop can leave projection records requiring an explicit
   `resolve projection … --quiescent` after writers close.
 - Windows remains degraded and is not a first-class release target.
-- The migration suite has deterministic fault injection at every modeled
-  boundary; operators should still keep the retained v1 backup until the new
-  installation has been exercised normally.
+- The command-WAL and migration suites kill real child processes at every
+  modeled durable boundary and recover in fresh processes. Operators should
+  still keep the retained v1 backup until the new installation has been
+  exercised normally.
 
 ## Development and release gates
 
