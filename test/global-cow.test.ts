@@ -89,4 +89,36 @@ describe('retained global COW integration', () => {
       reconcileRetiredGlobalCows(paths, { ids: [], quiescent: false }),
     ).rejects.toThrow(/quiescent/i);
   });
+
+  it('quarantines a secret-bearing late write before it reaches the canonical store', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const realRoot = join(home.home, 'real');
+    const envDir = paths.envDir('writing');
+    const canonical = join(envDir, 'skills', 'w-skill', 'SKILL.md');
+    mkdirSync(join(envDir, 'skills', 'w-skill'), { recursive: true });
+    writeFileSync(canonical, '# ORIGINAL\n');
+    const env = { ...home.env, [FIXTURE_CONFIG_ENV]: realRoot };
+    const adapter = makeFixtureAdapter();
+
+    await materialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], env });
+    await dematerialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], all: true, env });
+    const projection = (await readState(paths)).globalProjections.find(
+      (candidate) => candidate.canonicalPath === join(envDir, 'skills', 'w-skill'),
+    )!;
+    const secret = 'AKIAZ7Q2W9E4R6T1Y8U3';
+    writeFileSync(join(projection.retainedPath!, 'SKILL.md'), `api_key: ${secret}\n`);
+
+    expect(
+      await reconcileRetiredGlobalCows(paths, { ids: [projection.id], quiescent: true }),
+    ).toEqual({ reconciled: 0, quarantined: 1 });
+    expect(readFileSync(canonical, 'utf8')).toBe('# ORIGINAL\n');
+    const after = (await readState(paths)).globalProjections.find(
+      (candidate) => candidate.id === projection.id,
+    )!;
+    expect(after.phase).toBe('quarantined');
+    expect(after.failure).toMatch(/secret/i);
+    expect(after.failure).not.toContain(secret);
+  });
 });

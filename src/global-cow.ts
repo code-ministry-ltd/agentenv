@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { lstat, readdir, readFile } from 'node:fs/promises';
 import {
   beginProjectionReconciliation,
   completeProjectionReconciliation,
@@ -10,6 +11,7 @@ import {
   type GlobalProjection,
 } from './global-projection.js';
 import { mirrorCowToCanonical } from './cow-files.js';
+import { scanTextForSecrets } from './git.js';
 import { withLock } from './lock.js';
 import { capturePathIdentity, identitiesEqual } from './path-identity.js';
 import type { Paths } from './paths.js';
@@ -120,6 +122,26 @@ export interface ReconcileGlobalCowResult {
   quarantined: number;
 }
 
+/** Count findings without ever returning or logging retained values. */
+async function suspectedSecretCount(path: string): Promise<number> {
+  const stats = await lstat(path);
+  if (stats.isSymbolicLink()) {
+    throw new Error('retained projection contains an unresolved symlink');
+  }
+  if (stats.isFile()) {
+    try {
+      return scanTextForSecrets(await readFile(path, 'utf8')).length;
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('unresolved symlink')) throw error;
+      return 0;
+    }
+  }
+  if (!stats.isDirectory()) return 0;
+  let count = 0;
+  for (const entry of await readdir(path)) count += await suspectedSecretCount(join(path, entry));
+  return count;
+}
+
 /** Explicit, three-way reverse projection for retained global writer copies. */
 export async function reconcileRetiredGlobalCows(
   paths: Paths,
@@ -159,6 +181,12 @@ export async function reconcileRetiredGlobalCows(
         const source = current.transform === 'command-skill'
           ? join(current.retainedPath, 'SKILL.md')
           : current.retainedPath;
+        const secretCount = await suspectedSecretCount(source);
+        if (secretCount > 0) {
+          throw new Error(
+            `retained projection has ${secretCount} suspected secret finding(s); canonical write blocked`,
+          );
+        }
         await mirrorCowToCanonical(source, current.canonicalPath);
       }
       const revision = JSON.stringify(await capturePathIdentity(current.canonicalPath));
