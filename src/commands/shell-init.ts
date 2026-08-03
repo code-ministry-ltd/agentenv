@@ -16,7 +16,14 @@ export const shellInitCommand: Command = {
   usage: '',
   summary: 'Emit the shell hook (eval "$(agentenv shell-init)")',
 
-  async run({ paths }) {
+  async run({ args, paths }) {
+    if (args.length > 0) {
+      return {
+        stdout: '',
+        stderr: `shell-init: unexpected argument '${args[0]}'\nUsage: agentenv shell-init\n`,
+        code: 1,
+      };
+    }
     const shims = shSingleQuote(paths.shims);
     const script = `# agentenv shell hook — eval "$(agentenv shell-init)" in your shell rc.
 # 1) Put agentenv's shims first on PATH (idempotent).

@@ -113,7 +113,7 @@ describe('engine: global orphan recovery (Finding 1/2)', () => {
     expect(manifest.items.some((i) => i.surface === 'config-keys')).toBe(false);
   });
 
-  it('drop --global --all clears manifest-owned items even when the global stack is empty (Finding 1)', async () => {
+  it('an env-less global drop clears manifest-owned items even when the global stack is empty (Finding 1)', async () => {
     const th = home();
     const { paths, realHome, env } = await materialiseThenOrphan(th);
     const opts = { env, adapters: [makeFixtureAdapter()] };
@@ -122,7 +122,7 @@ describe('engine: global orphan recovery (Finding 1/2)', () => {
     expect(existsSync(join(realHome, 'skills', 'w-skill'))).toBe(true);
     expect((await readState(paths)).globalStack).toEqual([]);
 
-    const res = await run(['drop', '--global', '--all'], opts);
+    const res = await run(['drop', '--global'], opts);
     expect(res.code).toBe(0);
 
     // Every owned item is removed and the real surfaces are restored.

@@ -20,6 +20,13 @@ export const createCommand: Command = {
     if (name === undefined) {
       return { stdout: '', stderr: 'create: missing environment name\nUsage: agentenv create <name> [--from <env>]\n', code: 1 };
     }
+    if (parsed.positionals.length > 1) {
+      return {
+        stdout: '',
+        stderr: `create: unexpected argument '${parsed.positionals[1]}'\nUsage: agentenv create <name> [--from <env>]\n`,
+        code: 1,
+      };
+    }
     const nameError = validateEnvName(name);
     if (nameError) {
       return { stdout: '', stderr: `create: ${nameError}\n`, code: 1 };

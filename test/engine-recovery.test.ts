@@ -50,7 +50,7 @@ describe('engine: crash recovery', () => {
     });
 
     const env: NodeJS.ProcessEnv = { ...th.env, [FIXTURE_CONFIG_ENV]: realHome };
-    const res = await run(['drop', '--global', '--all'], { env, adapters: [makeFixtureAdapter()] });
+    const res = await run(['drop', '--global'], { env, adapters: [makeFixtureAdapter()] });
     expect(res.code).toBe(0);
 
     // recoverState rolled back the aborted add: the stray symlink is gone, the
@@ -83,7 +83,7 @@ describe('engine: crash recovery', () => {
     await persistPendingJournal(paths, { op: 'add', item, undo: { path: cfgPath, backupRef } });
 
     const env: NodeJS.ProcessEnv = { ...th.env, [FIXTURE_CONFIG_ENV]: realHome };
-    const res = await run(['drop', '--global', '--all'], { env, adapters: [makeFixtureAdapter()] });
+    const res = await run(['drop', '--global'], { env, adapters: [makeFixtureAdapter()] });
     expect(res.code).toBe(0);
 
     expect(readFileSync(cfgPath, 'utf8')).toBe(original); // restored byte-for-byte

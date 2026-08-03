@@ -41,6 +41,13 @@ export const disownCommand: Command = {
     if (name === undefined) {
       return { stdout: '', stderr: 'disown: missing item name\nUsage: agentenv disown <name>\n', code: 1 };
     }
+    if (parsed.positionals.length > 1) {
+      return {
+        stdout: '',
+        stderr: `disown: unexpected argument '${parsed.positionals[1]}'\nUsage: agentenv disown <name>\n`,
+        code: 1,
+      };
+    }
 
     const matches = findAdoptedByName(await readState(ctx.paths), name);
     if (matches.length === 0) {

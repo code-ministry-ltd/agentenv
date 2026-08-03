@@ -5,15 +5,15 @@ import { adapters as realAdapters } from '../adapters/index.js';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
 import { driftSweep } from '../drift.js';
-import { materialiseGlobal, selectAdapters } from '../engine.js';
+import { materialiseGlobal } from '../engine.js';
 import { setBinding } from '../session/registry.js';
 import { resolveProjectRoot } from '../session/registry.js';
-import { parseHarnesses, validateEnvs } from './activation.js';
+import { validateEnvs } from './activation.js';
 import { renderGlobalSkips } from './global-report.js';
 import { closeStoreSync, openStoreSync } from './store-sync.js';
 
 /**
- * `agentenv use <env>… [--harness <h>…] [--global]` — activate an env stack.
+ * `agentenv use <env>… [--global]` — activate an env stack.
  *
  * - **session (default)** binds this shell + project to the stack via the session
  *   registry (D8/D15). No real config file is touched — the shim/`run` builds the
@@ -24,33 +24,31 @@ import { closeStoreSync, openStoreSync } from './store-sync.js';
  */
 export const useCommand: Command = {
   name: 'use',
-  usage: '<env>… [--harness <h>…] [--global]',
+  usage: '<env>… [--global]',
   summary: 'Activate an env stack (session by default; --global for real paths)',
 
   async run(ctx): Promise<RunResult> {
-    const parsed = parseArgs(ctx.args, { booleans: ['global'], values: ['harness'] });
+    const parsed = parseArgs(ctx.args, { booleans: ['global'] });
     if (parsed.unknown.length > 0) {
       return { stdout: '', stderr: `use: unknown option '${parsed.unknown[0]}'\n`, code: 1 };
     }
     if (parsed.positionals.length === 0) {
       return {
         stdout: '',
-        stderr: 'use: missing environment name(s)\nUsage: agentenv use <env>… [--harness <h>…] [--global]\n',
+        stderr: 'use: missing environment name(s)\nUsage: agentenv use <env>… [--global]\n',
         code: 1,
       };
     }
-    const harnesses = parseHarnesses(parsed.values.get('harness'));
     if (parsed.booleans.has('global')) {
-      return useGlobal(ctx, parsed.positionals, harnesses);
+      return useGlobal(ctx, parsed.positionals);
     }
-    return useSession(ctx, parsed.positionals, harnesses);
+    return useSession(ctx, parsed.positionals);
   },
 };
 
 async function useSession(
   ctx: CommandContext,
   names: readonly string[],
-  harnesses: string[] | undefined,
 ): Promise<RunResult> {
   const { paths, env, cwd } = ctx;
   const session = env.AGENTENV_SESSION;
@@ -75,14 +73,12 @@ async function useSession(
     session,
     projectRoot,
     envs: kept,
-    ...(harnesses ? { harnesses } : {}),
     global: false,
   });
 
-  const scope = harnesses ? ` (harnesses: ${harnesses.join(', ')})` : '';
   const stderr = notices.length > 0 ? `${notices.join('\n')}\n` : undefined;
   return {
-    stdout: `Bound this shell to [${kept.join(', ')}]${scope} in ${projectRoot}.\n`,
+    stdout: `Bound this shell to [${kept.join(', ')}] in ${projectRoot}.\n`,
     ...(stderr ? { stderr } : {}),
     code: 0,
   };
@@ -91,15 +87,13 @@ async function useSession(
 async function useGlobal(
   ctx: CommandContext,
   names: readonly string[],
-  harnesses: string[] | undefined,
 ): Promise<RunResult> {
   const { paths, env, options } = ctx;
-  const adapters = selectAdapters(options.adapters ?? realAdapters, harnesses);
+  const adapters = options.adapters ?? realAdapters;
   if (adapters.length === 0) {
-    const detail = harnesses ? ` matching --harness ${harnesses.join(',')}` : '';
     return {
       stdout: '',
-      stderr: `use --global: no registered adapter${detail} — global mode needs a harness adapter (Task 1.8/4.x)\n`,
+      stderr: `use --global: no registered adapter — global mode needs a harness adapter\n`,
       code: 1,
     };
   }

@@ -43,7 +43,21 @@ export const initCommand: Command = {
         code: 1,
       };
     }
+    if (parsed.positionals.length > 0) {
+      return {
+        stdout: '',
+        stderr: `init: unexpected argument '${parsed.positionals[0]}'\nUsage: agentenv init [--remote <url>]\n`,
+        code: 1,
+      };
+    }
     const remoteUrl = (parsed.values.get('remote') ?? '').trim();
+    if (remoteUrl !== '' && ctx.options.globals?.offline) {
+      return {
+        stdout: '',
+        stderr: 'init: --remote is disabled by --offline\n',
+        code: 1,
+      };
+    }
     const alreadyRepo = await storeIsRepo(ctx.paths);
 
     // NEW-MACHINE BOOTSTRAP: a --remote on a machine with no local store yet clones

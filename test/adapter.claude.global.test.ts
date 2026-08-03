@@ -163,8 +163,8 @@ describe('adapter.claude — global materialise/restore (AC)', () => {
     expect(manifest.items.some((i) => i.surface === 'dir-merge')).toBe(true);
     expect(manifest.items.some((i) => i.surface === 'config-keys' && i.ownerEnv === 'writing')).toBe(true);
 
-    // drop --global --all restores the copy byte-for-byte.
-    const dropped = await run(['drop', '--global', '--all', '--harness', 'claude'], opts);
+    // An env-less global drop restores the copy byte-for-byte.
+    const dropped = await run(['drop', '--global'], opts);
     expect(dropped.code).toBe(0);
     expect(hashTree(userHome)).toBe(before);
     const after = await readState(paths);

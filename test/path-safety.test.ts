@@ -31,7 +31,7 @@ describe('store path-safety: env-name validation blocks traversal', () => {
 
   for (const bad of badNames) {
     it(`rm rejects '${bad}' (deletes nothing, store intact)`, async () => {
-      const result = await run(['rm', bad, '--yes'], { env: tmp.env });
+      const result = await run(['rm', bad], { env: tmp.env });
       expect(result.code).not.toBe(0);
       // store and both real environments must survive unscathed.
       expect(existsSync(storeDir())).toBe(true);
@@ -56,7 +56,7 @@ describe('store path-safety: env-name validation blocks traversal', () => {
     mkdirSync(sentinel, { recursive: true });
     writeFileSync(join(sentinel, 'keep.txt'), 'do not delete');
 
-    const result = await run(['rm', '../../sentinel', '--yes'], { env: tmp.env });
+    const result = await run(['rm', '../../sentinel'], { env: tmp.env });
     expect(result.code).not.toBe(0);
     expect(existsSync(join(sentinel, 'keep.txt'))).toBe(true);
   });

@@ -55,7 +55,7 @@ describe('sync: commit-per-mutation (D9)', () => {
     });
     expect(subjects(paths.store)[0]).toBe('agentenv: edit env writing');
 
-    await run(['rm', 'writing', '--yes'], { env: th.env });
+    await run(['rm', 'writing'], { env: th.env, confirm: async () => true });
     expect(subjects(paths.store)[0]).toBe('agentenv: remove env writing');
   });
 

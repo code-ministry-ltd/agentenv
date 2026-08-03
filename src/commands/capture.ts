@@ -30,6 +30,13 @@ export const captureCommand: Command = {
     if (parsed.unknown.length > 0) {
       return { stdout: '', stderr: `capture: unknown option '${parsed.unknown[0]}'\n`, code: 1 };
     }
+    if (parsed.positionals.length > 0) {
+      return {
+        stdout: '',
+        stderr: `capture: unexpected argument '${parsed.positionals[0]}'\nUsage: agentenv capture [--dry-run]\n`,
+        code: 1,
+      };
+    }
     const dryRun = parsed.booleans.has('dry-run');
     return dryRun ? previewCapture(ctx) : runCapture(ctx);
   },

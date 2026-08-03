@@ -53,7 +53,12 @@ export const syncCommand: Command = {
     }
 
     if (parsed.booleans.has('abort')) return abortSync(ctx);
-    if (parsed.booleans.has('resolve')) return resolveSync(ctx);
+    if (parsed.booleans.has('resolve')) {
+      if (ctx.options.globals?.offline) {
+        return fail('sync --resolve: remote conflict resolution is disabled by --offline\n');
+      }
+      return resolveSync(ctx);
+    }
     return plainSync(ctx);
   },
 };

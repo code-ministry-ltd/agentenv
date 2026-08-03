@@ -15,7 +15,6 @@ import { remoteCommand } from './remote.js';
 import { resolveCommand } from './resolve.js';
 import { rmCommand } from './rm.js';
 import { runCommand } from './run.js';
-import { secretCommand } from './secret.js';
 import { shellInitCommand } from './shell-init.js';
 import { shimCommand } from './shim.js';
 import { showCommand } from './show.js';
@@ -43,7 +42,6 @@ export const commands: readonly Command[] = [
   captureCommand,
   adoptCommand,
   disownCommand,
-  secretCommand,
   statusCommand,
   remoteCommand,
   syncCommand,

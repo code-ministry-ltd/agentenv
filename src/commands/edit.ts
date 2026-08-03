@@ -26,6 +26,13 @@ export const editCommand: Command = {
     if (name === undefined) {
       return { stdout: '', stderr: 'edit: missing environment name\nUsage: agentenv edit <name> [--print-path]\n', code: 1 };
     }
+    if (parsed.positionals.length > 1) {
+      return {
+        stdout: '',
+        stderr: `edit: unexpected argument '${parsed.positionals[1]}'\nUsage: agentenv edit <name> [--print-path]\n`,
+        code: 1,
+      };
+    }
     // Validate before any path join, so `edit ../../x` can't open a file outside the store.
     const nameError = validateEnvName(name);
     if (nameError) {

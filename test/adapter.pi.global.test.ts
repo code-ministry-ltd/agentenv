@@ -4,7 +4,7 @@
  * ~/.pi). Proves every supported surface materialises (skills/prompts dir-merge,
  * AGENTS.md inline file-block, settings.json resource arrays), the MCP surface is
  * reported UNSUPPORTED, bucket-1 `auth.json`/`trust.json` are never touched, and
- * `drop --global --all` restores the copy byte-for-byte.
+ * an env-less `drop --global` restores the copy byte-for-byte.
  */
 import { createHash } from 'node:crypto';
 import { lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs';
@@ -158,10 +158,10 @@ describe('adapter.pi — global materialise/restore (AC)', () => {
     expect(manifest.items.some((i) => i.surface === 'file-block' && i.ownerEnv === 'writing')).toBe(true);
     expect(manifest.items.some((i) => i.surface === 'config-keys' && i.ownerEnv === 'writing')).toBe(true);
 
-    // drop --global --all restores the copy. Every surface that promises a
+    // An env-less global drop restores the copy. Every surface that promises a
     // format-preserving round-trip is byte-for-byte identical: dir-merge symlinks are
     // removed, the AGENTS.md file-block is restored exactly, bucket-1 files untouched.
-    const dropped = await run(['drop', '--global', '--all'], opts);
+    const dropped = await run(['drop', '--global'], opts);
     expect(dropped.code).toBe(0);
     expect(hashTree(realHome, ['settings.json'])).toBe(beforeExceptSettings);
     // The settings.json array-element surface is DATA-identical with agentenv's element

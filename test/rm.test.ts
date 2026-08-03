@@ -17,11 +17,11 @@ describe('rm', () => {
     return join(tmp.home, 'store', 'environments', name);
   }
 
-  it('removes the environment with --yes (no prompt)', async () => {
+  it('removes the environment after confirmation', async () => {
     await run(['create', 'writing'], { env: tmp.env });
     expect(existsSync(envDir('writing'))).toBe(true);
 
-    const result = await run(['rm', 'writing', '--yes'], { env: tmp.env });
+    const result = await run(['rm', 'writing'], { env: tmp.env, confirm: async () => true });
     expect(result.code).toBe(0);
     expect(existsSync(envDir('writing'))).toBe(false);
   });
@@ -47,7 +47,7 @@ describe('rm', () => {
     expect(result.stdout).toMatch(/not removed|aborted/i);
   });
 
-  it('does NOT remove in a non-interactive path without --yes', async () => {
+  it('does NOT remove in a non-interactive path', async () => {
     await run(['create', 'writing'], { env: tmp.env });
     // No injected confirm and no TTY (vitest) -> safe default is to decline.
     const result = await run(['rm', 'writing'], { env: tmp.env });
@@ -56,13 +56,13 @@ describe('rm', () => {
   });
 
   it('errors on an unknown environment', async () => {
-    const result = await run(['rm', 'ghost', '--yes'], { env: tmp.env });
+    const result = await run(['rm', 'ghost'], { env: tmp.env });
     expect(result.code).not.toBe(0);
     expect(result.stderr).toContain('ghost');
   });
 
   it('requires a name', async () => {
-    const result = await run(['rm', '--yes'], { env: tmp.env });
+    const result = await run(['rm'], { env: tmp.env });
     expect(result.code).not.toBe(0);
   });
 });

@@ -16,6 +16,9 @@ export const statusCommand: Command = {
   summary: 'Show session bindings, the global stack, and per-surface support',
 
   async run(ctx): Promise<RunResult> {
+    if (ctx.args.length > 0) {
+      return { stdout: '', stderr: `status: unexpected argument '${ctx.args[0]}'\nUsage: agentenv status\n`, code: 1 };
+    }
     const lines: string[] = ['agentenv status', ''];
     lines.push(...(await syncSection(ctx)));
     lines.push(...(await lifecycleSection(ctx)));

@@ -57,18 +57,19 @@ describe('engine: session use', () => {
     expect(binding?.envs).toEqual(['writing']);
   });
 
-  it('records --harness scoping on the binding', async () => {
+  it('rejects removed --harness scoping', async () => {
     const th = home();
     await seedEnvs(th.env, 'writing');
     const env = { ...th.env, AGENTENV_SESSION: 'S1' };
 
     const res = await run(['use', 'writing', '--harness', 'claude,codex'], { env, cwd: th.home });
-    expect(res.code).toBe(0);
+    expect(res.code).toBe(1);
+    expect(res.stderr).toContain("unknown option '--harness'");
 
     const paths = resolvePaths(th.env);
     const projectRoot = await resolveProjectRoot(th.home);
     const binding = findBinding(await readSessionRegistry(paths), 'S1', projectRoot);
-    expect(binding?.harnesses).toEqual(['claude', 'codex']);
+    expect(binding).toBeUndefined();
   });
 
   it('errors when every named env is missing', async () => {
@@ -131,13 +132,13 @@ describe('engine: session drop', () => {
     expect(findBinding(await readSessionRegistry(paths), 'S1', projectRoot)).toBeUndefined();
   });
 
-  it('--all removes the binding', async () => {
+  it('an env-less drop removes the binding', async () => {
     const th = home();
     await seedEnvs(th.env, 'writing', 'research');
     const env = { ...th.env, AGENTENV_SESSION: 'S1' };
     await run(['use', 'writing', 'research'], { env, cwd: th.home });
 
-    const res = await run(['drop', '--all'], { env, cwd: th.home });
+    const res = await run(['drop'], { env, cwd: th.home });
     expect(res.code).toBe(0);
 
     const paths = resolvePaths(th.env);

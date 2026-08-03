@@ -171,8 +171,8 @@ describe('adapter.opencode — global materialise/restore (AC)', () => {
       manifest.items.some((i) => i.surface === 'config-keys' && i.ownerEnv === 'writing'),
     ).toBe(true);
 
-    // drop --global --all restores the copy byte-for-byte.
-    const dropped = await run(['drop', '--global', '--all'], opts);
+    // An env-less global drop restores the copy byte-for-byte.
+    const dropped = await run(['drop', '--global'], opts);
     expect(dropped.code).toBe(0);
     expect(hashTree(realHome)).toBe(before);
     expect(() => lstatSync(join(th.home, '.agents', 'skills', 'w-skill'))).toThrow();

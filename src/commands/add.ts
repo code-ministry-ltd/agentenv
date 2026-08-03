@@ -165,6 +165,9 @@ async function addSkill(
         'Usage: agentenv add skill <env> <name|localPath> [--force] [--print-path]\n',
     );
   }
+  if (parsed.positionals.length > 2) {
+    return fail(`add skill: unexpected argument '${parsed.positionals[2]}'\n`);
+  }
 
   const force = parsed.booleans.has('force');
   const printPath = parsed.booleans.has('print-path');
@@ -207,6 +210,9 @@ async function addSkill(
         'add skill: --print-path is not supported for git sources ' +
           '(the skill name is only known after fetching)\n',
       );
+    }
+    if (ctx.options.globals?.offline && !target.startsWith('file://')) {
+      return fail('add skill: network git sources are disabled by --offline\n');
     }
     return addSkillFromGit(env, target, force, ctx, notices);
   }
@@ -459,6 +465,9 @@ async function addSkills(
         'Usage: agentenv add skills <env> <owner/repo[/path][@ref]|localDir> [--all] [--force]\n',
     );
   }
+  if (parsed.positionals.length > 2) {
+    return fail(`add skills: unexpected argument '${parsed.positionals[2]}'\n`);
+  }
   const all = parsed.booleans.has('all');
   const force = parsed.booleans.has('force');
 
@@ -478,6 +487,9 @@ async function addSkills(
   if (localIsDir) {
     scanRoot = localDir;
   } else {
+    if (ctx.options.globals?.offline && !target.startsWith('file://')) {
+      return fail('add skills: network git sources are disabled by --offline\n');
+    }
     const source = await resolveSkillSource(target);
     if ('error' in source) return fail(`add skills: ${source.error}\n`);
     const fetched = await fetchSkillSource(source);
@@ -597,6 +609,9 @@ async function addMcp(
       'add mcp: missing server name\n' +
         'Usage: agentenv add mcp <env> <name> [--transport stdio|http] [--force] [--print-path]\n',
     );
+  }
+  if (parsed.positionals.length > 2) {
+    return fail(`add mcp: unexpected argument '${parsed.positionals[2]}'\n`);
   }
   const nameError = validateItemName('mcp server', name);
   if (nameError) return fail(`add mcp: ${nameError}\n`);
@@ -744,6 +759,9 @@ async function addMarkdownItem(
       `add ${kind}: missing ${kind} name\n` +
         `Usage: agentenv add ${kind} <env> <name> [--force] [--print-path]\n`,
     );
+  }
+  if (parsed.positionals.length > 2) {
+    return fail(`add ${kind}: unexpected argument '${parsed.positionals[2]}'\n`);
   }
   const nameError = validateItemName(kind, name);
   if (nameError) return fail(`add ${kind}: ${nameError}\n`);

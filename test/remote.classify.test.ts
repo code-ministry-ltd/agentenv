@@ -310,13 +310,13 @@ describe('remote 2.3: UNRELATED candidate → refuse / cancel / archive-and-adop
     return { th, paths, oldRemote, unrelated };
   }
 
-  it('--non-interactive REFUSES (exit non-zero, nothing changed)', async () => {
+  it('a non-interactive invocation safely refuses by default (nothing changed)', async () => {
     const { th, paths, oldRemote, unrelated } = await setup();
     const localBefore = subjects(paths.store);
 
-    const res = await run(['remote', unrelated.url, '--non-interactive'], { env: th.env });
-    expect(res.code).not.toBe(0);
-    expect(res.stderr).toMatch(/unrelated/i);
+    const res = await run(['remote', unrelated.url], { env: th.env });
+    expect(res.code).toBe(0);
+    expect(res.stdout).toMatch(/cancel/i);
     expect(originUrl(paths.store)).toBe(oldRemote.url); // unchanged
     expect(subjects(paths.store)).toEqual(localBefore); // intact
   });

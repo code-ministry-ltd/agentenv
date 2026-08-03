@@ -37,8 +37,8 @@ import { closeStoreSync, openStoreSync } from './store-sync.js';
  *   then flip.
  * - **related** history (a shared commit): integrate under the normal rebase rules,
  *   then flip; a conflict leaves the old URL configured and local state untouched.
- * - **unrelated** non-empty history: REFUSE non-interactively (`--non-interactive` /
- *   `--offline`); interactively DEFAULT to cancel, offering archive-local-and-adopt —
+ * - **unrelated** non-empty history: default to cancel, offering
+ *   archive-local-and-adopt —
  *   which archives the local store to a recoverable copy BEFORE adopting the remote.
  * - **unreachable** candidate: clear error, change nothing (old remote/URL/content intact).
  *
@@ -47,11 +47,11 @@ import { closeStoreSync, openStoreSync } from './store-sync.js';
  */
 export const remoteCommand: Command = {
   name: 'remote',
-  usage: '<url> [--non-interactive] [--offline]',
+  usage: '<url>',
   summary: 'Connect or safely replace the single sync remote (design D14)',
 
   async run(ctx): Promise<RunResult> {
-    const parsed = parseArgs(ctx.args, { booleans: ['non-interactive', 'offline'] });
+    const parsed = parseArgs(ctx.args);
     if (parsed.unknown.length > 0) {
       return fail(`remote: unknown option '${parsed.unknown[0]}'\n`);
     }
@@ -62,11 +62,10 @@ export const remoteCommand: Command = {
     if (parsed.positionals.length > 1) {
       return fail(`remote: unexpected argument '${parsed.positionals[1]}'\nUsage: agentenv remote <url>\n`);
     }
-    // `--offline` implies non-interactive here: classifying + adopting an unrelated
-    // remote needs an explicit confirmation we must not fabricate without a prompt.
-    const nonInteractive = parsed.booleans.has('non-interactive') || parsed.booleans.has('offline');
-
     const { paths, env, options } = ctx;
+    if (options.globals?.offline) {
+      return fail('remote: remote probing and replacement are disabled by --offline\n');
+    }
     await ensureStore(paths);
     await ensureStoreRepo(paths, env, options.gitRun);
 
@@ -111,7 +110,7 @@ export const remoteCommand: Command = {
         case 'related':
           return await integrateRelated(ctx, url, classification.candidateRef, existing);
         case 'unrelated':
-          return await adoptUnrelated(ctx, url, classification.candidateRef, existing, nonInteractive);
+          return await adoptUnrelated(ctx, url, classification.candidateRef, existing, false);
         default:
           return fail('remote: could not classify the candidate remote; nothing was changed.\n');
       }

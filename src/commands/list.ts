@@ -7,7 +7,10 @@ export const listCommand: Command = {
   usage: '',
   summary: 'List environments',
 
-  async run({ paths }) {
+  async run({ args, paths }) {
+    if (args.length > 0) {
+      return { stdout: '', stderr: `list: unexpected argument '${args[0]}'\nUsage: agentenv list\n`, code: 1 };
+    }
     const names = await listEnvironments(paths);
     if (names.length === 0) {
       return {

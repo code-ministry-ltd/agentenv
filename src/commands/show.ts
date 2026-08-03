@@ -35,6 +35,13 @@ export const showCommand: Command = {
     if (name === undefined) {
       return { stdout: '', stderr: 'show: missing environment name\nUsage: agentenv show <name>\n', code: 1 };
     }
+    if (parsed.positionals.length > 1) {
+      return {
+        stdout: '',
+        stderr: `show: unexpected argument '${parsed.positionals[1]}'\nUsage: agentenv show <name>\n`,
+        code: 1,
+      };
+    }
     // Validate before any path join, so `show ../../x` can't read outside the store.
     const nameError = validateEnvName(name);
     if (nameError) {

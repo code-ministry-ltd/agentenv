@@ -57,7 +57,7 @@ function seedEnv(envDir: string, skillName: string, mcpServerName: string, instr
 }
 
 describe('engine: global drop (round-trip)', () => {
-  it('AC: use --global then drop --global --all is byte-identical outside ~/.agentenv', async () => {
+  it('AC: use --global then an env-less global drop is byte-identical outside ~/.agentenv', async () => {
     const th = home();
     const paths = resolvePaths(th.env);
     const realHome = join(th.home, 'real');
@@ -72,7 +72,7 @@ describe('engine: global drop (round-trip)', () => {
     // Prove something actually changed in between.
     expect(hashTree(realHome)).not.toBe(before);
 
-    expect((await run(['drop', '--global', '--all'], opts)).code).toBe(0);
+    expect((await run(['drop', '--global'], opts)).code).toBe(0);
 
     expect(hashTree(realHome)).toBe(before);
     const manifest = await readState(paths);

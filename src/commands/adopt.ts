@@ -36,6 +36,13 @@ export const adoptCommand: Command = {
     if (name === undefined) {
       return { stdout: '', stderr: 'adopt: missing item name\nUsage: agentenv adopt <name> --into <env>\n', code: 1 };
     }
+    if (parsed.positionals.length > 1) {
+      return {
+        stdout: '',
+        stderr: `adopt: unexpected argument '${parsed.positionals[1]}'\nUsage: agentenv adopt <name> --into <env>\n`,
+        code: 1,
+      };
+    }
     const into = parsed.values.get('into');
     if (into === undefined) {
       return { stdout: '', stderr: 'adopt: --into <env> is required (use `agentenv capture` to auto-adopt into the top env)\n', code: 1 };

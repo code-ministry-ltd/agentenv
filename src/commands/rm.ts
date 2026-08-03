@@ -1,32 +1,30 @@
 import { rm as removeDir } from 'node:fs/promises';
-import { adapters as realAdapters } from '../adapters/index.js';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext } from '../command.js';
-import { dematerialiseGlobal, readGlobalStack } from '../engine.js';
+import { readGlobalStack } from '../engine.js';
 import { confirmDefault } from '../prompt.js';
-import {
-  readSessionRegistry,
-  removeBinding,
-  setBinding,
-} from '../session/registry.js';
+import { readSessionRegistry } from '../session/registry.js';
 import { readState } from '../state.js';
 import { environmentExists, validateEnvName } from '../store.js';
 import { withNotices, withStoreSync } from './store-sync.js';
 
 export const rmCommand: Command = {
   name: 'rm',
-  usage: '<name> [--yes|--force]',
+  usage: '<name>',
   summary: 'Remove an environment',
 
   async run(ctx) {
     const { args, paths, env, options } = ctx;
-    const parsed = parseArgs(args, { booleans: ['yes', 'force', 'drop-first'] });
+    const parsed = parseArgs(args);
     if (parsed.unknown.length > 0) {
       return { stdout: '', stderr: `rm: unknown option '${parsed.unknown[0]}'\n`, code: 1 };
     }
     const name = parsed.positionals[0];
     if (name === undefined) {
-      return { stdout: '', stderr: 'rm: missing environment name\nUsage: agentenv rm <name> [--drop-first] [--yes]\n', code: 1 };
+      return { stdout: '', stderr: 'rm: missing environment name\nUsage: agentenv rm <name>\n', code: 1 };
+    }
+    if (parsed.positionals.length > 1) {
+      return { stdout: '', stderr: `rm: unexpected argument '${parsed.positionals[1]}'\nUsage: agentenv rm <name>\n`, code: 1 };
     }
     // Validate BEFORE any path construction: path.join collapses `..`, so an
     // unvalidated name like `..` or `../../x` would let rm -rf escape the store.
@@ -41,39 +39,30 @@ export const rmCommand: Command = {
 
     // Active-env refusal (deferred from Task 1.1): refuse to remove an env that
     // is currently active — bound in any session OR present in the global stack —
-    // unless --drop-first, which deactivates it first (D5/D11).
+    // Active environments must be explicitly deactivated first.
     const activity = await envActivity(ctx, name);
     if (activity.session || activity.globalStack || activity.materialised) {
-      if (!parsed.booleans.has('drop-first')) {
-        // Distinguish stack membership from materialised ownership — an env can own
-        // real items without being in the stack (a crash-orphaned global env), and
-        // the two are deactivated the same way but read differently to the user.
-        const where = [
-          activity.session ? 'a session binding' : null,
-          activity.globalStack ? 'the global stack' : null,
-          activity.materialised ? 'materialised global items' : null,
-        ]
-          .filter(Boolean)
-          .join(' and ');
-        return {
-          stdout: '',
-          stderr: `rm: environment '${name}' is active (${where}) — deactivate it first, or pass --drop-first\n`,
-          code: 1,
-        };
-      }
-      await deactivateEverywhere(ctx, name, activity);
+      const where = [
+        activity.session ? 'a session binding' : null,
+        activity.globalStack ? 'the global stack' : null,
+        activity.materialised ? 'materialised global items' : null,
+      ]
+        .filter(Boolean)
+        .join(' and ');
+      return {
+        stdout: '',
+        stderr: `rm: environment '${name}' is active (${where}) — deactivate it first\n`,
+        code: 1,
+      };
     }
 
-    const skipPrompt = parsed.booleans.has('yes') || parsed.booleans.has('force');
-    if (!skipPrompt) {
-      const confirm = ctx.options.confirm ?? confirmDefault;
-      const confirmed = await confirm(`Remove environment '${name}'? This cannot be undone. [y/N] `);
-      if (!confirmed) {
-        return {
-          stdout: `Aborted; '${name}' was not removed. (use --yes to skip the prompt)\n`,
-          code: 0,
-        };
-      }
+    const confirm = ctx.options.confirm ?? confirmDefault;
+    const confirmed = await confirm(`Remove environment '${name}'? This cannot be undone. [y/N] `);
+    if (!confirmed) {
+      return {
+        stdout: `Aborted; '${name}' was not removed.\n`,
+        code: 0,
+      };
     }
 
     // Remove inside the git-sync lifecycle (pull → remove → commit → push).
@@ -107,33 +96,4 @@ async function envActivity(
   const globalStack = readGlobalStack(manifest).includes(name);
   const materialised = manifest.items.some((i) => i.ownerEnv === name);
   return { session, globalStack, materialised };
-}
-
-/**
- * `--drop-first`: deactivate `name` everywhere before removal — dematerialise it
- * from the global stack (re-materialising anything it shadowed, D5) and remove it
- * from every session binding (dropping a binding whose last env it was).
- */
-async function deactivateEverywhere(
-  ctx: CommandContext,
-  name: string,
-  activity: { session: boolean; globalStack: boolean; materialised: boolean },
-): Promise<void> {
-  const { paths, env, options } = ctx;
-  if (activity.globalStack || activity.materialised) {
-    const adapters = options.adapters ?? realAdapters;
-    await dematerialiseGlobal({ paths, adapters, envs: [name], all: false, env });
-  }
-  if (activity.session) {
-    const registry = await readSessionRegistry(paths);
-    for (const binding of [...registry.bindings]) {
-      if (!binding.envs.includes(name)) continue;
-      const remaining = binding.envs.filter((e) => e !== name);
-      if (remaining.length === 0) {
-        await removeBinding(paths, binding.session, binding.projectRoot);
-      } else {
-        await setBinding(paths, { ...binding, envs: remaining });
-      }
-    }
-  }
 }

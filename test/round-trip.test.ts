@@ -35,7 +35,7 @@ import { readState } from '../src/state.js';
  *   after a simulated session with a write-through edit + a discarded user-content
  *   drift, and after the view is dropped). The private view lives under
  *   `~/.agentenv/live/`; nothing leaks to the real home.
- * - (b) Global — the classic form: hash, `use --global`, `drop --global --all`,
+ * - (b) Global — the classic form: hash, `use --global`, env-less `drop --global`,
  *   byte-identical outside `~/.agentenv/`.
  *
  * Hermetic: a single temp `HOME` holds `.claude/` (the real config root), `.agents/`
@@ -315,7 +315,7 @@ describe('round-trip integrity (spec criterion 1) — session variant', () => {
 });
 
 describe('round-trip integrity (spec criterion 1) — global variant', () => {
-  it('use --global then drop --global --all restores the lived-in home byte-for-byte', async () => {
+  it('use --global then an env-less global drop restores the lived-in home byte-for-byte', async () => {
     const h = home();
     const paths = resolvePaths(h.env);
     seedLivedInClaude(h);
@@ -387,8 +387,8 @@ describe('round-trip integrity (spec criterion 1) — global variant', () => {
       manifest.items.some((i) => i.surface === 'config-keys' && i.ownerEnv === 'writing'),
     ).toBe(true);
 
-    // --- drop --global --all: dematerialise everything from the MANIFEST. ---
-    const dropped = await run(['drop', '--global', '--all'], opts);
+    // --- env-less drop --global: dematerialise everything from the MANIFEST. ---
+    const dropped = await run(['drop', '--global'], opts);
     expect(dropped.code).toBe(0);
 
     // The strict guarantee: byte-identical outside ~/.agentenv/ — .claude.json
