@@ -50,6 +50,7 @@ import type { Paths } from './paths.js';
 import { listRawFiles, rawMappingStoreRoot, type RawFile } from './raw-mapping.js';
 import { loadResolver, substituteSecretFields, type SecretResolver } from './secrets.js';
 import { findOwner, readState, writeState, type ManifestItem, type StateManifest } from './state.js';
+import { buildSurfaceGraph, type SurfaceGraph } from './surface-graph.js';
 
 /**
  * The GLOBAL-mode engine (design D4/D5/D7). `agentenv use … --global` materialises
@@ -278,6 +279,11 @@ export async function materialiseGlobal(req: MaterialiseGlobalRequest): Promise<
   const onWarn = req.onWarn ?? ((m: string) => console.warn(m));
   const skips: GlobalSkip[] = [];
 
+  // Compile the physical ownership graph before the first effect. This rejects
+  // overlapping/conflicting adapter declarations up front and identifies shared
+  // destinations that must be rendered once for all logical consumers.
+  const graph = buildProductionGlobalGraph(adapters, env);
+
   // Recovery-first: roll back any journal a previous crash left pending, so the
   // manifest is consistent before we begin (D4).
   await withLock(paths, () => recoverState(paths));
@@ -288,6 +294,7 @@ export async function materialiseGlobal(req: MaterialiseGlobalRequest): Promise<
   const rawPlans = await planRawMappings(req);
 
   let applied = 0;
+  const renderedSharedNodes = new Set<string>();
   // dir-merge and file-block: each self-locks + self-journals (one atomic op).
   for (const adapter of adapters) {
     for (const surface of adapter.surfaces) {
@@ -301,6 +308,25 @@ export async function materialiseGlobal(req: MaterialiseGlobalRequest): Promise<
         continue;
       }
       const target = resolveGlobalSurfaceDestination(adapter, surface, env);
+      const physical = graph?.nodes.find((node) => node.path === target);
+      if (
+        surface.mechanism !== 'config-keys' &&
+        physical &&
+        physical.consumers.length > 1
+      ) {
+        // One physical directory may intentionally consume several DIFFERENT
+        // store kinds (Codex skills + command-as-skill wrappers). Deduplicate
+        // only equivalent logical consumption shared by multiple adapters.
+        const logicalKey = JSON.stringify([
+          physical.ownerId,
+          surface.storeKind,
+          surface.mechanism,
+          surface.mechanism === 'dir-merge' ? surface.layout ?? null : null,
+          surface.mechanism === 'file-block' ? surface.layering : null,
+        ]);
+        if (renderedSharedNodes.has(logicalKey)) continue;
+        renderedSharedNodes.add(logicalKey);
+      }
       if (surface.mechanism === 'dir-merge') {
         applied += await materialiseDirMerge(req, adapter, surface, target, skips, onWarn);
       } else if (surface.mechanism === 'file-block') {
@@ -339,6 +365,23 @@ export async function materialiseGlobal(req: MaterialiseGlobalRequest): Promise<
   for (const w of verifyWarnings) onWarn(w);
 
   return { applied, removed: 0, skips, stack, verifyWarnings };
+}
+
+function buildProductionGlobalGraph(
+  adapters: readonly Adapter[],
+  env: NodeJS.ProcessEnv,
+): SurfaceGraph | null {
+  const declared = adapters.filter(
+    (adapter): adapter is Adapter & { definition: NonNullable<Adapter['definition']> } =>
+      adapter.definition !== undefined,
+  );
+  if (declared.length === 0) return null;
+  const byDefinition = new Map(declared.map((adapter) => [adapter.definition, adapter]));
+  return buildSurfaceGraph({
+    adapters: declared.map((adapter) => adapter.definition),
+    mode: 'global',
+    rootsFor: (definition) => globalDestinationRoots(byDefinition.get(definition)!, env),
+  });
 }
 
 async function planRawMappings(
@@ -1380,6 +1423,10 @@ export async function dematerialiseGlobal(req: DematerialiseGlobalRequest): Prom
   const { paths, adapters, env, all } = req;
   const onWarn = req.onWarn ?? ((m: string) => console.warn(m));
   const skips: GlobalSkip[] = [];
+
+  // Drop consumes the same central ownership graph as activation. A newly
+  // conflicting adapter set must fail before any retained inode is detached.
+  buildProductionGlobalGraph(adapters, env);
 
   await withLock(paths, () => recoverState(paths));
 
