@@ -204,6 +204,49 @@ describe('session launch', () => {
     expect(generation?.phase).toBe('quarantined');
     expect(result.notices.join(' ')).toMatch(/final generation sweep failed|commit failed/i);
     expect(readFileSync(storeInstruction, 'utf8')).toBe('UNCOMMITTED HARNESS EDIT\n');
+    expect((await readState(paths)).commands).toMatchObject([
+      { transactionId: `generation-${result.generationId}`, phase: 'git-pending' },
+    ]);
+  });
+
+  it('rolls final instruction drift back when canonical WAL publication faults', async () => {
+    const th = home();
+    const { paths, env } = scenario(th);
+    const storeInstruction = join(paths.envDir('writing'), 'instructions', 'base.md');
+    mkdirSync(join(storeInstruction, '..'), { recursive: true });
+    writeFileSync(storeInstruction, 'ORIGINAL INSTRUCTION\n');
+    const exec: ExecHarness = async (spec) => {
+      await spec.onSpawn?.({
+        processGroupId: 4400,
+        pid: 4401,
+        processStart: 'fixture-start-4401',
+      });
+      const instructions = join(spec.env[FIXTURE_CONFIG_ENV]!, 'INSTRUCTIONS.md');
+      writeFileSync(
+        instructions,
+        readFileSync(instructions, 'utf8').replace(
+          'ORIGINAL INSTRUCTION',
+          'ROLLED BACK HARNESS EDIT',
+        ),
+      );
+      return 0;
+    };
+
+    const result = await launchHarness({
+      ...req({ paths, adapter: makeFixtureAdapter(), env, execHarness: exec }),
+      afterFinalSweepApply: async () => {
+        throw new Error('injected final-sweep publication failure');
+      },
+    });
+
+    expect(readFileSync(storeInstruction, 'utf8')).toBe('ORIGINAL INSTRUCTION\n');
+    expect((await readState(paths)).commands).toEqual([]);
+    expect(
+      (await readState(paths)).generations.find(
+        (candidate) => candidate.id === result.generationId,
+      ),
+    ).toMatchObject({ phase: 'quarantined' });
+    expect(result.notices.join(' ')).toMatch(/final generation sweep failed/i);
   });
 
   it('uses Adapter v2 launch arguments, environment, and optional root override', async () => {

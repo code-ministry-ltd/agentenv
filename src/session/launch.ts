@@ -1,9 +1,18 @@
 import { randomUUID } from 'node:crypto';
+import { chmod, mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Adapter, SelfCheckContext } from '../adapter.js';
 import { renderSessionLaunch } from '../adapter-v2.js';
-import { driftSweep } from '../drift.js';
-import { commitStore, pushStore, type CommitResult, type GitRunner } from '../git.js';
+import { planSessionGenerationDrift } from '../drift.js';
+import {
+  commitStore,
+  pushStore,
+  scanTextForSecrets,
+  type CommitResult,
+  type GitRunner,
+} from '../git.js';
+import { publishStagedBundle, type StagedBundleEntry } from '../filesystem-bundle.js';
+import { capturePathIdentity } from '../path-identity.js';
 import type { Paths } from '../paths.js';
 import { loadSecrets } from '../secrets.js';
 import { readState } from '../state.js';
@@ -84,6 +93,8 @@ export interface LaunchRequest {
   now?: () => number;
   /** Store Git seam; final sweep must commit before the generation becomes swept. */
   gitRun?: GitRunner;
+  /** Fault-injection seam for final-sweep WAL tests. */
+  afterFinalSweepApply?: (entry: StagedBundleEntry) => Promise<void>;
 }
 
 function requireFinalCommit(commit: CommitResult): void {
@@ -95,6 +106,44 @@ function requireFinalCommit(commit: CommitResult): void {
   if (commit.status === 'rebase-in-progress') {
     throw new Error('required drift commit blocked by an in-progress rebase');
   }
+}
+
+async function publishFinalGenerationDrift(
+  req: LaunchRequest,
+  generationId: string,
+  writes: readonly { path: string; text: string }[],
+  commit: () => Promise<void>,
+): Promise<void> {
+  if (writes.length === 0) {
+    await commit();
+    return;
+  }
+  const transactionId = `generation-${generationId}`;
+  const stagingRoot = join(req.paths.live, 'commands', transactionId);
+  await mkdir(stagingRoot, { recursive: true });
+  const entries: StagedBundleEntry[] = [];
+  const seen = new Set<string>();
+  for (const [index, write] of writes.entries()) {
+    if (seen.has(write.path)) throw new Error(`duplicate final-sweep target '${write.path}'`);
+    seen.add(write.path);
+    const secretCount = scanTextForSecrets(write.text).length;
+    if (secretCount > 0) {
+      throw new Error(`final sweep has ${secretCount} suspected secret finding(s)`);
+    }
+    const staged = join(stagingRoot, `canonical-${index}`);
+    await writeFile(staged, write.text, 'utf8');
+    const identity = await capturePathIdentity(write.path);
+    if (identity.kind === 'file') await chmod(staged, identity.mode);
+    entries.push({ id: `canonical-${index}`, target: write.path, staged });
+  }
+  await publishStagedBundle({
+    paths: req.paths,
+    transactionId,
+    stagingRoot,
+    entries,
+    gitBookkeeping: commit,
+    ...(req.afterFinalSweepApply ? { afterApply: req.afterFinalSweepApply } : {}),
+  });
 }
 
 export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
@@ -303,20 +352,27 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
       try {
         await closeSessionGeneration(paths, generationId, reservationId, now());
         await beginSessionGenerationSweep(paths, generationId);
-        await driftSweep({
+        const writes = await planSessionGenerationDrift({
           paths,
           adapters: [adapter],
           env: execEnv,
           generationIds: [generationId],
           onWarn: (message) => notices.push(message),
         });
-        const commit = await commitStore(
-          paths,
-          execEnv,
-          `agentenv: sweep session generation ${generationId}`,
-          req.gitRun,
+        await publishFinalGenerationDrift(
+          req,
+          generationId,
+          writes,
+          async () => {
+            const commit = await commitStore(
+              paths,
+              execEnv,
+              `agentenv: sweep session generation ${generationId}`,
+              req.gitRun,
+            );
+            requireFinalCommit(commit);
+          },
         );
-        requireFinalCommit(commit);
         await completeSessionGenerationSweep(paths, generationId, now());
         sweepCompleted = true;
       } catch (err) {

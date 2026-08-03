@@ -342,6 +342,29 @@ async function sweepSessionInstructions(
   result: DriftSweepResult,
   onWarn: (m: string) => void,
 ): Promise<void> {
+  const writes = await discoverSessionInstructionDrift(req, manifest);
+  for (const write of writes) {
+    try {
+      await writeFileAtomic(write.path, write.text);
+      result.sessionInstructionsSynced += 1;
+      result.storePathsChanged.push(write.path);
+    } catch (err) {
+      onWarn(
+        `agentenv: could not write session drift back to ${write.path} (${(err as Error).message})`,
+      );
+    }
+  }
+}
+
+export interface SessionGenerationDriftWrite {
+  path: string;
+  text: string;
+}
+
+async function discoverSessionInstructionDrift(
+  req: DriftSweepRequest,
+  manifest: StateManifest,
+): Promise<SessionGenerationDriftWrite[]> {
   const { paths, adapters } = req;
   // The set of file-block instruction files each adapter generates, keyed by
   // adapter id → { relPath, layering }. Only INLINE surfaces carry content to
@@ -371,35 +394,42 @@ async function sweepSessionInstructions(
     }
   }
 
+  const writes: SessionGenerationDriftWrite[] = [];
   for (const { adapter, viewRoot } of roots) {
-      for (const surface of adapter.surfaces) {
-        if (surface.mechanism !== 'file-block' || !surface.supported || surface.layering !== 'inline') {
-          continue;
-        }
-        const genPath = join(viewRoot, surface.rootRelativePath);
-        let text: string;
-        try {
-          text = await readFile(genPath, 'utf8');
-        } catch {
-          continue; // no generated file for this view/surface
-        }
-        for (const hit of scanSubBlocks(text)) {
-          const storePath = join(paths.envDir(hit.env), 'instructions', hit.source);
-          let storeBody: string;
-          try {
-            storeBody = await readFile(storePath, 'utf8');
-          } catch {
-            continue; // never CREATE a store file from a session view — write-back only
-          }
-          if (hit.body === storeBody) continue;
-          try {
-            await writeFileAtomic(storePath, hit.body);
-            result.sessionInstructionsSynced += 1;
-            result.storePathsChanged.push(storePath);
-          } catch (err) {
-            onWarn(`agentenv: could not write session drift back to ${storePath} (${(err as Error).message})`);
-          }
-        }
+    for (const surface of adapter.surfaces) {
+      if (
+        surface.mechanism !== 'file-block' ||
+        !surface.supported ||
+        surface.layering !== 'inline'
+      ) {
+        continue;
       }
+      const genPath = join(viewRoot, surface.rootRelativePath);
+      let text: string;
+      try {
+        text = await readFile(genPath, 'utf8');
+      } catch {
+        continue; // no generated file for this view/surface
+      }
+      for (const hit of scanSubBlocks(text)) {
+        const storePath = join(paths.envDir(hit.env), 'instructions', hit.source);
+        let storeBody: string;
+        try {
+          storeBody = await readFile(storePath, 'utf8');
+        } catch {
+          continue; // never CREATE a store file from a session view — write-back only
+        }
+        if (hit.body !== storeBody) writes.push({ path: storePath, text: hit.body });
+      }
+    }
   }
+  return writes;
+}
+
+/** Plan final-generation instruction persistence without mutating canonical files. */
+export async function planSessionGenerationDrift(
+  req: DriftSweepRequest & { generationIds: readonly string[] },
+): Promise<SessionGenerationDriftWrite[]> {
+  if (req.generationIds.length === 0) return [];
+  return discoverSessionInstructionDrift(req, await readState(req.paths));
 }
