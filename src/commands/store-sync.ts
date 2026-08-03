@@ -56,6 +56,19 @@ export async function commitMutation(ctx: SyncCtx, message: string, notices: str
   }
 }
 
+/** Required local commit for a whole-command WAL; unsafe statuses keep it pending. */
+export async function commitRequiredMutation(
+  ctx: SyncCtx,
+  message: string,
+  notices: string[],
+): Promise<void> {
+  const result = await commitStore(ctx.paths, ctx.env, message, ctx.options.gitRun);
+  noteBlockedCommit(result, notices);
+  if (result.status === 'blocked' || result.status === 'rebase-in-progress') {
+    throw new Error(`required Git bookkeeping is '${result.status}'`);
+  }
+}
+
 /** START the sync lifecycle: pull-on-invoke + post-pull safeguards (design D9). */
 export async function openStoreSync(
   ctx: SyncCtx,

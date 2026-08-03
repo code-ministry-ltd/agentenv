@@ -5,7 +5,12 @@ import { reconcileRetiredGlobalCows } from '../global-cow.js';
 import { withLock } from '../lock.js';
 import { resolveRetainedCandidate } from '../sync.js';
 import { readState, writeState } from '../state.js';
-import { closeStoreSync, commitMutation, inScopeAdapters, withNotices } from './store-sync.js';
+import {
+  closeStoreSync,
+  commitRequiredMutation,
+  inScopeAdapters,
+  withNotices,
+} from './store-sync.js';
 
 function ok(stdout: string): RunResult {
   return { stdout, code: 0 };
@@ -33,26 +38,34 @@ async function resolveProjection(ctx: CommandContext, id: string, rest: readonly
   }
   const projection = (await readState(ctx.paths)).globalProjections.find((entry) => entry.id === id);
   if (!projection) return fail(`resolve projection: unknown projection '${id}'\n`);
-  if (projection.phase !== 'retired') {
-    return fail(`resolve projection: '${id}' is '${projection.phase}', not retired\n`);
+  if (projection.phase !== 'retired' && projection.phase !== 'reconciling') {
+    return fail(
+      `resolve projection: '${id}' is '${projection.phase}', not retired or reconciling\n`,
+    );
   }
 
-  const result = await reconcileRetiredGlobalCows(ctx.paths, {
-    ids: [id],
-    quiescent: true,
-    adapters: inScopeAdapters(ctx.options),
-  });
+  const notices: string[] = [];
+  let result;
+  try {
+    result = await reconcileRetiredGlobalCows(ctx.paths, {
+      ids: [id],
+      quiescent: true,
+      adapters: inScopeAdapters(ctx.options),
+      gitBookkeeping: () =>
+        commitRequiredMutation(
+          { paths: ctx.paths, env: ctx.env, options: ctx.options },
+          `agentenv: reconcile global projection ${id}`,
+          notices,
+        ),
+    });
+  } catch (error) {
+    return fail(`resolve projection: ${(error as Error).message}; retained intent remains\n`);
+  }
   if (result.quarantined > 0) {
     return fail(
       `resolve projection: '${id}' was quarantined; canonical bytes were not overwritten\n`,
     );
   }
-  const notices: string[] = [];
-  await commitMutation(
-    { paths: ctx.paths, env: ctx.env, options: ctx.options },
-    `agentenv: reconcile global projection ${id}`,
-    notices,
-  );
   await closeStoreSync({ paths: ctx.paths, env: ctx.env, options: ctx.options }, notices);
   return withNotices(
     ok(`Resolved projection '${id}'; retained bytes were not collected.\n`),

@@ -28,7 +28,11 @@ import { withLock } from './lock.js';
 import { capturePathIdentity, identitiesEqual } from './path-identity.js';
 import type { Paths } from './paths.js';
 import { readState, writeState } from './state.js';
-import { publishStagedBundle, type StagedBundleEntry } from './filesystem-bundle.js';
+import {
+  publishStagedBundle,
+  recoverPendingFilesystemBundles,
+  type StagedBundleEntry,
+} from './filesystem-bundle.js';
 
 export interface BeginGlobalCowRequest {
   id: string;
@@ -171,6 +175,8 @@ export interface ReconcileGlobalCowRequest {
   adapters?: readonly Adapter[];
   /** Fault-injection seam for canonical WAL tests. */
   afterCanonicalApply?: (entry: StagedBundleEntry) => Promise<void>;
+  /** Required local commit; a failure leaves canonical publication git-pending. */
+  gitBookkeeping?: () => Promise<void>;
 }
 
 export interface ReconcileGlobalCowResult {
@@ -203,8 +209,12 @@ async function publishCanonicalWrites(
   projectionId: string,
   writes: readonly (RetainedCanonicalWrite | RetainedConfigCanonicalWrite)[],
   afterApply?: (entry: StagedBundleEntry) => Promise<void>,
+  gitBookkeeping?: () => Promise<void>,
 ): Promise<void> {
-  if (writes.length === 0) return;
+  if (writes.length === 0) {
+    await gitBookkeeping?.();
+    return;
+  }
   const transactionId = `projection-${projectionId}`;
   const stagingRoot = join(paths.live, 'commands', transactionId);
   await mkdir(stagingRoot, { recursive: true });
@@ -221,6 +231,7 @@ async function publishCanonicalWrites(
     stagingRoot,
     entries,
     ...(afterApply ? { afterApply } : {}),
+    ...(gitBookkeeping ? { gitBookkeeping } : {}),
   });
 }
 
@@ -236,6 +247,42 @@ export async function reconcileRetiredGlobalCows(
   for (const id of req.ids) {
     const manifest = await readState(paths);
     const current = manifest.globalProjections.find((projection) => projection.id === id);
+    if (current?.phase === 'reconciling') {
+      const transactionId = `projection-${id}`;
+      const pending = manifest.commands.find((plan) => plan.transactionId === transactionId);
+      if (!pending) {
+        await updateProjection(paths, id, (projection) =>
+          failProjectionReconciliation(
+            projection,
+            'reconciliation intent ended without a durable completion record',
+          ),
+        );
+        result.quarantined += 1;
+        continue;
+      }
+      if (pending.commitPoint && !req.gitBookkeeping) {
+        throw new Error('projection has required Git bookkeeping pending');
+      }
+      await recoverPendingFilesystemBundles(paths, req.gitBookkeeping);
+      if (!pending.commitPoint) {
+        await updateProjection(paths, id, (projection) =>
+          failProjectionReconciliation(
+            projection,
+            'interrupted canonical publication was rolled back',
+          ),
+        );
+        result.quarantined += 1;
+        continue;
+      }
+      const revision = JSON.stringify(
+        await capturePathIdentity(current.canonicalPath ?? current.retainedPath ?? ''),
+      );
+      await updateProjection(paths, id, (projection) =>
+        completeProjectionReconciliation(projection, revision),
+      );
+      result.reconciled += 1;
+      continue;
+    }
     if (!current || current.phase !== 'retired') continue;
     if (!current.retainedPath || !current.canonicalPath || !current.canonicalBaseline) {
       await updateProjection(paths, id, (projection) => ({
@@ -293,13 +340,23 @@ export async function reconcileRetiredGlobalCows(
           }
         }
       }
-      await publishCanonicalWrites(paths, id, canonicalWrites, req.afterCanonicalApply);
+      await publishCanonicalWrites(
+        paths,
+        id,
+        canonicalWrites,
+        req.afterCanonicalApply,
+        req.gitBookkeeping,
+      );
       const revision = JSON.stringify(await capturePathIdentity(current.canonicalPath));
       await updateProjection(paths, id, (projection) =>
         completeProjectionReconciliation(projection, revision),
       );
       result.reconciled += 1;
     } catch (err) {
+      const pending = (await readState(paths)).commands.find(
+        (plan) => plan.transactionId === `projection-${id}`,
+      );
+      if (pending?.commitPoint) throw err;
       await updateProjection(paths, id, (projection) =>
         failProjectionReconciliation(projection, (err as Error).message),
       );

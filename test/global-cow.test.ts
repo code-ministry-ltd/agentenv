@@ -412,6 +412,65 @@ describe('retained global COW integration', () => {
     expect(readFileSync(projection.retainedPath!, 'utf8')).toBe(edited);
   });
 
+  it('resumes required Git bookkeeping without replaying canonical writes', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const realRoot = join(home.home, 'real');
+    const instructionFile = join(realRoot, 'INSTRUCTIONS.md');
+    const canonical = join(paths.envDir('writing'), 'instructions', 'base.md');
+    mkdirSync(join(paths.envDir('writing'), 'instructions'), { recursive: true });
+    mkdirSync(realRoot, { recursive: true });
+    writeFileSync(instructionFile, '# USER\n');
+    writeFileSync(canonical, '# BASELINE\n');
+    const env = { ...home.env, [FIXTURE_CONFIG_ENV]: realRoot };
+    const adapter = makeFixtureAdapter();
+    await materialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], env });
+    const edited = readFileSync(instructionFile, 'utf8').replace('# BASELINE', '# EDITED');
+    const descriptor = openSync(instructionFile, 'r+');
+    await dematerialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], all: true, env });
+    ftruncateSync(descriptor, 0);
+    writeSync(descriptor, edited, 0, 'utf8');
+    closeSync(descriptor);
+    const projection = (await readState(paths)).globalProjections.find(
+      (candidate) => candidate.surfacePath === instructionFile,
+    )!;
+
+    await expect(
+      reconcileRetiredGlobalCows(paths, {
+        ids: [projection.id],
+        quiescent: true,
+        gitBookkeeping: async () => {
+          throw new Error('injected commit failure');
+        },
+      }),
+    ).rejects.toThrow(/injected commit failure/);
+    expect(readFileSync(canonical, 'utf8')).toBe('# EDITED\n');
+    expect((await readState(paths)).globalProjections.find((item) => item.id === projection.id)).toMatchObject({
+      phase: 'reconciling',
+    });
+    expect((await readState(paths)).commands).toMatchObject([
+      { transactionId: `projection-${projection.id}`, phase: 'git-pending' },
+    ]);
+
+    let commits = 0;
+    expect(
+      await reconcileRetiredGlobalCows(paths, {
+        ids: [projection.id],
+        quiescent: true,
+        gitBookkeeping: async () => {
+          commits += 1;
+        },
+      }),
+    ).toEqual({ reconciled: 1, quarantined: 0 });
+    expect(commits).toBe(1);
+    expect(readFileSync(canonical, 'utf8')).toBe('# EDITED\n');
+    expect((await readState(paths)).commands).toEqual([]);
+    expect((await readState(paths)).globalProjections.find((item) => item.id === projection.id)).toMatchObject({
+      phase: 'reconciled',
+    });
+  });
+
   it('requires an explicit quiescent assertion before reverse projection', async () => {
     const home = makeTempHome();
     homes.push(home);

@@ -29,6 +29,8 @@ export interface PublishStagedBundleRequest {
   entries: readonly StagedBundleEntry[];
   /** Fault-injection/observation seam; production callers leave it unset. */
   afterApply?: (entry: StagedBundleEntry) => Promise<void>;
+  /** Required local Git bookkeeping; failure leaves the committed WAL git-pending. */
+  gitBookkeeping?: () => Promise<void>;
 }
 
 function isContained(root: string, candidate: string): boolean {
@@ -123,7 +125,10 @@ function recoveryEffects(paths: Paths, plan: CommandPlan): Map<string, CommandEf
 }
 
 /** Resume any pre-commit rollback (or clear a committed record) from an earlier process. */
-export async function recoverPendingFilesystemBundles(paths: Paths): Promise<void> {
+export async function recoverPendingFilesystemBundles(
+  paths: Paths,
+  gitBookkeeping?: () => Promise<void>,
+): Promise<void> {
   const pending = (await readState(paths)).commands.filter(
     (plan) => plan.kind === 'filesystem-bundle',
   );
@@ -132,6 +137,7 @@ export async function recoverPendingFilesystemBundles(paths: Paths): Promise<voi
       paths,
       transactionId: plan.transactionId,
       effects: recoveryEffects(paths, plan),
+      ...(gitBookkeeping ? { gitBookkeeping } : {}),
     });
     await rm(join(paths.live, 'commands', plan.transactionId), { recursive: true, force: true });
   }
@@ -140,7 +146,7 @@ export async function recoverPendingFilesystemBundles(paths: Paths): Promise<voi
 /** Publish a complete staged bundle under one durable, identity-checked command plan. */
 export async function publishStagedBundle(req: PublishStagedBundleRequest): Promise<void> {
   validateRequest(req);
-  await recoverPendingFilesystemBundles(req.paths);
+  await recoverPendingFilesystemBundles(req.paths, req.gitBookkeeping);
 
   const planned: Array<{
     entry: StagedBundleEntry;
@@ -191,7 +197,12 @@ export async function publishStagedBundle(req: PublishStagedBundleRequest): Prom
   }
 
   try {
-    await executeCommandPlan({ paths: req.paths, plan, effects });
+    await executeCommandPlan({
+      paths: req.paths,
+      plan,
+      effects,
+      ...(req.gitBookkeeping ? { gitBookkeeping: req.gitBookkeeping } : {}),
+    });
   } finally {
     await rm(req.stagingRoot, { recursive: true, force: true });
   }
