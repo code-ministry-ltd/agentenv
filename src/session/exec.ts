@@ -1,5 +1,7 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { constants as osConstants } from 'node:os';
+import type { ProcessIdentity } from '../view-generation.js';
 
 /** What to exec: a resolved real binary, its args, the environment and cwd. */
 export interface ExecSpec {
@@ -7,6 +9,8 @@ export interface ExecSpec {
   args: readonly string[];
   env: NodeJS.ProcessEnv;
   cwd: string;
+  /** Called once the child process-group identity is known. */
+  onSpawn?: (identity: ProcessIdentity) => void | Promise<void>;
 }
 
 /**
@@ -34,14 +38,33 @@ const FORWARDED_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
  */
 export const defaultExecHarness: ExecHarness = (spec) =>
   new Promise((resolve) => {
+    const detached = process.platform !== 'win32';
     const child = spawn(spec.binaryPath, [...spec.args], {
       env: spec.env,
       cwd: spec.cwd,
       stdio: 'inherit',
+      detached,
+    });
+    let spawnedPid: number | null = null;
+    let spawnRecorded = Promise.resolve();
+    child.once('spawn', () => {
+      if (!child.pid) return;
+      spawnedPid = child.pid;
+      spawnRecorded = Promise.resolve(
+        spec.onSpawn?.({
+          processGroupId: child.pid,
+          pid: child.pid,
+          processStart: processStartIdentity(child.pid),
+        }),
+      ).catch(() => {
+        // Launch lifecycle callbacks retain/quarantine their own failures. The
+        // user's harness must keep running even if lifecycle persistence fails.
+      });
     });
     const forward = (sig: NodeJS.Signals): void => {
       try {
-        child.kill(sig);
+        if (detached && spawnedPid) process.kill(-spawnedPid, sig);
+        else child.kill(sig);
       } catch {
         /* child already gone */
       }
@@ -54,20 +77,60 @@ export const defaultExecHarness: ExecHarness = (spec) =>
     const cleanup = (): void => {
       for (const [s, h] of handlers) process.off(s, h);
     };
+    let settled = false;
+    const settle = async (code: number): Promise<void> => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      await spawnRecorded;
+      if (detached && spawnedPid) await waitForProcessGroupExit(spawnedPid);
+      resolve(code);
+    };
     child.on('exit', (code, signal) => {
-      cleanup();
-      if (signal) {
-        const num = (osConstants.signals as Record<string, number>)[signal] ?? 0;
-        resolve(128 + num);
-      } else {
-        resolve(code ?? 0);
-      }
+      const result = signal
+        ? 128 + ((osConstants.signals as Record<string, number>)[signal] ?? 0)
+        : (code ?? 0);
+      void settle(result);
     });
-    child.on('error', () => {
-      cleanup();
-      resolve(127);
-    });
+    child.on('error', () => void settle(127));
   });
+
+function processStartIdentity(pid: number): string {
+  if (process.platform === 'linux') {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const afterCommand = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+      const startTicks = afterCommand[19];
+      if (startTicks) return `linux-start-ticks:${startTicks}`;
+    } catch {
+      // Fall through to ps.
+    }
+  }
+  try {
+    const ps = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8',
+      timeout: 1_000,
+    });
+    const value = ps.stdout.trim();
+    if (ps.status === 0 && value) return `ps-start:${value}`;
+  } catch {
+    // A timestamp still distinguishes this launch conservatively on platforms
+    // without a queryable process start identity.
+  }
+  return `spawn-observed:${Date.now()}`;
+}
+
+async function waitForProcessGroupExit(processGroupId: number): Promise<void> {
+  while (true) {
+    try {
+      process.kill(-processGroupId, 0);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ESRCH') return;
+      // EPERM means the group still exists but is not signalable by this user.
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+}
 
 /**
  * Default self-check capture timeout (ms). A self-check probe spawns the harness;

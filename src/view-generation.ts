@@ -17,6 +17,22 @@ export interface GenerationLease extends ProcessIdentity {
   reservationId: string;
 }
 
+export interface GenerationInventoryEntry {
+  surfaceId: string;
+  storeKind: string;
+  mechanism: string;
+  path: string;
+  baseline: string[] | string;
+  ownerEnv: string | null;
+}
+
+export interface ViewGenerationDetails {
+  adapterId: string;
+  session: string;
+  viewRoot: string;
+  createdAt: number;
+}
+
 export interface ViewGeneration {
   schemaVersion: 2;
   id: string;
@@ -24,11 +40,32 @@ export interface ViewGeneration {
   phase: ViewGenerationPhase;
   reservations: string[];
   leases: GenerationLease[];
+  adapterId?: string;
+  session?: string;
+  viewRoot?: string;
+  fingerprint?: string;
+  inventory?: GenerationInventoryEntry[];
+  createdAt?: number;
+  publishedAt?: number;
+  closedAt?: number;
+  sweptAt?: number;
   failure?: string;
 }
 
-export function createViewGeneration(id: string, envs: readonly string[]): ViewGeneration {
-  return { schemaVersion: 2, id, envs: [...envs], phase: 'building', reservations: [], leases: [] };
+export function createViewGeneration(
+  id: string,
+  envs: readonly string[],
+  details?: ViewGenerationDetails,
+): ViewGeneration {
+  return {
+    schemaVersion: 2,
+    id,
+    envs: [...envs],
+    phase: 'building',
+    reservations: [],
+    leases: [],
+    ...details,
+  };
 }
 
 function requirePhase(generation: ViewGeneration, expected: ViewGenerationPhase): void {

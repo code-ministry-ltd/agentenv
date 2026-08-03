@@ -6,6 +6,8 @@ import { resolvePaths } from '../src/paths.js';
 import { writeSecrets } from '../src/secrets.js';
 import type { ExecHarness, ExecSpec } from '../src/session/exec.js';
 import { launchHarness, type LaunchRequest } from '../src/session/launch.js';
+import { readState } from '../src/state.js';
+import type { ProcessIdentity } from '../src/view-generation.js';
 import { FIXTURE_CONFIG_ENV, installFixtureHarness, makeFixtureAdapter } from './fixtures/fixture-adapter.js';
 import { makeTempHome, type TempHome } from './helpers.js';
 
@@ -75,6 +77,46 @@ describe('session launch', () => {
     expect(calls[0]?.env[FIXTURE_CONFIG_ENV]).toBe(result.viewRoot);
     // The real fixture harness, launched under the overrides, printed that root.
     expect(lastStdout().trim()).toBe(result.viewRoot);
+  });
+
+  it('durably reserves a generation before spawn, leases its process group, and sweeps it after exit', async () => {
+    const th = home();
+    const { paths, env } = scenario(th);
+    let generationId = '';
+    const identity: ProcessIdentity = {
+      processGroupId: 4100,
+      pid: 4101,
+      processStart: 'fixture-start-4101',
+    };
+    const exec: ExecHarness = async (spec) => {
+      const beforeSpawn = await readState(paths);
+      const active = beforeSpawn.generations.find((generation) =>
+        generation.reservations.length === 1,
+      );
+      expect(active).toMatchObject({ phase: 'published', envs: ['writing'] });
+      expect(active?.inventory?.length).toBeGreaterThan(0);
+      generationId = active?.id ?? '';
+
+      const onSpawn = (spec as ExecSpec & {
+        onSpawn?: (spawned: ProcessIdentity) => Promise<void>;
+      }).onSpawn;
+      expect(onSpawn).toBeTypeOf('function');
+      await onSpawn?.(identity);
+
+      const leased = (await readState(paths)).generations.find((g) => g.id === generationId);
+      expect(leased?.reservations).toEqual([]);
+      expect(leased?.leases).toEqual([{ reservationId: expect.any(String), ...identity }]);
+      return 0;
+    };
+
+    const result = await launchHarness(
+      req({ paths, adapter: makeFixtureAdapter(), env, execHarness: exec }),
+    );
+
+    expect(result.generationId).toBe(generationId);
+    expect(result.viewRoot).toContain(join('live', 'generations', generationId));
+    const swept = (await readState(paths)).generations.find((g) => g.id === generationId);
+    expect(swept).toMatchObject({ phase: 'swept', reservations: [], leases: [] });
   });
 
   it('uses Adapter v2 launch arguments, environment, and optional root override', async () => {

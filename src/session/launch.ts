@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
 import type { Adapter, SelfCheckContext } from '../adapter.js';
 import { renderSessionLaunch } from '../adapter-v2.js';
 import type { Paths } from '../paths.js';
@@ -5,6 +7,14 @@ import { loadSecrets } from '../secrets.js';
 import { readState } from '../state.js';
 import { composeView, type SurfaceSkip } from './composer.js';
 import { defaultCapture, defaultExecHarness, type CaptureFn, type ExecHarness } from './exec.js';
+import {
+  attachSessionGenerationLease,
+  beginSessionGeneration,
+  publishSessionGeneration,
+  quarantineSessionGeneration,
+  reserveSessionGeneration,
+  sweepSessionGeneration,
+} from './generations.js';
 import { resolveBinaryOnPath, sanitisePath } from './resolve.js';
 
 /**
@@ -42,6 +52,8 @@ export interface LaunchResult {
   applied: boolean;
   /** The composed view root, when one was built. */
   viewRoot?: string;
+  /** Durable id of the immutable view used for an applied launch. */
+  generationId?: string;
   /** The resolved real binary, when found. */
   binaryPath?: string;
   /** Surfaces skipped during composition (for `status`). */
@@ -71,6 +83,7 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
   const { paths, adapter, args, env, cwd } = req;
   const execHarness = req.execHarness ?? defaultExecHarness;
   const capture = req.capture ?? defaultCapture;
+  const now = req.now ?? Date.now;
   const notices: string[] = [];
 
   // The child always runs with agentenv's shim dirs stripped from PATH, so it
@@ -114,18 +127,31 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
   // — the APPLYING path — anything broken here fails OPEN (never brick the tool).
   let viewRoot: string;
   let skipped: SurfaceSkip[];
+  const generationId = randomUUID();
+  let generationBegun = false;
   try {
     // Reading state.json here is both the --global dedup source and a health
     // probe: a corrupt manifest throws → caught below → fail-open.
     const manifest = await readState(paths);
     const ownedRealPaths = new Set(manifest.items.map((i) => i.path));
     const realConfigRoot = adapter.realConfigRoot(env);
+    const intendedViewRoot = join(paths.live, 'generations', generationId, adapter.id);
+    await beginSessionGeneration(paths, {
+      id: generationId,
+      envs: req.envs!,
+      adapterId: adapter.id,
+      session: req.session,
+      viewRoot: intendedViewRoot,
+      createdAt: now(),
+    });
+    generationBegun = true;
 
     const composed = await composeView({
       paths,
       adapter,
       envs: req.envs!,
       session: req.session,
+      generationId,
       realConfigRoot,
       // The launch cwd is the project root an adapter keys project-scoped config
       // by (Codex trust); thread it through to config-keys compilation (H3).
@@ -133,12 +159,24 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
       isGloballyOwned: (p) => ownedRealPaths.has(p),
       // The shell env resolves the substitute rung's ${VAR} over secrets.env (D6).
       env,
-      now: req.now,
+      now,
       onWarn: (m) => notices.push(m),
     });
     viewRoot = composed.viewRoot;
     skipped = composed.skipped;
+    await publishSessionGeneration(paths, generationId, {
+      fingerprint: composed.fingerprint,
+      inventory: composed.inventory,
+      publishedAt: now(),
+    });
   } catch (err) {
+    if (generationBegun) {
+      try {
+        await quarantineSessionGeneration(paths, generationId, (err as Error).message);
+      } catch {
+        // The original state/composition failure is the useful fail-open reason.
+      }
+    }
     notices.push(
       `agentenv: could not compose a session view (${(err as Error).message}) — ` +
         `launching ${adapter.binaryName} without overrides`,
@@ -167,6 +205,11 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
       `agentenv: ${adapter.id} could not be proven session-safe` +
         `${check.detail ? ` (${check.detail})` : ''} — launching without overrides; use --global`,
     );
+    try {
+      await sweepSessionGeneration(paths, generationId, null, now());
+    } catch (err) {
+      notices.push(`agentenv: unused generation ${generationId} retained (${(err as Error).message})`);
+    }
     return execUntouched('self-check-failed');
   }
 
@@ -183,11 +226,84 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
       `agentenv: could not load the child secret environment (${(err as Error).message}) — ` +
         `launching ${adapter.binaryName} without overrides`,
     );
+    try {
+      await sweepSessionGeneration(paths, generationId, null, now());
+    } catch (sweepErr) {
+      notices.push(
+        `agentenv: unused generation ${generationId} retained (${(sweepErr as Error).message})`,
+      );
+    }
     return execUntouched('fail-open');
   }
   // Machine-local secrets exist only in an applied child/materialiser. They override
   // the shell, while adapter-owned launch variables remain authoritative.
   const execEnv: NodeJS.ProcessEnv = { ...sanitisedEnv, ...secretEnv, ...launch.env };
-  const code = await execHarness({ binaryPath, args: launch.args, env: execEnv, cwd });
-  return { code, mode: 'applied', applied: true, viewRoot, binaryPath, skipped, notices };
+  const reservationId = randomUUID();
+  try {
+    await reserveSessionGeneration(paths, generationId, reservationId);
+  } catch (err) {
+    try {
+      await quarantineSessionGeneration(paths, generationId, (err as Error).message);
+    } catch {
+      // Keep the reservation failure as the launch decision.
+    }
+    notices.push(
+      `agentenv: could not reserve session generation (${(err as Error).message}) — ` +
+        `launching ${adapter.binaryName} without overrides`,
+    );
+    return execUntouched('fail-open');
+  }
+
+  let lifecycleFailed = false;
+  let code: number;
+  try {
+    code = await execHarness({
+      binaryPath,
+      args: launch.args,
+      env: execEnv,
+      cwd,
+      onSpawn: async (identity) => {
+        try {
+          await attachSessionGenerationLease(paths, generationId, reservationId, identity);
+        } catch (err) {
+          lifecycleFailed = true;
+          notices.push(
+            `agentenv: generation lease could not be recorded; retained for resolution ` +
+              `(${(err as Error).message})`,
+          );
+          try {
+            await quarantineSessionGeneration(paths, generationId, (err as Error).message);
+          } catch {
+            // The durable reservation remains conservative if quarantine also fails.
+          }
+        }
+      },
+    });
+  } finally {
+    if (!lifecycleFailed) {
+      try {
+        await sweepSessionGeneration(paths, generationId, reservationId, now());
+      } catch (err) {
+        notices.push(
+          `agentenv: final generation sweep failed; retained for resolution ` +
+            `(${(err as Error).message})`,
+        );
+        try {
+          await quarantineSessionGeneration(paths, generationId, (err as Error).message);
+        } catch {
+          // Preserve the original sweep failure; state may itself be unavailable.
+        }
+      }
+    }
+  }
+  return {
+    code,
+    mode: 'applied',
+    applied: true,
+    viewRoot,
+    generationId,
+    binaryPath,
+    skipped,
+    notices,
+  };
 }
