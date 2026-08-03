@@ -1,8 +1,8 @@
+import { randomBytes } from 'node:crypto';
 import { access, readdir, rm, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
-import type { BackupRef } from './backups.js';
-import { restore } from './backups.js';
+import { backup, restore, type BackupRef } from './backups.js';
 import {
   ConfigKeysError,
   inspectOwnedKey,
@@ -23,8 +23,14 @@ import {
 } from './file-block.js';
 import { beginTransaction, recoverState } from './journal.js';
 import { withLock } from './lock.js';
+import { capturePathIdentity, identitiesEqual } from './path-identity.js';
 import type { Paths } from './paths.js';
-import { readState, type StateManifest } from './state.js';
+import {
+  readState,
+  writeState,
+  type QuarantineRecord,
+  type StateManifest,
+} from './state.js';
 
 /**
  * The base `doctor` (design D4, spec criterion 6). It DETECTS inconsistencies
@@ -736,6 +742,8 @@ export interface RestoreResult {
   restored: boolean;
   /** The manifest-recorded path the backup was restored to (on success). */
   path?: string;
+  /** Retained copy of the displaced current bytes, when a path existed. */
+  rescuedPath?: string;
   /** Why the restore did not happen (on failure). */
   error?: string;
 }
@@ -766,14 +774,51 @@ function findBackupTarget(
 export async function restoreBackup(paths: Paths, backupId: string): Promise<RestoreResult> {
   const id = backupId.trim();
   if (id === '') return { restored: false, error: 'a backup id is required' };
-  const manifest = await readState(paths);
-  const match = findBackupTarget(manifest, id);
-  if (!match) {
-    return { restored: false, error: `no manifest item references backup '${id}'` };
-  }
-  if (!(await exists(join(paths.backups, id)))) {
-    return { restored: false, error: `backup '${id}' is not present under ${paths.backups}` };
-  }
-  await withLock(paths, () => restore(paths, match.ref, match.path));
-  return { restored: true, path: match.path };
+  return withLock(paths, async () => {
+    const manifest = await readState(paths);
+    const match = findBackupTarget(manifest, id);
+    if (!match) {
+      return { restored: false, error: `no manifest item references backup '${id}'` };
+    }
+    if (!(await exists(join(paths.backups, id)))) {
+      return { restored: false, error: `backup '${id}' is not present under ${paths.backups}` };
+    }
+
+    const before = await capturePathIdentity(match.path);
+    let rescuedPath: string | undefined;
+    if (before.kind !== 'absent') {
+      const rescueId = `doctor-restore-${Date.now()}-${randomBytes(6).toString('hex')}`;
+      rescuedPath = join(paths.live, 'quarantine', rescueId, 'content');
+      const currentRef = await backup(paths, match.path);
+      await restore(paths, currentRef, rescuedPath);
+      const afterCopy = await capturePathIdentity(match.path);
+      const rescue: QuarantineRecord = {
+        schemaVersion: 2,
+        id: rescueId,
+        kind: 'doctor-backup-restore',
+        path: match.path,
+        retainedPath: rescuedPath,
+        reason: identitiesEqual(before, afterCopy)
+          ? `current bytes retained before restoring backup '${id}'`
+          : `target changed while retaining current bytes before backup '${id}'; restore refused`,
+        createdAt: Date.now(),
+        resolved: false,
+      };
+      manifest.quarantine.push(rescue);
+      await writeState(paths, manifest);
+      if (!identitiesEqual(before, afterCopy)) {
+        return {
+          restored: false,
+          error: `target changed while preparing restore; current bytes retained at ${rescuedPath}`,
+        };
+      }
+    }
+
+    await restore(paths, match.ref, match.path);
+    return {
+      restored: true,
+      path: match.path,
+      ...(rescuedPath ? { rescuedPath } : {}),
+    };
+  });
 }

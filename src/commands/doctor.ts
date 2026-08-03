@@ -96,5 +96,10 @@ async function runRestore(ctx: CommandContext, backupId: string): Promise<RunRes
   if (!res.restored) {
     return { stdout: '', stderr: `doctor --restore: ${res.error}\n`, code: 1 };
   }
-  return { stdout: `doctor --restore: restored backup '${backupId.trim()}' to ${res.path}\n`, code: 0 };
+  return {
+    stdout:
+      `doctor --restore: restored backup '${backupId.trim()}' to ${res.path}\n` +
+      (res.rescuedPath ? `doctor --restore: retained displaced current bytes at ${res.rescuedPath}\n` : ''),
+    code: 0,
+  };
 }

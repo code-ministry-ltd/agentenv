@@ -61,6 +61,14 @@ describe('doctor: --restore <backup>', () => {
     expect(res.stdout).toContain(target);
     // The original bytes are back.
     expect(readFileSync(target, 'utf8')).toBe('# original user content\nkeep me\n');
+    // Restore is deliberately no-clobber: the displaced current bytes remain
+    // available for explicit resolution instead of being silently destroyed.
+    const rescue = (await readState(resolvePaths(th.env))).quarantine.find(
+      (record) => record.kind === 'doctor-backup-restore' && record.path === target,
+    );
+    expect(rescue).toBeDefined();
+    expect(readFileSync(rescue!.retainedPath, 'utf8')).toBe('CLOBBERED\n');
+    expect(res.stdout).toContain(rescue!.retainedPath);
   });
 
   it('errors clearly for a backup id no manifest item references', async () => {
