@@ -44,6 +44,13 @@ import { readState, type StateManifest } from './state.js';
 /** The six base detectors (design D4 / spec criterion 6). */
 export type DoctorProblemKind =
   | 'journal-pending'
+  | 'command-pending'
+  | 'generation-pending'
+  | 'lease-stale'
+  | 'projection-pending'
+  | 'candidate-pending'
+  | 'quarantine-pending'
+  | 'migration-pending'
   | 'dangling-symlink'
   | 'store-drift'
   | 'mangled-markers'
@@ -343,6 +350,138 @@ async function detectOrphanedBackups(
 }
 
 // ---------------------------------------------------------------------------
+// durable v2 lifecycle intent
+// ---------------------------------------------------------------------------
+
+/** Read-only local liveness probe. EPERM still proves the identity exists. */
+function processExists(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/** A detached POSIX process group can outlive its original leader. */
+function processGroupExists(processGroupId: number): boolean {
+  if (process.platform === 'win32') return processExists(processGroupId);
+  if (!Number.isSafeInteger(processGroupId) || processGroupId <= 0) return false;
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function detectDurableLifecycle(paths: Paths, manifest: StateManifest): DoctorProblem[] {
+  const out: DoctorProblem[] = [];
+
+  for (const command of manifest.commands) {
+    out.push({
+      kind: 'command-pending',
+      where: `${paths.state} (command '${command.transactionId}')`,
+      what: `whole-command intent '${command.kind}' remains in phase '${command.phase}'`,
+      repair: command.commitPoint
+        ? 'resume required Git bookkeeping; never roll back an already committed command'
+        : 'recover the recorded operation identities through the whole-command WAL; never delete the intent',
+    });
+  }
+
+  for (const generation of manifest.generations) {
+    for (const lease of generation.leases) {
+      if (processExists(lease.pid) && processGroupExists(lease.processGroupId)) continue;
+      out.push({
+        kind: 'lease-stale',
+        where: generation.viewRoot ?? `${paths.state} (generation '${generation.id}')`,
+        what:
+          `generation '${generation.id}' retains a process-group lease whose ` +
+          'recorded PID or group is no longer live',
+        repair:
+          'retain the generation, verify owner identity, then explicitly sweep or quarantine it; do not collect it',
+      });
+    }
+
+    const strandedPublished =
+      generation.phase === 'published' &&
+      (generation.reservations.length > 0 || generation.leases.length === 0);
+    const transitional = ['building', 'closing', 'sweeping', 'quarantined'].includes(
+      generation.phase,
+    );
+    if (!strandedPublished && !transitional) continue;
+    out.push({
+      kind: 'generation-pending',
+      where: generation.viewRoot ?? `${paths.state} (generation '${generation.id}')`,
+      what:
+        `generation '${generation.id}' remains '${generation.phase}' with ` +
+        `${generation.reservations.length} reservation(s) and ${generation.leases.length} lease(s)`,
+      repair:
+        'complete identity-checked lifecycle recovery or retain it for explicit resolution; never delete unswept bytes',
+    });
+  }
+
+  for (const projection of manifest.globalProjections) {
+    if (!['building', 'retired', 'reconciling', 'quarantined'].includes(projection.phase)) {
+      continue;
+    }
+    out.push({
+      kind: 'projection-pending',
+      where:
+        projection.retainedPath ??
+        projection.surfacePath ??
+        `${paths.state} (projection '${projection.id}')`,
+      what: `global COW projection '${projection.id}' remains '${projection.phase}'`,
+      repair:
+        projection.phase === 'retired'
+          ? 'assert writer quiescence, then explicitly run three-way reconciliation; retain bytes afterwards'
+          : 'resume or explicitly resolve the projection lifecycle; never overwrite canonical content or collect it',
+    });
+  }
+
+  for (const candidate of manifest.candidates) {
+    if (candidate.phase === 'promoted' || candidate.phase === 'abandoned') continue;
+    out.push({
+      kind: 'candidate-pending',
+      where: candidate.worktree,
+      what:
+        `isolated sync candidate '${candidate.id}' remains '${candidate.phase}' with ` +
+        `${candidate.blockers.length} blocker(s)`,
+      repair:
+        candidate.phase === 'deferred' || candidate.phase === 'rejected'
+          ? 'explicitly retry after blockers are resolved, or abandon the isolated candidate'
+          : 'resume identity-checked validation/promotion; keep the working store on last-known-good content',
+    });
+  }
+
+  for (const rescue of manifest.quarantine) {
+    if (rescue.resolved) continue;
+    out.push({
+      kind: 'quarantine-pending',
+      where: rescue.retainedPath,
+      what: `retained rescue '${rescue.id}' of kind '${rescue.kind}' is unresolved`,
+      repair:
+        'inspect retained bytes and explicitly restore, adopt elsewhere, or mark resolved; never delete unresolved data',
+    });
+  }
+
+  const migration = manifest.migration;
+  if (migration && migration.phase !== 'opened' && migration.phase !== 'rolled-back') {
+    out.push({
+      kind: 'migration-pending',
+      where: `${paths.state} (migration '${migration.id}')`,
+      what:
+        `migration from '${migration.sourceFormat}' remains '${migration.phase}' with gate '${migration.gate}'`,
+      repair:
+        'resume the gated migration or complete its byte-preserving rollback before opening normal mutations',
+    });
+  }
+
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // diagnose (read-only) — never mutates
 // ---------------------------------------------------------------------------
 
@@ -354,6 +493,7 @@ export async function diagnose(paths: Paths): Promise<DoctorProblem[]> {
   const manifest = await readState(paths);
   const problems: DoctorProblem[] = [];
   problems.push(...detectJournal(paths, manifest));
+  problems.push(...detectDurableLifecycle(paths, manifest));
   problems.push(...(await detectDanglingSymlinks(manifest)));
   problems.push(...(await detectStoreDrift(manifest)));
   problems.push(...(await detectMangledMarkers(paths, manifest)));
