@@ -225,6 +225,9 @@ function validateCommand(record: Record<string, unknown>, label: string): string
   if (record.gitRequired !== undefined && typeof record.gitRequired !== 'boolean') {
     return `${label}.gitRequired must be boolean`;
   }
+  if (record.gitMessage !== undefined && typeof record.gitMessage !== 'string') {
+    return `${label}.gitMessage must be string`;
+  }
   if (!COMMAND_PHASES.has(record.phase as string)) return `${label}.phase is invalid`;
   if (typeof record.commitPoint !== 'boolean') return `${label}.commitPoint must be boolean`;
   if (!Array.isArray(record.operations)) return `${label}.operations must be an array`;

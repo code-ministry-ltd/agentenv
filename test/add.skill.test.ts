@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -100,9 +101,30 @@ describe('add skill', () => {
     expect(result.code).not.toBe(0);
     expect(result.stderr).toMatch(/commit failure|Git bookkeeping|retained/i);
     expect(existsSync(join(skillDir('writing', 'durable-add'), 'SKILL.md'))).toBe(true);
-    expect((await readState(resolvePaths(tmp.env))).commands).toMatchObject([
-      { phase: 'git-pending', commitPoint: true, gitRequired: true },
+    const paths = resolvePaths(tmp.env);
+    const pending = (await readState(paths)).commands;
+    expect(pending).toMatchObject([
+      {
+        phase: 'git-pending',
+        commitPoint: true,
+        gitRequired: true,
+        gitMessage: 'agentenv: add skill durable-add → writing',
+      },
     ]);
+
+    const resolved = await run(
+      ['resolve', 'command', pending[0]!.transactionId, '--retry'],
+      { env: tmp.env },
+    );
+    expect(resolved.code, `${resolved.stdout}${resolved.stderr ?? ''}`).toBe(0);
+    expect((await readState(paths)).commands).toEqual([]);
+    expect(
+      execFileSync('git', ['log', '-1', '--format=%s'], {
+        cwd: paths.store,
+        env: { ...tmp.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' },
+        encoding: 'utf8',
+      }).trim(),
+    ).toBe('agentenv: add skill durable-add → writing');
   });
 
   it('copies and validates a local skill directory', async () => {

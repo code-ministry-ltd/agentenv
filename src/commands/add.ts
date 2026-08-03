@@ -119,6 +119,7 @@ async function publishContentMutation(
       transactionId,
       stagingRoot,
       entries: [{ id: 'content', target, staged }],
+      ...(!paused ? { gitMessage: message } : {}),
       ...(!paused
         ? {
             gitBookkeeping: () =>
@@ -298,6 +299,7 @@ async function writeVendoredSkill(
         },
         { id: 'skill-provenance', target: yamlPath, staged: stagedYaml },
       ],
+      ...(!paused ? { gitMessage: `agentenv: add skill ${name} → ${env}` } : {}),
       ...(!paused
         ? {
             gitBookkeeping: () =>

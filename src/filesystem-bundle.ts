@@ -31,6 +31,8 @@ export interface PublishStagedBundleRequest {
   afterApply?: (entry: StagedBundleEntry) => Promise<void>;
   /** Required local Git bookkeeping; failure leaves the committed WAL git-pending. */
   gitBookkeeping?: () => Promise<void>;
+  /** Persisted commit subject when generic `resolve command` may retry bookkeeping. */
+  gitMessage?: string;
 }
 
 function isContained(root: string, candidate: string): boolean {
@@ -47,6 +49,9 @@ function validateRequest(req: PublishStagedBundleRequest): void {
   }
   if (req.entries.length === 0 && !req.gitBookkeeping) {
     throw new Error('empty filesystem bundle requires Git bookkeeping');
+  }
+  if (req.gitMessage && !req.gitBookkeeping) {
+    throw new Error('filesystem bundle Git message requires Git bookkeeping');
   }
   const ids = new Set<string>();
   const targets = new Set<string>();
@@ -198,6 +203,7 @@ export async function publishStagedBundle(req: PublishStagedBundleRequest): Prom
     transactionId: req.transactionId,
     kind: 'filesystem-bundle',
     gitRequired: req.gitBookkeeping !== undefined,
+    ...(req.gitMessage ? { gitMessage: req.gitMessage } : {}),
     operations: planned.map(({ entry, pre, post, undo }) => ({
       id: entry.id,
       kind: 'replace-path',

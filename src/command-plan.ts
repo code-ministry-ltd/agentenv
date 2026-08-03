@@ -30,6 +30,8 @@ export interface CommandPlan {
   kind: string;
   /** True when the committed filesystem effects cannot complete without Git bookkeeping. */
   gitRequired: boolean;
+  /** Exact local commit subject for generic retryable content mutations. */
+  gitMessage?: string;
   phase: CommandPhase;
   commitPoint: boolean;
   operations: PlannedOperation[];
@@ -39,6 +41,7 @@ export interface CreateCommandPlanInput {
   transactionId: string;
   kind: string;
   gitRequired?: boolean;
+  gitMessage?: string;
   operations: PlannedOperationInput[];
 }
 
@@ -57,6 +60,7 @@ export function createCommandPlan(input: CreateCommandPlanInput): CommandPlan {
     transactionId: input.transactionId,
     kind: input.kind,
     gitRequired: input.gitRequired ?? false,
+    ...(input.gitMessage ? { gitMessage: input.gitMessage } : {}),
     phase: 'planned',
     commitPoint: false,
     operations: input.operations.map((operation) => ({ ...operation, state: 'pending' })),

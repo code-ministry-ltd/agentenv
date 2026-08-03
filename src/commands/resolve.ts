@@ -2,6 +2,7 @@ import { access } from 'node:fs/promises';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
 import { reconcileRetiredGlobalCows } from '../global-cow.js';
+import { recoverPendingFilesystemBundles } from '../filesystem-bundle.js';
 import { withLock } from '../lock.js';
 import { resolveRetainedCandidate } from '../sync.js';
 import { resumeSessionGenerationSweep } from '../session/generations.js';
@@ -23,6 +24,7 @@ function fail(stderr: string): RunResult {
 
 const usage =
   'Usage:\n' +
+  '  agentenv resolve command <id> --retry\n' +
   '  agentenv resolve projection <id> --quiescent\n' +
   '  agentenv resolve generation <id> --retry\n' +
   '  agentenv resolve candidate <id> (--retry | --abandon)\n' +
@@ -73,6 +75,43 @@ async function resolveProjection(ctx: CommandContext, id: string, rest: readonly
     ok(`Resolved projection '${id}'; retained bytes were not collected.\n`),
     notices,
   );
+}
+
+async function resolveWholeCommand(ctx: CommandContext, id: string, rest: readonly string[]): Promise<RunResult> {
+  const parsed = parseArgs(rest, { booleans: ['retry'] });
+  if (
+    parsed.unknown.length > 0 ||
+    parsed.positionals.length > 0 ||
+    !parsed.booleans.has('retry')
+  ) {
+    return fail(`resolve command: an explicit --retry is required\n${usage}`);
+  }
+  const pending = (await readState(ctx.paths)).commands.find(
+    (command) => command.transactionId === id,
+  );
+  if (!pending) return fail(`resolve command: unknown command '${id}'\n`);
+  if (pending.kind !== 'filesystem-bundle' || !pending.gitRequired || !pending.gitMessage) {
+    return fail(
+      `resolve command: '${id}' requires its domain-specific resolver; retained intent was unchanged\n`,
+    );
+  }
+  const notices: string[] = [];
+  try {
+    await recoverPendingFilesystemBundles(
+      ctx.paths,
+      () =>
+        commitRequiredMutation(
+          { paths: ctx.paths, env: ctx.env, options: ctx.options },
+          pending.gitMessage!,
+          notices,
+        ),
+      id,
+    );
+  } catch (error) {
+    return fail(`resolve command: ${(error as Error).message}; retained intent remains\n`);
+  }
+  await closeStoreSync({ paths: ctx.paths, env: ctx.env, options: ctx.options }, notices);
+  return withNotices(ok(`Completed retained command '${id}'.\n`), notices);
 }
 
 async function resolveCandidate(ctx: CommandContext, id: string, rest: readonly string[]): Promise<RunResult> {
@@ -167,8 +206,8 @@ async function resolveRescue(ctx: CommandContext, id: string, rest: readonly str
 /** Explicitly resolve retained lifecycle records; no mode implicitly deletes bytes. */
 export const resolveCommand: Command = {
   name: 'resolve',
-  usage: '<projection|candidate|rescue> <id> …',
-  summary: 'Resolve retained projections, candidates, and rescue records',
+  usage: '<command|projection|generation|candidate|rescue> <id> …',
+  summary: 'Resolve retained commands, projections, generations, candidates, and rescues',
 
   async run(ctx): Promise<RunResult> {
     const domain = ctx.args[0];
@@ -176,6 +215,8 @@ export const resolveCommand: Command = {
     if (!domain || !id) return fail(usage);
     const rest = ctx.args.slice(2);
     switch (domain) {
+      case 'command':
+        return resolveWholeCommand(ctx, id, rest);
       case 'projection':
         return resolveProjection(ctx, id, rest);
       case 'candidate':
