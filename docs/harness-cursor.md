@@ -1,6 +1,6 @@
 # Cursor adapter
 
-Adapter id: `cursor`; binary: `cursor-agent`.
+Adapter id: `cursor`; binary: `agent` (the current official Cursor CLI command).
 
 ## Modes
 

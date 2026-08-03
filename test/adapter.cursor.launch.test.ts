@@ -19,10 +19,10 @@ afterEach(() => {
   for (const h of homes.splice(0)) h.cleanup();
 });
 
-/** Install a no-op executable `cursor-agent` so PATH resolution reaches the launch branch. */
+/** Install a no-op executable `agent` so PATH resolution reaches the launch branch. */
 function installFakeCursorAgent(binDir: string): void {
   mkdirSync(binDir, { recursive: true });
-  const p = join(binDir, 'cursor-agent');
+  const p = join(binDir, 'agent');
   writeFileSync(p, '#!/bin/sh\nexit 0\n');
   chmodSync(p, 0o755);
 }
@@ -39,7 +39,7 @@ function capturingExec(): { exec: ExecHarness; calls: ExecSpec[] } {
 }
 
 describe('adapter.cursor — session-unsupported launch (AC)', () => {
-  it('a bound launch for cursor-agent execs UNTOUCHED (no CURSOR_CONFIG_DIR override) + a --global notice', async () => {
+  it('a bound launch for agent execs UNTOUCHED (no CURSOR_CONFIG_DIR override) + a --global notice', async () => {
     const th = home();
     const paths = resolvePaths(th.env);
     const binDir = join(th.home, 'bin');

@@ -33,8 +33,8 @@ import {
 
 /**
  * The Cursor adapter — the GLOBAL-ONLY / session-unsupported harness (Task 4.4).
- * Every declaration below is re-verified LIVE against `cursor-agent`
- * **2026.07.23-e383d2b** (see `docs/harness-cursor.md`); the reference machine's
+ * The release checkpoint is verified against the current `agent` CLI (see
+ * `docs/harness-cursor.md`); the reference machine's
  * `~/.cursor` was only ever READ (probes ran against temp copies / HOME overrides).
  *
  * Cursor is the reason the frozen {@link Adapter} contract carries
@@ -65,7 +65,7 @@ import {
 /** The config-root env var (declared for consistency; the CLI ignores it for mcp.json). */
 const CONFIG_ROOT_ENV = 'CURSOR_CONFIG_DIR';
 
-/** How long to wait for `cursor-agent --version` in {@link detect} before giving up (ms). */
+/** How long to wait for `agent --version` in {@link detect} before giving up (ms). */
 const DETECT_TIMEOUT_MS = 5000;
 
 /**
@@ -132,7 +132,7 @@ const CURSOR_SESSION_REASON =
 export const cursorDefinition: AdapterV2 = {
   version: 2,
   id: 'cursor',
-  binaryName: 'cursor-agent',
+  binaryName: 'agent',
   session: { supported: false, reason: CURSOR_SESSION_REASON },
   surfaces: [
     {
@@ -396,7 +396,7 @@ function unshapeCursorServer(
   return passthroughUnshape(canon, prior);
 }
 
-/** Run `cursor-agent --version`, resolving `true` only on a clean exit 0. Never throws. */
+/** Run `agent --version`, resolving `true` only on a clean exit 0. Never throws. */
 function versionExitsZero(binaryPath: string): Promise<boolean> {
   return new Promise((resolve) => {
     let settled = false;
@@ -442,7 +442,7 @@ function isValidCursorServer(entry: unknown): boolean {
  */
 export const cursorAdapter: Adapter = {
   id: 'cursor',
-  binaryName: 'cursor-agent',
+  binaryName: 'agent',
   definition: cursorDefinition,
 
   // GUI/IDE + a CLI whose config-root override does not isolate mcp.json → no session
@@ -453,7 +453,7 @@ export const cursorAdapter: Adapter = {
     'inherits no shell env — activate globally with `agentenv use … --global`',
 
   async detect(env) {
-    const bin = await resolveBinaryOnPath('cursor-agent', env);
+    const bin = await resolveBinaryOnPath('agent', env);
     if (!bin) return false;
     return versionExitsZero(bin);
   },
@@ -612,7 +612,7 @@ export const cursorAdapter: Adapter = {
     return {
       ok: false,
       detail:
-        `cursor-agent does not isolate its config root via CURSOR_CONFIG_DIR ` +
+        `agent does not isolate its config root via CURSOR_CONFIG_DIR ` +
         `(live-verified) — session mode is unsupported; use --global (view ${viewRoot} not composed)`,
     };
   },

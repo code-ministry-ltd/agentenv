@@ -25,7 +25,7 @@
     "test:offline": "GIT_CONFIG_GLOBAL=/dev/null vitest run --exclude 'test/*.live.test.ts'",
     "test:migration": "GIT_CONFIG_GLOBAL=/dev/null vitest run test/legacy-state.test.ts test/migration-state.test.ts test/migration.test.ts test/migration-command.test.ts test/migration.subprocess-kill.test.ts",
     "test:restore:container": "bash scripts/test-restore-container.sh",
-    "test:live": "vitest run test/adapter.claude.live.test.ts test/adapter.codex.live.test.ts test/adapter.opencode.live.test.ts test/adapter.pi.live.test.ts",
+    "test:live": "vitest run test/adapter.claude.live.test.ts test/adapter.codex.live.test.ts test/adapter.opencode.live.test.ts test/adapter.pi.live.test.ts test/adapter.cursor.live.test.ts",
     "ci": "npm run lint && npm run typecheck && npm run test",
     "prepare": "npm run build",
     "smoke:install": "bash scripts/smoke-install.sh",

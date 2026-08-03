@@ -34,7 +34,7 @@ describe('adapter.cursor — identity & declarations', () => {
 
   it('declares Cursor identity, session-UNSUPPORTED, and the config-root override', () => {
     expect(cursorAdapter.id).toBe('cursor');
-    expect(cursorAdapter.binaryName).toBe('cursor-agent');
+    expect(cursorAdapter.binaryName).toBe('agent');
     // The whole reason for sessionSupported:false in the frozen contract.
     expect(cursorAdapter.sessionSupported).toBe(false);
     expect(cursorAdapter.sessionUnsupportedReason).toMatch(/--global/);
@@ -293,7 +293,7 @@ describe('adapter.cursor — selfCheck (offline, fail-closed: session never comp
     const res = await cursorAdapter.selfCheck('/view/root', {
       resolveBinary: async () => {
         spawned = true;
-        return '/fake/cursor-agent';
+        return '/fake/agent';
       },
       capture: async () => {
         spawned = true;
@@ -308,7 +308,7 @@ describe('adapter.cursor — selfCheck (offline, fail-closed: session never comp
 });
 
 describe('adapter.cursor — detect', () => {
-  it('is false when no cursor-agent binary is on PATH (hermetic)', async () => {
+  it('is false when no agent binary is on PATH (hermetic)', async () => {
     expect(await cursorAdapter.detect({ PATH: '/nonexistent-dir-xyz' })).toBe(false);
   });
 });

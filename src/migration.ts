@@ -56,7 +56,7 @@ import type { GenerationInventoryEntry, ViewGeneration } from './view-generation
 
 const execFileAsync = promisify(execFile);
 const WAL_VERSION = '1.0';
-const HARNESS_NAMES = new Set(['claude', 'codex', 'cursor-agent', 'opencode', 'pi']);
+const HARNESS_NAMES = new Set(['claude', 'codex', 'agent', 'cursor-agent', 'opencode', 'pi']);
 
 export type MigrationBoundary =
   | 'gate-installed'
