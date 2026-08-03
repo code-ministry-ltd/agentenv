@@ -9,6 +9,7 @@ import {
   writeSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import { afterEach, describe, expect, it } from 'vitest';
 import { dematerialiseGlobal, materialiseGlobal } from '../src/engine.js';
 import { reconcileRetiredGlobalCows } from '../src/global-cow.js';
@@ -169,6 +170,131 @@ describe('retained global COW integration', () => {
     ).toEqual({ reconciled: 0, quarantined: 1 });
     expect(readFileSync(canonical, 'utf8')).toBe('managed:\n  url: https://managed\n');
     expect(readFileSync(projection!.retainedPath!, 'utf8')).toBe('{"late":true}\n');
+  });
+
+  it('reverse-projects only an attributable late config-key edit', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const realRoot = join(home.home, 'real');
+    const configFile = join(realRoot, 'config.json');
+    const canonical = join(paths.envDir('writing'), 'mcp', 'servers.yaml');
+    mkdirSync(join(paths.envDir('writing'), 'mcp'), { recursive: true });
+    mkdirSync(realRoot, { recursive: true });
+    writeFileSync(configFile, '{"mcpServers":{"user":{"url":"https://user"}}}\n');
+    writeFileSync(canonical, 'managed:\n  url: https://managed\n  future: keep-me\n');
+    const env = { ...home.env, [FIXTURE_CONFIG_ENV]: realRoot };
+    const adapter = makeFixtureAdapter();
+
+    await materialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], env });
+    const rendered = JSON.parse(readFileSync(configFile, 'utf8'));
+    rendered.mcpServers.managed.url = 'https://late-edit';
+    const edited = `${JSON.stringify(rendered, null, 2)}\n`;
+    const descriptor = openSync(configFile, 'r+');
+    await dematerialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], all: true, env });
+    ftruncateSync(descriptor, 0);
+    writeSync(descriptor, edited, 0, 'utf8');
+    closeSync(descriptor);
+
+    const projection = (await readState(paths)).globalProjections.find(
+      (candidate) => candidate.surfacePath === configFile,
+    )!;
+    expect(
+      await reconcileRetiredGlobalCows(paths, {
+        ids: [projection.id],
+        quiescent: true,
+        adapters: [adapter],
+      }),
+    ).toEqual({ reconciled: 1, quarantined: 0 });
+    expect(parseYaml(readFileSync(canonical, 'utf8'))).toEqual({
+      managed: { url: 'https://late-edit', future: 'keep-me' },
+    });
+    expect(JSON.parse(readFileSync(configFile, 'utf8'))).toEqual({
+      mcpServers: { user: { url: 'https://user' } },
+    });
+    expect(readFileSync(projection.retainedPath!, 'utf8')).toBe(edited);
+  });
+
+  it('restores secret placeholders before reverse-projecting a config-key edit', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const realRoot = join(home.home, 'real');
+    const configFile = join(realRoot, 'config.json');
+    const canonical = join(paths.envDir('writing'), 'mcp', 'servers.yaml');
+    mkdirSync(join(paths.envDir('writing'), 'mcp'), { recursive: true });
+    mkdirSync(realRoot, { recursive: true });
+    writeFileSync(configFile, '{}\n');
+    writeFileSync(canonical, 'managed:\n  url: https://managed\n  token: ${TOKEN}\n');
+    const secret = 'AKIAZ7Q2W9E4R6T1Y8U3';
+    const env = { ...home.env, [FIXTURE_CONFIG_ENV]: realRoot, TOKEN: secret };
+    const adapter = makeFixtureAdapter({ substituteMcp: true });
+
+    await materialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], env });
+    const rendered = JSON.parse(readFileSync(configFile, 'utf8'));
+    expect(rendered.mcpServers.managed.token).toBe(secret);
+    rendered.mcpServers.managed.url = 'https://late-edit';
+    const edited = `${JSON.stringify(rendered)}\n`;
+    const descriptor = openSync(configFile, 'r+');
+    await dematerialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], all: true, env });
+    ftruncateSync(descriptor, 0);
+    writeSync(descriptor, edited, 0, 'utf8');
+    closeSync(descriptor);
+
+    const projection = (await readState(paths)).globalProjections.find(
+      (candidate) => candidate.surfacePath === configFile,
+    )!;
+    expect(
+      await reconcileRetiredGlobalCows(paths, {
+        ids: [projection.id],
+        quiescent: true,
+        adapters: [adapter],
+      }),
+    ).toEqual({ reconciled: 1, quarantined: 0 });
+    const persisted = readFileSync(canonical, 'utf8');
+    expect(persisted).toContain('${TOKEN}');
+    expect(persisted).not.toContain(secret);
+  });
+
+  it('quarantines a config-key edit when canonical YAML changed concurrently', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const realRoot = join(home.home, 'real');
+    const configFile = join(realRoot, 'config.json');
+    const canonical = join(paths.envDir('writing'), 'mcp', 'servers.yaml');
+    mkdirSync(join(paths.envDir('writing'), 'mcp'), { recursive: true });
+    mkdirSync(realRoot, { recursive: true });
+    writeFileSync(configFile, '{}\n');
+    writeFileSync(canonical, 'managed:\n  url: https://baseline\n');
+    const env = { ...home.env, [FIXTURE_CONFIG_ENV]: realRoot };
+    const adapter = makeFixtureAdapter();
+
+    await materialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], env });
+    const rendered = JSON.parse(readFileSync(configFile, 'utf8'));
+    rendered.mcpServers.managed.url = 'https://late-edit';
+    const edited = `${JSON.stringify(rendered)}\n`;
+    const descriptor = openSync(configFile, 'r+');
+    await dematerialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], all: true, env });
+    ftruncateSync(descriptor, 0);
+    writeSync(descriptor, edited, 0, 'utf8');
+    closeSync(descriptor);
+    writeFileSync(canonical, 'managed:\n  url: https://concurrent\n');
+
+    const projection = (await readState(paths)).globalProjections.find(
+      (candidate) => candidate.surfacePath === configFile,
+    )!;
+    expect(
+      await reconcileRetiredGlobalCows(paths, {
+        ids: [projection.id],
+        quiescent: true,
+        adapters: [adapter],
+      }),
+    ).toEqual({ reconciled: 0, quarantined: 1 });
+    expect(parseYaml(readFileSync(canonical, 'utf8'))).toEqual({
+      managed: { url: 'https://concurrent' },
+    });
+    expect(readFileSync(projection.retainedPath!, 'utf8')).toBe(edited);
   });
 
   it('reverse-projects only an attributable late instruction sub-block edit', async () => {

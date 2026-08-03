@@ -7,6 +7,7 @@ import { backup } from './backups.js';
 import { writeFileAtomic } from './fs-atomic.js';
 import type { Transaction } from './journal.js';
 import type { Paths } from './paths.js';
+import type { PathIdentity } from './path-identity.js';
 import type { ManifestItemBase } from './state.js';
 
 /**
@@ -117,6 +118,24 @@ export interface ConfigKeysItem extends ManifestItemBase {
   /** array-element only: the array path itself was absent and was created by us. */
   createdPath?: boolean;
 }
+
+/** Durable field-level provenance for an entry in a retained global config file. */
+export interface RetainedConfigKeysItem {
+  item: ConfigKeysItem;
+  adapterId: string;
+  surfaceId: string;
+  canonicalPath?: string;
+  canonicalBaseline?: PathIdentity;
+}
+
+export interface RetainedConfigKeysProvenance {
+  items: RetainedConfigKeysItem[];
+}
+
+export type RetainedConfigKeysObservation =
+  | { kind: 'unchanged' }
+  | { kind: 'changed'; canonicalValue: JsonValue }
+  | { kind: 'removed' };
 
 // Register the variant so `ManifestItem` narrows on `surface: 'config-keys'`
 // (design: each surface augments the registry from its own module).
@@ -693,6 +712,28 @@ export async function syncBack(
   const next = writeKeyedValueText(text, item, canonical);
   await applyFileMutation(paths, tx, 'add', updated, item.path, next);
   return { drifted: true, currentValue: current, canonicalValue: canonical, item: updated };
+}
+
+/** Inspect one owned entry in a detached file without mutating it or state. */
+export async function inspectRetainedConfigKey(
+  retainedPath: string,
+  item: ConfigKeysItem,
+): Promise<RetainedConfigKeysObservation> {
+  const retainedItem = { ...item, path: retainedPath };
+  const text = await readText(retainedPath);
+  if (retainedItem.mode === 'array-element') {
+    const { found, value } = getAtPath(parseConfig(text, retainedItem), retainedItem.keyPath);
+    const present =
+      found &&
+      Array.isArray(value) &&
+      value.some((entry) => stableStringify(entry) === stableStringify(retainedItem.value));
+    return present ? { kind: 'unchanged' } : { kind: 'removed' };
+  }
+  const { found, value } = readKeyed(text, retainedItem);
+  if (!found) return { kind: 'removed' };
+  const current = value as JsonValue;
+  if (hashValue(current) === retainedItem.hash) return { kind: 'unchanged' };
+  return { kind: 'changed', canonicalValue: restoreSecrets(current, retainedItem.secretFields) };
 }
 
 /** Parse an owned item's file, dispatching on format. */

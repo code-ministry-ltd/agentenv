@@ -164,7 +164,10 @@ export function passthroughUnshape(
  * against. No adapter can reach a rebuilt canonical value — only the named-field
  * difference — so the write path cannot be reassembled from outside this file.
  */
-function overlayCanonicalServer(prior: unknown, unshaped: UnshapedServer): JsonValue {
+function overlayCanonicalServer(
+  prior: unknown,
+  unshaped: UnshapedServer,
+): Record<string, JsonValue> {
   const priorObj = isJsonObject(prior) ? prior : undefined;
   const out: Record<string, JsonValue> = priorObj ? { ...priorObj } : {};
 
@@ -480,4 +483,40 @@ export function describeCanonicalDrift(opts: {
     else changes.push({ field, kind: 'changed', note: text });
   }
   return changes;
+}
+
+export type CanonicalReverseDecision =
+  | { kind: 'lossless'; value: Record<string, JsonValue> }
+  | { kind: 'ambiguous'; fields: string[] }
+  | { kind: 'invalid'; reason: string };
+
+/**
+ * Reconstruct a canonical entry only when the existing overlay lattice produces
+ * no ambiguity notes. Unknown canonical fields survive through the prior-value
+ * overlay; a non-object retained entry is invalid rather than guessed.
+ */
+export function reverseCanonicalServer(opts: {
+  prior: unknown;
+  drifted: JsonValue;
+  unshape: (
+    def: Record<string, JsonValue>,
+    prior: unknown,
+    ctx: UnshapeContext,
+  ) => UnshapedServer;
+  server: string;
+  adapterId: string;
+}): CanonicalReverseDecision {
+  if (!isJsonObject(opts.drifted)) {
+    return { kind: 'invalid', reason: 'retained server entry is not an object' };
+  }
+  const fields = new Set<string>();
+  const ctx: UnshapeContext = {
+    server: opts.server,
+    adapterId: opts.adapterId,
+    note: (field) => fields.add(field),
+  };
+  const prior = isJsonObject(opts.prior) ? opts.prior : undefined;
+  const value = overlayCanonicalServer(prior, opts.unshape(opts.drifted, opts.prior, ctx));
+  if (fields.size > 0) return { kind: 'ambiguous', fields: [...fields].sort() };
+  return { kind: 'lossless', value };
 }

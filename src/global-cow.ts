@@ -16,6 +16,9 @@ import {
   reconcileRetainedFileBlockProjection,
   type RetainedFileBlockProvenance,
 } from './file-block.js';
+import { reconcileRetainedConfigKeysProjection } from './config-keys-reverse.js';
+import type { RetainedConfigKeysProvenance } from './config-keys.js';
+import type { Adapter } from './adapter.js';
 import { scanTextForSecrets } from './git.js';
 import { withLock } from './lock.js';
 import { capturePathIdentity, identitiesEqual } from './path-identity.js';
@@ -82,7 +85,10 @@ export async function finishGlobalCowPublication(
   paths: Paths,
   id: string,
   surfacePath: string,
-  fileBlockProvenance?: RetainedFileBlockProvenance,
+  provenance?: {
+    fileBlock?: RetainedFileBlockProvenance;
+    configKeys?: RetainedConfigKeysProvenance;
+  },
 ): Promise<GlobalProjection> {
   const baseline = await capturePathIdentity(surfacePath);
   return updateProjection(paths, id, (projection) =>
@@ -90,7 +96,8 @@ export async function finishGlobalCowPublication(
       ...projection,
       baseline,
       observed: baseline,
-      ...(fileBlockProvenance ? { fileBlockProvenance } : {}),
+      ...(provenance?.fileBlock ? { fileBlockProvenance: provenance.fileBlock } : {}),
+      ...(provenance?.configKeys ? { configKeysProvenance: provenance.configKeys } : {}),
     }),
   );
 }
@@ -156,6 +163,7 @@ export interface ReconcileGlobalCowRequest {
   ids: readonly string[];
   /** Callers assert every unsupervised writer for these ids is closed. */
   quiescent: boolean;
+  adapters?: readonly Adapter[];
 }
 
 export interface ReconcileGlobalCowResult {
@@ -216,7 +224,8 @@ export async function reconcileRetiredGlobalCows(
         const source = current.transform === 'command-skill'
           ? join(current.retainedPath, 'SKILL.md')
           : current.retainedPath;
-        const secretCount = await suspectedSecretCount(source);
+        const secretCount =
+          current.transform === 'config-keys' ? 0 : await suspectedSecretCount(source);
         if (secretCount > 0) {
           throw new Error(
             `retained projection has ${secretCount} suspected secret finding(s); canonical write blocked`,
@@ -232,11 +241,19 @@ export async function reconcileRetiredGlobalCows(
             throw new Error('canonical changed concurrently with retained projection');
           }
           if (current.transform === 'config-keys') {
-            throw new Error(
-              'retained config-keys projection requires field-level reconciliation',
+            if (!current.configKeysProvenance) {
+              throw new Error('retained config-keys projection provenance is incomplete');
+            }
+            if (!req.adapters) throw new Error('config-key reconciliation requires adapters');
+            await reconcileRetainedConfigKeysProjection(
+              paths,
+              source,
+              current.configKeysProvenance,
+              req.adapters,
             );
+          } else {
+            await mirrorCowToCanonical(source, current.canonicalPath);
           }
-          await mirrorCowToCanonical(source, current.canonicalPath);
         }
       }
       const revision = JSON.stringify(await capturePathIdentity(current.canonicalPath));

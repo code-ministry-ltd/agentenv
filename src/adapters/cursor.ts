@@ -26,6 +26,7 @@ import {
   resolveAuthDrift,
   transportFamily,
   noteConflictingTransport,
+  reverseCanonicalServer,
   type UnshapeContext,
   type UnshapedServer,
 } from './mcp-canonical.js';
@@ -529,6 +530,41 @@ export const cursorAdapter: Adapter = {
         server: name,
         adapterId: 'cursor',
       }),
+    };
+  },
+
+  async reverseConfigKeysDrift(surface, drift, ctx) {
+    if (surface.id !== 'mcp' || drift.style !== 'keyed' || drift.keyPath.length < 2) {
+      return { kind: 'invalid', reason: 'retained key is not a canonical Cursor MCP entry' };
+    }
+    const name = drift.keyPath.at(-1);
+    if (typeof name !== 'string') return { kind: 'invalid', reason: 'MCP entry name is invalid' };
+    const serversFile = join(ctx.envContentDir, 'mcp', 'servers.yaml');
+    const existing = existsSync(serversFile)
+      ? ((parseYaml(await readFile(serversFile, 'utf8')) as Record<string, unknown> | null) ?? {})
+      : {};
+    if (drift.removed) {
+      return { kind: 'lossless', entry: name, storeRelativePath: join('mcp', 'servers.yaml') };
+    }
+    if (drift.canonicalValue === undefined) {
+      return { kind: 'invalid', reason: 'retained MCP value is absent' };
+    }
+    const reversed = reverseCanonicalServer({
+      prior: existing[name],
+      drifted: drift.canonicalValue,
+      unshape: unshapeCursorServer,
+      server: name,
+      adapterId: 'cursor',
+    });
+    if (reversed.kind === 'invalid') return reversed;
+    if (reversed.kind === 'ambiguous') {
+      return { kind: 'ambiguous', reason: `ambiguous canonical field(s): ${reversed.fields.join(', ')}` };
+    }
+    return {
+      kind: 'lossless',
+      entry: name,
+      storeRelativePath: join('mcp', 'servers.yaml'),
+      value: reversed.value,
     };
   },
 

@@ -5,7 +5,7 @@ import { reconcileRetiredGlobalCows } from '../global-cow.js';
 import { withLock } from '../lock.js';
 import { resolveRetainedCandidate } from '../sync.js';
 import { readState, writeState } from '../state.js';
-import { closeStoreSync, commitMutation, withNotices } from './store-sync.js';
+import { closeStoreSync, commitMutation, inScopeAdapters, withNotices } from './store-sync.js';
 
 function ok(stdout: string): RunResult {
   return { stdout, code: 0 };
@@ -37,7 +37,11 @@ async function resolveProjection(ctx: CommandContext, id: string, rest: readonly
     return fail(`resolve projection: '${id}' is '${projection.phase}', not retired\n`);
   }
 
-  const result = await reconcileRetiredGlobalCows(ctx.paths, { ids: [id], quiescent: true });
+  const result = await reconcileRetiredGlobalCows(ctx.paths, {
+    ids: [id],
+    quiescent: true,
+    adapters: inScopeAdapters(ctx.options),
+  });
   if (result.quarantined > 0) {
     return fail(
       `resolve projection: '${id}' was quarantined; canonical bytes were not overwritten\n`,

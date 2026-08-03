@@ -23,6 +23,7 @@ import {
   removeKey,
   type ConfigKeysItem,
   type KeyPath,
+  type RetainedConfigKeysItem,
 } from './config-keys.js';
 import {
   dematerialise as dmDematerialise,
@@ -611,7 +612,9 @@ async function materialiseFileBlock(
       reverseItems.push({ item, canonical });
       applied += 1;
     }
-    await finishGlobalCowPublication(paths, projectionId, target, { items: reverseItems });
+    await finishGlobalCowPublication(paths, projectionId, target, {
+      fileBlock: { items: reverseItems },
+    });
     return applied;
   } catch (error) {
     // Keep intent when any file-block write committed; otherwise discard the
@@ -862,8 +865,43 @@ async function materialiseConfigKeys(
   });
   const postApply = await readState(paths);
   for (const [file, id] of projections) {
-    if (postApply.items.some((item) => item.surface === 'config-keys' && item.path === file)) {
-      await finishGlobalCowPublication(paths, id, file);
+    const items = postApply.items.filter(
+      (item): item is ConfigKeysItem => item.surface === 'config-keys' && item.path === file,
+    );
+    if (items.length > 0) {
+      const reverseItems: RetainedConfigKeysItem[] = [];
+      for (const item of items) {
+        const matched = adapters
+          .flatMap((adapter) => adapter.surfaces.map((surface) => ({ adapter, surface })))
+          .find(
+            ({ adapter, surface }) =>
+              surface.mechanism === 'config-keys' &&
+              resolveGlobalSurfaceDestination(adapter, surface, env) === file &&
+              surface.style === item.mode &&
+              surface.keyPath.every((segment, index) => item.keyPath[index] === segment),
+          );
+        if (!matched || matched.surface.mechanism !== 'config-keys') {
+          throw new Error(`could not resolve config-key provenance for '${file}'`);
+        }
+        const canonicalPath =
+          matched.surface.storeKind === 'mcp' && item.mode === 'keyed'
+            ? join(paths.envDir(item.ownerEnv), 'mcp', 'servers.yaml')
+            : undefined;
+        reverseItems.push({
+          item,
+          adapterId: matched.adapter.id,
+          surfaceId: matched.surface.id,
+          ...(canonicalPath
+            ? {
+                canonicalPath,
+                canonicalBaseline: await capturePathIdentity(canonicalPath),
+              }
+            : {}),
+        });
+      }
+      await finishGlobalCowPublication(paths, id, file, {
+        configKeys: { items: reverseItems },
+      });
     } else {
       await abandonBuildingGlobalCow(paths, id);
     }

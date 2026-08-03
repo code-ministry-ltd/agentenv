@@ -256,6 +256,26 @@ export interface ConfigKeysDriftReport {
   changes: ConfigKeysDriftChange[];
 }
 
+/** One retained config-key entry presented to an adapter for strict inversion. */
+export interface ConfigKeysReverseDrift {
+  style: ConfigKeysStyle;
+  keyPath: readonly (string | number)[];
+  removed: boolean;
+  /** Present when the retained key still exists, with secret placeholders restored. */
+  canonicalValue?: JsonValue;
+}
+
+/** A writable result exists only when the adapter proves the inversion lossless. */
+export type ConfigKeysReverseResult =
+  | {
+      kind: 'lossless';
+      entry: string;
+      storeRelativePath: string;
+      /** Undefined means remove this exact canonical entry. */
+      value?: JsonValue;
+    }
+  | { kind: 'ambiguous' | 'invalid'; reason: string };
+
 /** The set of environment variables that point a harness at a private root. */
 export type OverrideEnv = Record<string, string>;
 
@@ -447,6 +467,16 @@ export interface Adapter {
     drift: ConfigKeysDrift,
     ctx: ConfigKeysContext,
   ): Promise<ConfigKeysDriftReport | null>;
+
+  /**
+   * Strict inverse used only for a quiescent retained global COW projection.
+   * Ambiguous/lossy shapes must return no bytes; the caller retains and quarantines.
+   */
+  reverseConfigKeysDrift?(
+    surface: ConfigKeysSurface,
+    drift: ConfigKeysReverseDrift,
+    ctx: ConfigKeysContext,
+  ): Promise<ConfigKeysReverseResult>;
 
   // — launch self-check (D15 fail-closed) —
 
