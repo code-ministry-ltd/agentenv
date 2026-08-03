@@ -8,7 +8,7 @@ export const migrateCommand: Command = {
   usage: '[--rollback]',
   summary: 'Safely migrate a pinned CM or JJ v1 installation',
 
-  async run({ args, paths, options }): Promise<RunResult> {
+  async run({ args, paths, env, options }): Promise<RunResult> {
     const parsed = parseArgs(args, { booleans: ['rollback'] });
     if (parsed.unknown.length > 0 || parsed.positionals.length > 0) {
       const unexpected = parsed.unknown[0] ?? parsed.positionals[0];
@@ -26,6 +26,8 @@ export const migrateCommand: Command = {
       const result = await migrateV1({
         paths,
         adapters: options.adapters ?? realAdapters,
+        env,
+        capture: options.capture,
         ...options.migration,
       });
       const verb = result.status === 'already-opened' ? 'Already migrated' : `Migrated ${result.sourceFormat}`;

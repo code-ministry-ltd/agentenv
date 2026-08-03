@@ -183,6 +183,30 @@ describe('gated v1 migration', () => {
     });
   });
 
+  it('rolls back when an installed adapter cannot prove the migrated view', async () => {
+    const th = home();
+    const { external, paths } = cmFixture(th);
+    const rootBefore = await capturePathIdentity(paths.base);
+    const externalBefore = await capturePathIdentity(external);
+    const adapter = makeFixtureAdapter({
+      forceSelfCheck: { ok: false, detail: 'fixture rejected the migration view' },
+    });
+    adapter.detect = async () => true;
+
+    await expect(
+      migrateV1({
+        paths,
+        adapters: [adapter],
+        env: th.env,
+        listHarnessProcesses: async () => [],
+        now: quiet.now,
+      }),
+    ).rejects.toThrow(/fixture.*rejected the migration view/i);
+
+    expect(await capturePathIdentity(paths.base)).toEqual(rootBefore);
+    expect(await capturePathIdentity(external)).toEqual(externalBefore);
+  });
+
   it.each<MigrationBoundary>([
     'gate-installed',
     'quiescent',

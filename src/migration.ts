@@ -35,6 +35,9 @@ import {
 } from './migration-state.js';
 import { capturePathIdentity, identitiesEqual, type PathIdentity } from './path-identity.js';
 import { resolvePaths, type Paths } from './paths.js';
+import { composeView } from './session/composer.js';
+import { defaultCapture, type CaptureFn } from './session/exec.js';
+import { resolveBinaryOnPath, sanitisePath } from './session/resolve.js';
 import { generateShims } from './session/shims.js';
 import { readState, writeState, type StateManifest } from './state.js';
 import type { GenerationInventoryEntry, ViewGeneration } from './view-generation.js';
@@ -62,6 +65,10 @@ export interface HarnessProcess {
 export interface MigrationRequest {
   paths: Paths;
   adapters?: readonly Adapter[];
+  /** Effective invocation environment used for installed-harness detection and probes. */
+  env?: NodeJS.ProcessEnv;
+  /** Injectable capture seam; production executes each installed adapter's real probe. */
+  capture?: CaptureFn;
   now?: () => number;
   listHarnessProcesses?: () => Promise<HarnessProcess[]>;
   probe?: (paths: Paths, manifest: StateManifest) => Promise<void>;
@@ -616,8 +623,73 @@ async function probeCutover(req: MigrationRequest, wal: MigrationWal): Promise<S
       throw new Error(`retained legacy view is missing after cutover: ${generation.viewRoot}`);
     }
   }
+  await probeInstalledAdapters(req, manifest);
   await req.probe?.(req.paths, manifest);
   return manifest;
+}
+
+/**
+ * Prove that every installed, session-capable harness can observe a private view
+ * composed from the migrated store. The probe source and published view both
+ * live in the sibling migration workspace: probing never reads or writes the
+ * user's real harness configuration, and a failed probe remains rollback-safe.
+ */
+async function probeInstalledAdapters(
+  req: MigrationRequest,
+  manifest: StateManifest,
+): Promise<void> {
+  const env = req.env ?? process.env;
+  const capture = req.capture ?? defaultCapture;
+  const adapters = req.adapters ?? defaultAdapters;
+  const globalStack = Array.isArray(manifest.globalStack)
+    ? manifest.globalStack.filter((entry): entry is string => typeof entry === 'string')
+    : [];
+  const probeRoot = join(migrationWorkspace(req.paths), 'adapter-probes');
+  await rm(probeRoot, { recursive: true, force: true });
+  await mkdir(probeRoot, { recursive: true });
+
+  for (const adapter of adapters) {
+    if (!(await adapter.detect(env))) continue;
+    const sessionSupported = adapter.definition
+      ? adapter.definition.session.supported
+      : adapter.sessionSupported;
+    // A global-only harness has no relocatable config root to prove. Its
+    // whole-file validator runs when global config is materialised.
+    if (!sessionSupported) continue;
+
+    const suffix = createHash('sha256').update(adapter.id).digest('hex').slice(0, 16);
+    const privateRealRoot = join(probeRoot, 'config-sources', suffix);
+    await mkdir(privateRealRoot, { recursive: true });
+    const probePaths: Paths = {
+      ...req.paths,
+      live: join(probeRoot, 'live'),
+    };
+    const composed = await composeView({
+      paths: probePaths,
+      adapter,
+      envs: globalStack,
+      session: `migration-probe-${suffix}`,
+      realConfigRoot: privateRealRoot,
+      projectRoot: null,
+      env,
+      now: req.now,
+    });
+    const sanitisedEnv: NodeJS.ProcessEnv = {
+      ...env,
+      PATH: sanitisePath(env.PATH ?? env.Path ?? '', [req.paths.shims]),
+    };
+    const check = await adapter.selfCheck(composed.viewRoot, {
+      resolveBinary: () => resolveBinaryOnPath(adapter.binaryName, env, [req.paths.shims]),
+      capture,
+      env: sanitisedEnv,
+    });
+    if (!check.ok) {
+      throw new Error(
+        `migration probe failed for ${adapter.id}` +
+          `${check.detail ? `: ${check.detail}` : ': harness did not observe the migrated view'}`,
+      );
+    }
+  }
 }
 
 async function openGate(

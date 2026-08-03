@@ -9,9 +9,14 @@ if (process.env.MODE === 'rollback') {
   const boundary = process.env.KILL_BOUNDARY;
   await migrateV1({
     paths,
-    // No adapter behaviour is exercised before the gate-open commit point. The
-    // identity is enough to make the migration install a real closed shim.
-    adapters: [{ id: 'fixture', binaryName: 'fixture-harness' }],
+    // This fixture exercises migration crash boundaries, not adapter probing.
+    // Report the synthetic harness absent so the production probe correctly
+    // skips it while the identity still installs a real closed shim.
+    adapters: [{
+      id: 'fixture',
+      binaryName: 'fixture-harness',
+      detect: async () => false,
+    }],
     listHarnessProcesses: async () => [],
     now: () => 1_754_112_000_000,
     probe: async () => {},
