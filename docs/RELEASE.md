@@ -37,7 +37,7 @@ What each extra gate proves:
 |---|---|
 | `test:offline` | The non-live suite completes without depending on hosted services or a user home. |
 | `test:migration` | Both pinned v1 readers, closed-gate cutover, probes, and fresh-process recovery after real SIGKILL at every modeled boundary. |
-| `smoke:install` | A packed artifact installs in a clean prefix, syncs through a local bare remote, restores to a second machine, materialises Claude/Codex, drops, reconciles projections, and finishes doctor-clean. |
+| `smoke:install` | A packed artifact installs in a clean prefix, syncs through a local bare remote, restores to a second machine, launches an observed private Codex session, materialises Claude/Codex globally, drops, reconciles projections, and finishes doctor-clean. |
 | `test:restore:container` | The same packed restore proof in a clean Node 22 Linux container. Docker is required. |
 | `test:live` | Current installed Claude, Codex, OpenCode, and Pi binaries accept isolated views. These checks are intentionally opt-in because they depend on local binaries/login state. Cursor has no session probe. |
 

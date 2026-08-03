@@ -161,6 +161,12 @@ agentenv status
 agentenv resolve projection <id> --quiescent
 ```
 
+Activation and drop are rendered against private copies first. The complete
+surface and ownership diff is then published through one identity-checked command
+WAL; a pre-commit interruption restores the prior surfaces, while a third identity
+is retained for explicit resolution. Already-open global writer descriptors are
+handed to retained storage without changing their inode.
+
 Other retained lifecycle records use the same explicit pattern:
 
 ```text
@@ -214,7 +220,7 @@ $EDITOR ~/.agentenv/secrets.env
 Canonical content contains `${VAR}` placeholders. `secrets.env` takes
 precedence over the process environment. Values are exposed only to a child or
 materialiser that needs them; state, status, rescue metadata, and Git retain
-placeholders or non-reversible fingerprints, never resolved values. An
+placeholders or machine-keyed non-reversible fingerprints, never resolved values. An
 unresolved required variable skips the affected server and reports its variable
 name.
 
