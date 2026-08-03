@@ -68,8 +68,8 @@ describe('generic raw mappings', () => {
 
     expect((await run(['use', 'work', '--global'], opts)).code).toBe(0);
     const reviewer = join(realRoot, 'agents', 'reviewer.toml');
-    expect(lstatSync(reviewer).isSymbolicLink()).toBe(true);
-    expect(readlinkSync(reviewer)).toBe(canonical);
+    expect(lstatSync(reviewer).isSymbolicLink()).toBe(false);
+    expect(readFileSync(reviewer, 'utf8')).toBe(readFileSync(canonical, 'utf8'));
     expect(readFileSync(join(realRoot, 'agents', 'user.toml'), 'utf8')).toBe('name = "user"\n');
     expect(
       (await describeGlobal({ paths, adapters: [codexAdapter], env })).adapters[0]?.surfaces,

@@ -105,7 +105,7 @@ describe('engine: global orphan recovery (Finding 1/2)', () => {
     expect(res.code).toBe(0);
     expect(res.stderr ?? '').toContain('is not an array');
     // The dir-merge skill is materialised (not orphaned).
-    expect(lstatSync(join(realHome, 'skills', 'w-skill')).isSymbolicLink()).toBe(true);
+    expect(lstatSync(join(realHome, 'skills', 'w-skill')).isSymbolicLink()).toBe(false);
     // The stack IS persisted (the invocation reached writeGlobalStack).
     const manifest = await readState(paths);
     expect(manifest.globalStack).toEqual(['writing']);

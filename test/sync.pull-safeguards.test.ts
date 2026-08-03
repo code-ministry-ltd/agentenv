@@ -13,6 +13,7 @@ import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { run } from '../src/cli.js';
 import { resolvePaths } from '../src/paths.js';
+import { readState } from '../src/state.js';
 import { FIXTURE_CONFIG_ENV, makeFixtureAdapter } from './fixtures/fixture-adapter.js';
 import { makeTempHome, type TempHome } from './helpers.js';
 
@@ -81,7 +82,7 @@ function subjects(store: string): string[] {
 }
 
 describe('sync: drift-sweep commit BEFORE the pull (D9)', () => {
-  it('a write-through edit to a materialised skill is committed as `agentenv: sync drift`', async () => {
+  it('a COW edit to a materialised skill is committed as `agentenv: sync drift`', async () => {
     const th = gitHome();
     const { paths, env } = localWithWork(th);
     const opts = { env, adapters: [makeFixtureAdapter()] };
@@ -91,9 +92,9 @@ describe('sync: drift-sweep commit BEFORE the pull (D9)', () => {
     await run(['add', 'skill', 'work', 'w-skill'], opts);
     await run(['use', 'work', '--global'], opts);
 
-    // Edit the skill through its MATERIALISED symlink → writes through to the store file.
+    // Edit the retained COW copy; the next drift sweep writes it to the store.
     const realSkill = join(th.home, 'real', 'skills', 'w-skill', 'SKILL.md');
-    expect(lstatSync(join(th.home, 'real', 'skills', 'w-skill')).isSymbolicLink()).toBe(true);
+    expect(lstatSync(join(th.home, 'real', 'skills', 'w-skill')).isSymbolicLink()).toBe(false);
     writeFileSync(realSkill, '# w skill — edited mid-session\n');
 
     // The next store-touching command sweeps + commits that drift before doing its own work.
@@ -165,8 +166,8 @@ describe('sync: post-pull safeguards quarantine a bad pulled tree (D9)', () => {
   });
 });
 
-describe('sync: manifest reconcile warns on a remotely-deleted active env (D9)', () => {
-  it('an active env rm-ed on another machine warns and points at doctor', async () => {
+describe('sync: active global writers defer remotely changed candidates', () => {
+  it('retains a candidate that removes an env while its global projection is active', async () => {
     const th = gitHome();
     const { env } = localWithWork(th);
     const opts = { env, adapters: [makeFixtureAdapter()] };
@@ -185,11 +186,14 @@ describe('sync: manifest reconcile warns on a remotely-deleted active env (D9)',
       'rm env work',
     );
 
-    // The next invocation pulls the deletion and must warn (not silently dangle).
+    // The active COW writer blocks promotion; the candidate remains isolated.
     const res = await run(['create', 'foo'], opts);
     expect(res.code).toBe(0);
     const notices = res.stderr ?? '';
-    expect(notices).toContain("environment 'work'");
-    expect(notices).toContain('doctor');
+    expect(notices).toContain('DEFERRED candidate');
+    expect(notices).toContain('global-projection:');
+    expect((await readState(resolvePaths(env))).candidates).toContainEqual(
+      expect.objectContaining({ phase: 'deferred' }),
+    );
   });
 });

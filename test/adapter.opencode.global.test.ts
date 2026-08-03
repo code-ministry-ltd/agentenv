@@ -125,15 +125,17 @@ describe('adapter.opencode — global materialise/restore (AC)', () => {
     expect(used.code).toBe(0);
     expect(hashTree(realHome)).not.toBe(before); // something changed
 
-    // dir-merge: each env item symlinked in beside the user's, user items intact.
+    // Global writers receive retained COW copies; user items remain intact.
     for (const [dir, name, storeSub] of [
       ['skills', 'w-skill', 'skills'],
       ['agents', 'w-agent.md', 'agents'],
       ['commands', 'w-cmd.md', 'commands'],
     ] as const) {
       const link = join(realHome, dir, name);
-      expect(lstatSync(link).isSymbolicLink()).toBe(true);
-      expect(readlinkSync(link)).toBe(join(paths.envDir('writing'), storeSub, name));
+      expect(lstatSync(link).isSymbolicLink()).toBe(false);
+      const source = join(paths.envDir('writing'), storeSub, name);
+      const leaf = name.endsWith('.md') ? '' : 'SKILL.md';
+      expect(readFileSync(join(link, leaf), 'utf8')).toBe(readFileSync(join(source, leaf), 'utf8'));
     }
     expect(readFileSync(join(realHome, 'skills', 'user-skill', 'SKILL.md'), 'utf8')).toBe('# user skill\n');
     expect(readFileSync(join(realHome, 'agents', 'user-agent.md'), 'utf8')).toBe('# user agent\n');

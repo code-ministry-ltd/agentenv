@@ -100,10 +100,10 @@ describe('adapter.cursor — global materialise/restore (AC)', () => {
     expect(used.code).toBe(0);
     expect(hashTree(realHome)).not.toBe(before); // something changed
 
-    // dir-merge: the env skill is symlinked in beside the user's; the user's survives.
+    // The env skill is a retained COW copy beside the user's own skill.
     const wSkill = join(realHome, 'skills', 'w-skill');
-    expect(lstatSync(wSkill).isSymbolicLink()).toBe(true);
-    expect(readlinkSync(wSkill)).toBe(join(paths.envDir('writing'), 'skills', 'w-skill'));
+    expect(lstatSync(wSkill).isSymbolicLink()).toBe(false);
+    expect(readFileSync(join(wSkill, 'SKILL.md'), 'utf8')).toBe('# w skill\n');
     expect(readFileSync(join(realHome, 'skills', 'user-skill', 'SKILL.md'), 'utf8')).toBe(
       '# user skill\n',
     );

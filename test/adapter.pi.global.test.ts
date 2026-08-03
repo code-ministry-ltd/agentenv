@@ -116,15 +116,17 @@ describe('adapter.pi — global materialise/restore (AC)', () => {
     expect(used.code).toBe(0);
     expect(hashTree(realHome)).not.toBe(before); // something changed
 
-    // dir-merge: env items symlinked in beside the user's; the prompts surface draws
+    // Global writers receive retained COW copies; the prompts surface draws
     // from the env's `commands/` store content (storeKind ≠ rootRelativePath).
     for (const [dir, name, storeSub] of [
       ['skills', 'w-skill', 'skills'],
       ['prompts', 'w-cmd.md', 'commands'],
     ] as const) {
       const link = join(realHome, dir, name);
-      expect(lstatSync(link).isSymbolicLink()).toBe(true);
-      expect(readlinkSync(link)).toBe(join(paths.envDir('writing'), storeSub, name));
+      expect(lstatSync(link).isSymbolicLink()).toBe(false);
+      const source = join(paths.envDir('writing'), storeSub, name);
+      const leaf = name.endsWith('.md') ? '' : 'SKILL.md';
+      expect(readFileSync(join(link, leaf), 'utf8')).toBe(readFileSync(join(source, leaf), 'utf8'));
     }
     // The user's own dir-merge items survive.
     expect(readFileSync(join(realHome, 'skills', 'user-skill', 'SKILL.md'), 'utf8')).toBe('# user skill\n');

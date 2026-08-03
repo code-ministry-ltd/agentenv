@@ -5,16 +5,20 @@ import {
   readdir,
   readFile,
   readlink,
+  realpath,
   rm,
   symlink,
   writeFile,
 } from 'node:fs/promises';
-import { basename, join } from 'node:path';
+import { basename, join, sep } from 'node:path';
 import { backup, restore, type BackupRef } from './backups.js';
+import { retainGlobalCowBytes } from './global-cow.js';
+import { observeProjection, retireProjection, type GlobalProjection } from './global-projection.js';
 import { beginTransaction } from './journal.js';
 import { withLock } from './lock.js';
+import { capturePathIdentity } from './path-identity.js';
 import type { Paths } from './paths.js';
-import { findOwner, readState, type ManifestItemBase } from './state.js';
+import { findOwner, readState, writeState, type ManifestItemBase } from './state.js';
 
 /**
  * The dir-merge surface: skills, agents and commands, whose harness home is a
@@ -33,7 +37,7 @@ import { findOwner, readState, type ManifestItemBase } from './state.js';
  *   unsupported (Windows, unverified symlink-following); {@link syncBack} diffs
  *   the copy against the store and writes changes back (D1).
  */
-export type DirMergeMode = 'symlink' | 'copy';
+export type DirMergeMode = 'symlink' | 'copy' | 'cow';
 
 /**
  * A dir-merge ownership record: a per-item symlink or copy in a shared surface
@@ -46,6 +50,8 @@ export interface DirMergeItem extends ManifestItemBase {
   action: DirMergeMode;
   /** The store source: the symlink target, or the copy source for write-back. */
   target: string;
+  /** Durable retained-COW lifecycle record for unsupervised global writers. */
+  projectionId?: string;
 }
 
 declare module './state.js' {
@@ -66,6 +72,8 @@ export interface MaterialiseOptions {
   itemName: string;
   /** Placement mechanism; defaults to `symlink`. */
   mode?: DirMergeMode;
+  /** Associate this copy with a retained global COW projection. */
+  projectionId?: string;
   /**
    * Take over a conflicting non-owned item instead of skipping it: back it up
    * (dir, symlink or file — {@link backup} handles each) and record the ref so
@@ -163,10 +171,41 @@ async function copyPath(src: string, dest: string): Promise<void> {
   }
 }
 
+/** Copy for an unsupervised writer, dereferencing store-contained symlinks. */
+async function copyCowPath(paths: Paths, src: string, dest: string): Promise<void> {
+  const st = await lstat(src);
+  if (st.isSymbolicLink()) {
+    const resolved = await realpath(src);
+    const storeRoot = await realpath(paths.store).catch(() => paths.store);
+    if (resolved !== storeRoot && !resolved.startsWith(storeRoot + sep)) {
+      throw new Error(`global COW source symlink escapes the canonical store: ${src}`);
+    }
+    await copyCowPath(paths, resolved, dest);
+    return;
+  }
+  if (st.isDirectory()) {
+    await mkdir(dest, { recursive: true });
+    for (const entry of await readdir(src)) {
+      await copyCowPath(paths, join(src, entry), join(dest, entry));
+    }
+    return;
+  }
+  if (st.isFile()) await copyFile(src, dest);
+}
+
 /** Place the store item at `targetPath` using `mode`. */
-async function placeItem(mode: DirMergeMode, sourcePath: string, targetPath: string): Promise<void> {
+async function placeItem(
+  paths: Paths,
+  mode: DirMergeMode,
+  sourcePath: string,
+  targetPath: string,
+): Promise<void> {
   if (mode === 'symlink') {
     await symlink(sourcePath, targetPath);
+    return;
+  }
+  if (mode === 'cow') {
+    await copyCowPath(paths, sourcePath, targetPath);
     return;
   }
   await copyPath(sourcePath, targetPath);
@@ -258,6 +297,7 @@ export async function materialise(
     targetDir,
     itemName,
     mode = 'symlink',
+    projectionId,
     force = false,
     onWarn = (m: string) => console.warn(m),
   } = options;
@@ -302,13 +342,14 @@ export async function materialise(
       target: sourcePath,
       ownerEnv,
       backupRef,
+      ...(projectionId ? { projectionId } : {}),
     };
 
     const tx = await beginTransaction(paths);
     try {
       await tx.apply({ op: 'add', item, undo: { path: targetPath, backupRef } }, async () => {
         if (takeover) await rm(targetPath, { recursive: true, force: true });
-        await placeItem(mode, sourcePath, targetPath);
+        await placeItem(paths, mode, sourcePath, targetPath);
       });
       await tx.commit();
     } catch (err) {
@@ -336,7 +377,17 @@ export async function dematerialise(
     // = delete item.path". Only delete if it is still the item we placed; if the
     // user replaced it out-of-band, restoring `absent` would rm THEIR data — so
     // leave their content in place and drop only our ownership.
+    const initial = await readState(paths);
+    const projection = item.projectionId
+      ? initial.globalProjections.find((candidate) => candidate.id === item.projectionId)
+      : undefined;
     let effect = (): Promise<void> => restore(paths, restoreRef, item.path);
+    if ((item.action === 'copy' || item.action === 'cow') && projection?.phase === 'active') {
+      effect = async (): Promise<void> => {
+        await retainGlobalCowBytes(projection);
+        await restore(paths, restoreRef, item.path);
+      };
+    }
     if (restoreRef.kind === 'absent' && !(await isStillOurs(item))) {
       onWarn(
         `agentenv: '${item.path}' is no longer the item agentenv placed — leaving it ` +
@@ -356,6 +407,20 @@ export async function dematerialise(
         effect,
       );
       await tx.commit();
+      if (projection?.phase === 'active' && projection.retainedPath) {
+        const manifest = await readState(paths);
+        const index = manifest.globalProjections.findIndex(
+          (candidate) => candidate.id === projection.id,
+        );
+        if (index !== -1) {
+          const observed = await capturePathIdentity(projection.retainedPath);
+          manifest.globalProjections[index] = {
+            ...observeProjection(retireProjection(manifest.globalProjections[index]!), observed),
+            retiredAt: Date.now(),
+          } as GlobalProjection;
+          await writeState(paths, manifest);
+        }
+      }
     } catch (err) {
       await tx.rollback();
       throw err;
@@ -372,6 +437,6 @@ export async function dematerialise(
  * needs no lock.
  */
 export async function syncBack(paths: Paths, item: DirMergeItem): Promise<void> {
-  if (item.action !== 'copy') return;
+  if (item.action === 'symlink') return;
   await mirrorPath(item.path, item.target);
 }

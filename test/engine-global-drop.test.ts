@@ -100,12 +100,12 @@ describe('engine: global drop (round-trip)', () => {
     // Stack [base, top]: top wins the shared name.
     expect((await run(['use', 'base', 'top', '--global'], opts)).code).toBe(0);
     const sharedLink = join(realHome, 'skills', 'shared');
-    expect(readlinkSync(sharedLink)).toBe(join(paths.envDir('top'), 'skills', 'shared'));
+    expect(readFileSync(join(sharedLink, 'SKILL.md'), 'utf8')).toBe('# from TOP\n');
 
     // Drop the top env → base's shared skill is re-materialised (unshadowed).
     expect((await run(['drop', 'top', '--global'], opts)).code).toBe(0);
-    expect(lstatSync(sharedLink).isSymbolicLink()).toBe(true);
-    expect(readlinkSync(sharedLink)).toBe(join(paths.envDir('base'), 'skills', 'shared'));
+    expect(lstatSync(sharedLink).isSymbolicLink()).toBe(false);
+    expect(readFileSync(join(sharedLink, 'SKILL.md'), 'utf8')).toBe('# from BASE\n');
     // base-only remains; top's ownership is gone.
     expect(existsSync(join(realHome, 'skills', 'base-only'))).toBe(true);
     const manifest = await readState(paths);

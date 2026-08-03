@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { run } from '../src/cli.js';
@@ -51,10 +51,10 @@ describe('engine: global use (materialise)', () => {
     const res = await run(['use', 'writing', '--global'], { env, adapters: [makeFixtureAdapter()] });
     expect(res.code).toBe(0);
 
-    // dir-merge: our skill symlinked in beside the user's own skill.
+    // dir-merge: our retained COW skill sits beside the user's own skill.
     const wSkill = join(realHome, 'skills', 'w-skill');
-    expect(lstatSync(wSkill).isSymbolicLink()).toBe(true);
-    expect(readlinkSync(wSkill)).toBe(join(paths.envDir('writing'), 'skills', 'w-skill'));
+    expect(lstatSync(wSkill).isSymbolicLink()).toBe(false);
+    expect(readFileSync(join(wSkill, 'SKILL.md'), 'utf8')).toBe('# w skill\n');
     expect(existsSync(join(realHome, 'skills', 'user-skill'))).toBe(true);
 
     // file-block: our region appended, user content preserved.

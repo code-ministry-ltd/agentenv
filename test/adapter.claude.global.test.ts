@@ -121,7 +121,7 @@ describe('adapter.claude — global materialise/restore (AC)', () => {
     expect(used.code).toBe(0);
     expect(hashTree(userHome)).not.toBe(before); // something changed
 
-    // dir-merge: each env item symlinked in beside the user's, user items intact.
+    // Global writers receive retained COW copies; user items remain intact.
     for (const [dir, name, storeSub] of [
       ['skills', 'w-skill', 'skills'],
       ['agents', 'w-agent.md', 'agents'],
@@ -130,8 +130,10 @@ describe('adapter.claude — global materialise/restore (AC)', () => {
       ['rules', 'agentenv-writing.md', 'instructions'],
     ] as const) {
       const link = join(realHome, dir, name);
-      expect(lstatSync(link).isSymbolicLink()).toBe(true);
-      expect(readlinkSync(link)).toBe(join(paths.envDir('writing'), storeSub, name));
+      expect(lstatSync(link).isSymbolicLink()).toBe(false);
+      const source = join(paths.envDir('writing'), storeSub, name);
+      const leaf = name.endsWith('.md') ? '' : 'SKILL.md';
+      expect(readFileSync(join(link, leaf), 'utf8')).toBe(readFileSync(join(source, leaf), 'utf8'));
     }
     // The user's own items in every surface survive.
     expect(readFileSync(join(realHome, 'skills', 'user-skill', 'SKILL.md'), 'utf8')).toBe('# user skill\n');

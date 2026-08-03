@@ -15,12 +15,33 @@ export interface GlobalProjection {
   phase: GlobalProjectionPhase;
   baseline: PathIdentity;
   observed: PathIdentity;
+  surfacePath?: string;
+  retainedPath?: string;
+  canonicalPath?: string;
+  canonicalBaseline?: PathIdentity;
+  ownerEnv?: string;
+  createdAt?: number;
+  retiredAt?: number;
   canonicalRevision?: string;
   failure?: string;
 }
 
-export function createGlobalProjection(id: string, baseline: PathIdentity): GlobalProjection {
-  return { schemaVersion: 2, id, phase: 'building', baseline, observed: baseline };
+export function createGlobalProjection(
+  id: string,
+  baseline: PathIdentity,
+  details?: Omit<
+    GlobalProjection,
+    'schemaVersion' | 'id' | 'phase' | 'baseline' | 'observed'
+  >,
+): GlobalProjection {
+  return {
+    schemaVersion: 2,
+    id,
+    phase: 'building',
+    baseline,
+    observed: baseline,
+    ...details,
+  };
 }
 
 function requirePhase(projection: GlobalProjection, expected: GlobalProjectionPhase): void {

@@ -104,14 +104,15 @@ describe('adapter.codex — global materialise/restore (AC)', () => {
     expect(used.code).toBe(0);
     expect(hashTree(userHome)).not.toBe(before); // something changed
 
-    // dir-merge (skills): env item symlinked in beside the user's, user item intact.
+    // Global writers receive retained COW copies; user items remain intact.
     const wSkill = join(sharedSkills, 'w-skill');
-    expect(lstatSync(wSkill).isSymbolicLink()).toBe(true);
-    expect(readlinkSync(wSkill)).toBe(join(paths.envDir('writing'), 'skills', 'w-skill'));
+    expect(lstatSync(wSkill).isSymbolicLink()).toBe(false);
+    expect(readFileSync(join(wSkill, 'SKILL.md'), 'utf8')).toBe('# w skill\n');
     expect(readFileSync(join(sharedSkills, 'user-skill', 'SKILL.md'), 'utf8')).toBe('# user skill\n');
-    expect(lstatSync(join(sharedSkills, 'ship')).isSymbolicLink()).toBe(true);
-    expect(readlinkSync(join(sharedSkills, 'ship', 'SKILL.md'))).toBe(
-      join(paths.envDir('writing'), 'commands', 'ship.md'),
+    expect(lstatSync(join(sharedSkills, 'ship')).isSymbolicLink()).toBe(false);
+    expect(lstatSync(join(sharedSkills, 'ship', 'SKILL.md')).isSymbolicLink()).toBe(false);
+    expect(readFileSync(join(sharedSkills, 'ship', 'SKILL.md'), 'utf8')).toBe(
+      readFileSync(join(paths.envDir('writing'), 'commands', 'ship.md'), 'utf8'),
     );
 
     // file-block (AGENTS.md inline): env content INLINED into a managed region; user content kept.

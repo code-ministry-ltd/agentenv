@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, readdir, readFile, readlink, rm, symlink } from 'node:fs/promises';
 import { basename, dirname, extname, join, sep } from 'node:path';
 import {
@@ -27,7 +28,7 @@ import {
   dematerialise as dmDematerialise,
   materialise as dmMaterialise,
   type DirMergeItem,
-  type DirMergeMode,
+  type MaterialiseResult as DirMergeMaterialiseResult,
 } from './dir-merge.js';
 import {
   dematerialise as fbDematerialise,
@@ -35,6 +36,11 @@ import {
   type FileBlockSource,
 } from './file-block.js';
 import { beginTransaction, recoverState } from './journal.js';
+import {
+  abandonBuildingGlobalCow,
+  beginGlobalCowProjection,
+  finishGlobalCowPublication,
+} from './global-cow.js';
 import { withLock } from './lock.js';
 import type { Paths } from './paths.js';
 import { listRawFiles, rawMappingStoreRoot, type RawFile } from './raw-mapping.js';
@@ -387,12 +393,11 @@ async function materialiseRawMapping(
         });
         continue;
       }
-      const result = await dmMaterialise(paths, {
+      const result = await materialiseGlobalCowItem(paths, {
         ownerEnv,
         sourcePath: file.sourcePath,
         targetDir: join(targetRoot, dirname(file.relativePath)),
         itemName: basename(file.relativePath),
-        mode: 'symlink',
         onWarn,
       });
       if (result.status === 'materialised') {
@@ -456,7 +461,6 @@ async function materialiseDirMerge(
   onWarn: (m: string) => void,
 ): Promise<number> {
   const { paths, envs } = req;
-  const mode: DirMergeMode = surface.mode ?? 'symlink';
   const claimed = new Set<string>();
   let applied = 0;
 
@@ -479,12 +483,11 @@ async function materialiseDirMerge(
       const sourcePath = surface.layout === 'command-skill'
         ? await commandSkillWrapper(paths, env, name, canonicalSource)
         : canonicalSource;
-      const result = await dmMaterialise(paths, {
+      const result = await materialiseGlobalCowItem(paths, {
         ownerEnv: env,
         sourcePath,
         targetDir,
         itemName: name,
-        mode,
         onWarn,
       });
       if (result.status === 'materialised') {
@@ -500,6 +503,51 @@ async function materialiseDirMerge(
     }
   }
   return applied;
+}
+
+interface GlobalCowItemRequest {
+  ownerEnv: string;
+  sourcePath: string;
+  targetDir: string;
+  itemName: string;
+  onWarn: (message: string) => void;
+}
+
+/** Materialise one unsupervised global writer as an independently retained copy. */
+async function materialiseGlobalCowItem(
+  paths: Paths,
+  req: GlobalCowItemRequest,
+): Promise<DirMergeMaterialiseResult> {
+  const id = randomUUID();
+  const surfacePath = join(req.targetDir, req.itemName);
+  await beginGlobalCowProjection(paths, {
+    id,
+    surfacePath,
+    canonicalPath: req.sourcePath,
+    ownerEnv: req.ownerEnv,
+    createdAt: Date.now(),
+  });
+  try {
+    const result = await dmMaterialise(paths, {
+      ...req,
+      mode: 'cow',
+      projectionId: id,
+    });
+    if (result.status === 'skipped' || result.item.projectionId !== id) {
+      await abandonBuildingGlobalCow(paths, id);
+      return result;
+    }
+    await finishGlobalCowPublication(paths, id, surfacePath);
+    return result;
+  } catch (err) {
+    // Once bytes exist, retain the building record for doctor/recovery. If the
+    // dir-merge transaction never committed, it is safe to remove inert intent.
+    const manifest = await readState(paths);
+    if (!manifest.items.some((item) => item.path === surfacePath && item.ownerEnv === req.ownerEnv)) {
+      await abandonBuildingGlobalCow(paths, id);
+    }
+    throw err;
+  }
 }
 
 /**

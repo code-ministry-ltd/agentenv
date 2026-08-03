@@ -5,7 +5,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readlinkSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -190,14 +189,16 @@ describe('restore (criterion 5) probe 1: use work --global reproduces the env + 
     const used = await run(['use', 'work', '--global'], { env, adapters: [claudeAdapter] });
     expect(used.code).toBe(0);
 
-    // dir-merge: the env skill symlinked into a freshly-created skills/ dir.
+    // dir-merge: retained COW copies appear in freshly-created surface dirs.
     const skillLink = join(realHome, 'skills', 'sharpen');
-    expect(lstatSync(skillLink).isSymbolicLink()).toBe(true);
-    expect(readlinkSync(skillLink)).toBe(join(paths.envDir('work'), 'skills', 'sharpen'));
-    // instructions materialise as a rules/ symlink (D2), not a CLAUDE.md block.
+    expect(lstatSync(skillLink).isSymbolicLink()).toBe(false);
+    expect(readFileSync(join(skillLink, 'SKILL.md'), 'utf8')).toContain('sharpen');
+    // Instructions materialise as a rules/ COW file, not a CLAUDE.md block.
     const ruleLink = join(realHome, 'rules', 'base.md');
-    expect(lstatSync(ruleLink).isSymbolicLink()).toBe(true);
-    expect(readlinkSync(ruleLink)).toBe(join(paths.envDir('work'), 'instructions', 'base.md'));
+    expect(lstatSync(ruleLink).isSymbolicLink()).toBe(false);
+    expect(readFileSync(ruleLink, 'utf8')).toBe(
+      readFileSync(join(paths.envDir('work'), 'instructions', 'base.md'), 'utf8'),
+    );
 
     // config-keys: BOTH servers injected into .claude.json; Claude is passthrough so
     // the ${SOME_TOKEN} placeholder is kept verbatim (no secret written, env reproduced).

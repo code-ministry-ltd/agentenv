@@ -329,13 +329,13 @@ describe('round-trip integrity (spec criterion 1) — global variant', () => {
 
     const opts = { env: h.env, adapters: [claudeAdapter] };
 
-    // --- use writing --global: materialise skills/agents/commands/rules symlinks
+    // --- use writing --global: materialise skills/agents/commands/rules COW copies
     //     + .claude.json mcpServers onto the REAL fixture home. ---
     const used = await run(['use', 'writing', '--global'], opts);
     expect(used.code).toBe(0);
     expect(hashTree(h.home, exclude)).not.toBe(step0); // something DID change
 
-    // The env's unique items are symlinked in beside the user's, pointing at the store.
+    // The env's unique items are retained copies beside the user's content.
     for (const [dir, name, storeSub] of [
       ['skills', 'draft-helper', 'skills'],
       ['agents', 'draft-agent.md', 'agents'],
@@ -343,8 +343,10 @@ describe('round-trip integrity (spec criterion 1) — global variant', () => {
       ['rules', 'writing-rules.md', 'instructions'], // instructions → rules/ symlink (D2)
     ] as const) {
       const link = join(h.claudeHome, dir, name);
-      expect(lstatSync(link).isSymbolicLink()).toBe(true);
-      expect(readlinkSync(link)).toBe(join(envDir, storeSub, name));
+      expect(lstatSync(link).isSymbolicLink()).toBe(false);
+      const source = join(envDir, storeSub, name);
+      const leaf = name.endsWith('.md') ? '' : 'SKILL.md';
+      expect(readFileSync(join(link, leaf), 'utf8')).toBe(readFileSync(join(source, leaf), 'utf8'));
     }
 
     // The name-colliding env skill is SKIPPED — the user's real skill is untouched,

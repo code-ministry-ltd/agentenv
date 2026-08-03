@@ -100,7 +100,7 @@ export async function driftSweep(req: DriftSweepRequest): Promise<DriftSweepResu
   for (const item of manifest.items) {
     if (item.surface !== 'dir-merge') continue;
     const dm = item as DirMergeItem;
-    if (dm.action !== 'copy') continue;
+    if (dm.action === 'symlink') continue;
     await dmSyncBack(paths, dm);
     result.dirMergeSynced += 1;
     result.storePathsChanged.push(dm.target);
