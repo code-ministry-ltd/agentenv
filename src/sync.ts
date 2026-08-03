@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { Adapter } from './adapter.js';
 import { adoptSweep, singular } from './adopt.js';
 import { driftSweep } from './drift.js';
@@ -8,7 +9,6 @@ import {
   describeFindings,
   type GitRunner,
   type PushResult,
-  pullRebase,
   pushStore,
   rebaseInProgress,
   reconcileManifest,
@@ -18,7 +18,22 @@ import {
 } from './git.js';
 import type { Paths } from './paths.js';
 import { readSessionRegistry } from './session/registry.js';
-import { readState } from './state.js';
+import {
+  candidatePaths,
+  prepareSyncCandidate,
+  promoteSyncCandidate,
+} from './sync-candidate-git.js';
+import {
+  approveCandidate,
+  beginCandidatePromotion,
+  beginCandidateValidation,
+  completeCandidatePromotion,
+  deferCandidate,
+  rejectCandidate,
+  type SyncCandidate,
+} from './sync-candidate.js';
+import { withLock } from './lock.js';
+import { readState, writeState } from './state.js';
 
 /**
  * The git-sync invocation lifecycle (design D9), composing {@link
@@ -175,55 +190,112 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
       }
     }
 
-    // 3. Pull (rebase, short timeout, silently skipped offline / no-remote).
-    const pull = await pullRebase(paths, env, {
+    // 3. Fetch into a private ref and detached worktree. The canonical store is
+    // unchanged until validation and every retained-writer gate have passed.
+    const prepared = await prepareSyncCandidate({
+      paths,
+      env,
+      id: randomUUID(),
+      fetchedAt: Date.now(),
+      onFetched: (candidate) => persistCandidate(paths, candidate),
       ...(gitRun ? { run: gitRun } : {}),
       ...(req.pullTimeoutMs !== undefined ? { timeoutMs: req.pullTimeoutMs } : {}),
     });
-    const conflicted = pull.status === 'conflict';
-    if (conflicted) {
-      // 2.1 already aborted the rebase so the tree stays usable; persist a
-      // machine-local marker so `status` surfaces the blocked state and the local
-      // command still completes (Task 2.2). NEVER auto-resolve.
-      await writeConflictMarker(paths, pull.detail ?? 'store history diverged');
-      onNotice(
-        `agentenv: sync blocked by a conflict — ${pull.detail}. ` +
-          'Your store still works locally from the working tree; run `agentenv sync --resolve` to finish syncing.',
-      );
-    } else if (pull.status === 'ok') {
-      // A clean pull integrated remote history: any earlier conflict is now moot.
-      await clearConflictMarker(paths);
-    } else if (pull.status === 'error') {
-      onNotice(`agentenv: pull skipped (${pull.detail ?? 'error'}); working offline from the local store.`);
-    }
-    const pulled = pull.status === 'ok';
 
-    // 4. Post-pull safeguards, BEFORE anything materialises (D9). Only meaningful
-    //    when a pull actually integrated remote history.
-    let quarantined = false;
-    if (pulled) {
-      const validation = await validatePulledStore(paths);
-      if (!validation.ok) {
-        quarantined = true;
-        const parts: string[] = [];
-        if (validation.schemaProblems.length > 0) {
-          parts.push(`  malformed manifest(s):\n${validation.schemaProblems.map((p) => `    ${p}`).join('\n')}`);
-        }
-        if (validation.secretFindings.length > 0) {
-          parts.push(`  suspected secret(s):\n${describeFindings(validation.secretFindings)}`);
-        }
-        onNotice(
-          'agentenv: QUARANTINED pulled changes — the remote store is malformed or secret-bearing and was ' +
-            'NOT materialised (it stays in the working tree for inspection):\n' +
-            parts.join('\n'),
+    if (prepared.status === 'offline' || prepared.status === 'error') {
+      onNotice(`agentenv: pull skipped (${prepared.detail}); working offline from the local store.`);
+      return { synced: true, pulled: false, quarantined: false, conflicted: false, paused: false };
+    }
+    if (prepared.status === 'no-remote' || prepared.status === 'nothing') {
+      await clearConflictMarker(paths);
+      return { synced: true, pulled: false, quarantined: false, conflicted: false, paused: false };
+    }
+    if (prepared.status === 'conflict') {
+      const candidate = deferCandidate(beginCandidateValidation(prepared.candidate), [
+        'rebase-conflict',
+      ]);
+      await persistCandidate(paths, candidate);
+      await writeConflictMarker(paths, prepared.detail);
+      onNotice(
+        `agentenv: sync blocked by a conflict — ${prepared.detail}. ` +
+          'The candidate is retained in isolation; run `agentenv sync --resolve` to finish syncing.',
+      );
+      return { synced: true, pulled: false, quarantined: false, conflicted: true, paused: false };
+    }
+    if (prepared.status !== 'prepared') {
+      throw new Error(`unexpected candidate preparation state: ${prepared.status}`);
+    }
+
+    let candidate = beginCandidateValidation(prepared.candidate);
+    await persistCandidate(paths, candidate);
+    const validation = await validatePulledStore(candidatePaths(paths, candidate.worktree));
+    if (!validation.ok) {
+      const reason =
+        `post-fetch validation failed (${validation.schemaProblems.length} malformed manifest(s), ` +
+        `${validation.secretFindings.length} suspected secret finding(s))`;
+      candidate = rejectCandidate(candidate, reason);
+      await persistCandidate(paths, candidate);
+      const parts: string[] = [];
+      if (validation.schemaProblems.length > 0) {
+        parts.push(
+          `  malformed manifest(s):\n${validation.schemaProblems.map((p) => `    ${p}`).join('\n')}`,
         );
       }
-      const active = await activeEnvNames(paths);
-      const reconcile = await reconcileManifest(paths, active);
-      for (const w of reconcile.warnings) onNotice(w);
+      if (validation.secretFindings.length > 0) {
+        parts.push(`  suspected secret(s):\n${describeFindings(validation.secretFindings)}`);
+      }
+      onNotice(
+        `agentenv: QUARANTINED candidate '${candidate.id}' — remote changes are malformed or ` +
+          'secret-bearing and were NOT promoted or materialised. The isolated candidate is retained ' +
+          `at ${candidate.worktree} for inspection:\n${parts.join('\n')}`,
+      );
+      return { synced: true, pulled: false, quarantined: true, conflicted: false, paused: false };
     }
 
-    return { synced: true, pulled, quarantined, conflicted, paused: false };
+    const blockers = await retainedWriterBlockers(paths);
+    if (blockers.length > 0) {
+      candidate = deferCandidate(candidate, blockers);
+      await persistCandidate(paths, candidate);
+      onNotice(
+        `agentenv: DEFERRED candidate '${candidate.id}' — retained writers must close before ` +
+          `promotion (${blockers.join(', ')}). Nothing from the candidate was materialised.`,
+      );
+      return { synced: true, pulled: false, quarantined: true, conflicted: false, paused: false };
+    }
+
+    candidate = approveCandidate(candidate);
+    await persistCandidate(paths, candidate);
+    candidate = beginCandidatePromotion(candidate);
+    await persistCandidate(paths, candidate);
+    const promoted = await promoteSyncCandidate({
+      paths,
+      env,
+      expectedHead: prepared.expectedHead,
+      revision: prepared.revision,
+      ...(gitRun ? { run: gitRun } : {}),
+    });
+    if (promoted.status !== 'promoted') {
+      candidate = {
+        ...candidate,
+        phase: promoted.status === 'deferred' ? 'deferred' : 'rejected',
+        blockers: promoted.blocker ? [promoted.blocker] : [],
+        reason: promoted.detail ?? null,
+      };
+      await persistCandidate(paths, candidate);
+      onNotice(
+        `agentenv: candidate '${candidate.id}' was NOT promoted — ` +
+          `${promoted.blocker ?? promoted.detail ?? 'promotion failed'}. It remains isolated.`,
+      );
+      return { synced: true, pulled: false, quarantined: true, conflicted: false, paused: false };
+    }
+
+    candidate = completeCandidatePromotion(candidate, prepared.revision);
+    await persistCandidate(paths, candidate);
+    await clearConflictMarker(paths);
+    const active = await activeEnvNames(paths);
+    const reconcile = await reconcileManifest(paths, active);
+    for (const warning of reconcile.warnings) onNotice(warning);
+    return { synced: true, pulled: true, quarantined: false, conflicted: false, paused: false };
   } catch (err) {
     // Fail-soft: sync is best-effort; the local command must still complete.
     onNotice(`agentenv: sync (pull phase) skipped — ${(err as Error).message}`);
@@ -270,6 +342,33 @@ export async function endStoreSync(req: SyncAfterRequest): Promise<PushResult | 
     onNotice(`agentenv: push skipped — ${(err as Error).message}`);
     return undefined;
   }
+}
+
+async function persistCandidate(paths: Paths, candidate: SyncCandidate): Promise<void> {
+  await withLock(paths, async () => {
+    const manifest = await readState(paths);
+    const index = manifest.candidates.findIndex((current) => current.id === candidate.id);
+    if (index === -1) manifest.candidates.push(candidate);
+    else manifest.candidates[index] = candidate;
+    await writeState(paths, manifest);
+  });
+}
+
+/** Conservative promotion gate until path-scoped writer reservations are wired. */
+async function retainedWriterBlockers(paths: Paths): Promise<string[]> {
+  const manifest = await readState(paths);
+  const blockers: string[] = [];
+  for (const generation of manifest.generations) {
+    if (generation.phase !== 'swept' && generation.phase !== 'collected') {
+      blockers.push(`generation:${generation.id}`);
+    }
+  }
+  for (const projection of manifest.globalProjections) {
+    if (projection.phase !== 'reconciled' && projection.phase !== 'collected') {
+      blockers.push(`global-projection:${projection.id}`);
+    }
+  }
+  return blockers.sort();
 }
 
 /**

@@ -3,6 +3,7 @@ import type { Command, CommandContext, RunResult } from '../command.js';
 import { describeGlobal, type AdapterStatus } from '../engine.js';
 import { readConflictMarker } from '../git.js';
 import { findBinding, readSessionRegistry, resolveProjectRoot } from '../session/registry.js';
+import { readState } from '../state.js';
 
 /**
  * `agentenv status` — the mode + bindings for this shell/project, the active
@@ -32,12 +33,30 @@ export const statusCommand: Command = {
  */
 async function syncSection(ctx: CommandContext): Promise<string[]> {
   const marker = await readConflictMarker(ctx.paths);
-  if (!marker.pending) return [];
-  return [
-    'Sync:       BLOCKED by a rebase conflict — run `agentenv sync --resolve` to finish syncing',
-    '            (or `agentenv sync --abort` to cancel and keep local). The store still works locally.',
-    '',
-  ];
+  const candidates = (await readState(ctx.paths)).candidates.filter(
+    (candidate) => candidate.phase !== 'promoted' && candidate.phase !== 'abandoned',
+  );
+  const lines: string[] = [];
+  if (marker.pending) {
+    lines.push(
+      'Sync:       BLOCKED by a rebase conflict — run `agentenv sync --resolve` to finish syncing',
+      '            (or `agentenv sync --abort` to cancel and keep local). The store still works locally.',
+    );
+  }
+  if (candidates.length > 0) {
+    if (lines.length === 0) lines.push('Sync candidates:');
+    else lines.push('Candidates:');
+    for (const candidate of candidates) {
+      const blockers = candidate.blockers.length > 0
+        ? `; blockers: ${candidate.blockers.join(', ')}`
+        : '';
+      lines.push(
+        `  ${candidate.phase.toUpperCase()} ${candidate.id}${blockers}; retained at ${candidate.worktree}`,
+      );
+    }
+  }
+  if (lines.length > 0) lines.push('');
+  return lines;
 }
 
 async function sessionSection(ctx: CommandContext): Promise<string[]> {

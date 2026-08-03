@@ -28,6 +28,7 @@ or specifications is recorded as behavioral provenance rather than copied code.
 | Session generations and inventory | Immutable retained generations and launch-time inventories | JJ view composer/adoption tests | Behavioral reimplementation under new lease model | Pending |
 | CLI and release | Settled commands, root globals, env-less global drop, Node floor, container restore | JJ CLI/release tests | Behavioral reimplementation | Pending |
 | Raw mappings | Generic `files/<harness>/<relpath>` and Codex TOML agents | Merge specification | New implementation | Implemented with recursive traversal checks, per-file ownership, collision handling, session write-through, global drop, inventory, and status |
+| Sync candidates | Isolated fetched tree, last-known-good launch behavior, writer-aware deferral, durable rejection, and status visibility | Merge specification plus CM Git safeguards | New lifecycle around CM validation, secret scan, rebase, and push primitives | Implemented for fetch, validation, promotion, retained-writer deferral, rejection, and read-only status; explicit resolve/abandon and GC pending |
 
 ## Baseline defect ledger
 
