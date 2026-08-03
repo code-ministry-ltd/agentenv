@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { chmod, mkdir, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Adapter, SelfCheckContext } from '../adapter.js';
 import { renderSessionLaunch } from '../adapter-v2.js';
@@ -19,6 +19,10 @@ import { readState } from '../state.js';
 import { composeView, type SurfaceSkip } from './composer.js';
 import { defaultCapture, defaultExecHarness, type CaptureFn, type ExecHarness } from './exec.js';
 import {
+  planSessionGenerationAdoptions,
+  type GenerationAdoptionPlan,
+} from './generation-adoption.js';
+import {
   attachSessionGenerationLease,
   beginSessionGenerationSweep,
   beginSessionGeneration,
@@ -30,6 +34,7 @@ import {
   sweepSessionGeneration,
 } from './generations.js';
 import { resolveBinaryOnPath, sanitisePath } from './resolve.js';
+import type { ViewGeneration } from '../view-generation.js';
 
 /**
  * The launch core (D15) shared by `agentenv run` and the shim's `__shim` command.
@@ -110,40 +115,55 @@ function requireFinalCommit(commit: CommitResult): void {
 
 async function publishFinalGenerationDrift(
   req: LaunchRequest,
-  generationId: string,
+  generation: ViewGeneration,
   writes: readonly { path: string; text: string }[],
   commit: () => Promise<void>,
-): Promise<void> {
-  if (writes.length === 0) {
-    await commit();
-    return;
-  }
-  const transactionId = `generation-${generationId}`;
+): Promise<GenerationAdoptionPlan> {
+  const transactionId = `generation-${generation.id}`;
   const stagingRoot = join(req.paths.live, 'commands', transactionId);
   await mkdir(stagingRoot, { recursive: true });
-  const entries: StagedBundleEntry[] = [];
-  const seen = new Set<string>();
-  for (const [index, write] of writes.entries()) {
-    if (seen.has(write.path)) throw new Error(`duplicate final-sweep target '${write.path}'`);
-    seen.add(write.path);
-    const secretCount = scanTextForSecrets(write.text).length;
-    if (secretCount > 0) {
-      throw new Error(`final sweep has ${secretCount} suspected secret finding(s)`);
+  try {
+    const entries: StagedBundleEntry[] = [];
+    const seen = new Set<string>();
+    for (const [index, write] of writes.entries()) {
+      if (seen.has(write.path)) throw new Error(`duplicate final-sweep target '${write.path}'`);
+      seen.add(write.path);
+      const secretCount = scanTextForSecrets(write.text).length;
+      if (secretCount > 0) {
+        throw new Error(`final sweep has ${secretCount} suspected secret finding(s)`);
+      }
+      const staged = join(stagingRoot, `canonical-${index}`);
+      await writeFile(staged, write.text, 'utf8');
+      const identity = await capturePathIdentity(write.path);
+      if (identity.kind === 'file') await chmod(staged, identity.mode);
+      entries.push({ id: `canonical-${index}`, target: write.path, staged });
     }
-    const staged = join(stagingRoot, `canonical-${index}`);
-    await writeFile(staged, write.text, 'utf8');
-    const identity = await capturePathIdentity(write.path);
-    if (identity.kind === 'file') await chmod(staged, identity.mode);
-    entries.push({ id: `canonical-${index}`, target: write.path, staged });
+    const adoptions = await planSessionGenerationAdoptions({
+      paths: req.paths,
+      generation,
+      stagingRoot,
+    });
+    for (const entry of adoptions.entries) {
+      if (seen.has(entry.target)) throw new Error(`duplicate final-sweep target '${entry.target}'`);
+      seen.add(entry.target);
+      entries.push(entry);
+    }
+    if (entries.length === 0) {
+      await commit();
+      return adoptions;
+    }
+    await publishStagedBundle({
+      paths: req.paths,
+      transactionId,
+      stagingRoot,
+      entries,
+      gitBookkeeping: commit,
+      ...(req.afterFinalSweepApply ? { afterApply: req.afterFinalSweepApply } : {}),
+    });
+    return adoptions;
+  } finally {
+    await rm(stagingRoot, { recursive: true, force: true });
   }
-  await publishStagedBundle({
-    paths: req.paths,
-    transactionId,
-    stagingRoot,
-    entries,
-    gitBookkeeping: commit,
-    ...(req.afterFinalSweepApply ? { afterApply: req.afterFinalSweepApply } : {}),
-  });
 }
 
 export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
@@ -351,7 +371,7 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
       let sweepCompleted = false;
       try {
         await closeSessionGeneration(paths, generationId, reservationId, now());
-        await beginSessionGenerationSweep(paths, generationId);
+        const sweepingGeneration = await beginSessionGenerationSweep(paths, generationId);
         const writes = await planSessionGenerationDrift({
           paths,
           adapters: [adapter],
@@ -359,9 +379,9 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
           generationIds: [generationId],
           onWarn: (message) => notices.push(message),
         });
-        await publishFinalGenerationDrift(
+        const adoptions = await publishFinalGenerationDrift(
           req,
-          generationId,
+          sweepingGeneration,
           writes,
           async () => {
             const commit = await commitStore(
@@ -373,6 +393,18 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
             requireFinalCommit(commit);
           },
         );
+        for (const adoption of adoptions.adopted) {
+          notices.push(
+            `agentenv: adopted ${adoption.storeKind === 'skills' ? 'skill' : adoption.storeKind === 'agents' ? 'agent' : 'command'} ` +
+              `'${adoption.name}' → ${adoption.ownerEnv} during final generation sweep`,
+          );
+        }
+        for (const ignored of adoptions.ignored) {
+          notices.push(
+            `agentenv: ignored session-born ${ignored.storeKind === 'skills' ? 'skill' : ignored.storeKind === 'agents' ? 'agent' : 'command'} ` +
+              `'${ignored.name}' by policy; canonical store unchanged`,
+          );
+        }
         await completeSessionGenerationSweep(paths, generationId, now());
         sweepCompleted = true;
       } catch (err) {

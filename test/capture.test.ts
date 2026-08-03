@@ -95,6 +95,23 @@ describe('capture --dry-run: previews the adoption without changing anything', (
 });
 
 describe('capture: guardrails are enforced (D10)', () => {
+  it('honours capture.ignore before adopting a matching item', async () => {
+    const { th, paths, surfaceDir } = await setup();
+    writeFileSync(
+      paths.envYaml('work'),
+      'version: "1.0"\ndescription: work\ncapture:\n  ignore:\n    - scratch-*\n',
+      'utf8',
+    );
+    makeSkill(surfaceDir, 'scratch-notes');
+
+    const res = await run(['capture'], { env: th.env });
+
+    expect(res.code).toBe(0);
+    expect((await lstat(join(surfaceDir, 'scratch-notes'))).isDirectory()).toBe(true);
+    expect(existsSync(join(paths.envDir('work'), 'skills', 'scratch-notes'))).toBe(false);
+    expect(res.stdout).toMatch(/nothing to adopt/i);
+  });
+
   it('does not adopt a secret-bearing item when the prompt is declined', async () => {
     const { th, surfaceDir } = await setup();
     const dir = makeSkill(surfaceDir, 'leaky');

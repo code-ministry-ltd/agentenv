@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { run } from '../src/cli.js';
@@ -62,6 +62,32 @@ function req(partial: Partial<LaunchRequest> & Pick<LaunchRequest, 'paths' | 'ad
     cwd: partial.paths.base,
     ...partial,
   } as LaunchRequest;
+}
+
+function makeSessionSkill(viewRoot: string, name: string, extra?: { file: string; text: string }): string {
+  const dir = join(viewRoot, 'skills', name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, 'SKILL.md'),
+    `---\nname: ${name}\ndescription: session-created ${name}\n---\n\n# ${name}\n`,
+  );
+  if (extra) writeFileSync(join(dir, extra.file), extra.text);
+  return dir;
+}
+
+function writeWritingEnvYaml(paths: ReturnType<typeof resolvePaths>, ignore: readonly string[] = []): void {
+  mkdirSync(paths.envDir('writing'), { recursive: true });
+  writeFileSync(
+    paths.envYaml('writing'),
+    [
+      'version: "1.0"',
+      'description: writing',
+      ...(ignore.length > 0
+        ? ['capture:', '  ignore:', ...ignore.map((pattern) => `    - ${JSON.stringify(pattern)}`)]
+        : []),
+      '',
+    ].join('\n'),
+  );
 }
 
 describe('session launch', () => {
@@ -155,6 +181,146 @@ describe('session launch', () => {
       (candidate) => candidate.id === result.generationId,
     );
     expect(generation?.phase).toBe('swept');
+  });
+
+  it('adopts a valid session-born skill into its launch-time owner in the final WAL-backed sweep', async () => {
+    const th = home();
+    const { paths, env } = scenario(th);
+    writeWritingEnvYaml(paths);
+    const exec: ExecHarness = async (spec) => {
+      await spec.onSpawn?.({
+        processGroupId: 4250,
+        pid: 4251,
+        processStart: 'fixture-start-4251',
+      });
+      makeSessionSkill(spec.env[FIXTURE_CONFIG_ENV]!, 'session-born');
+      return 0;
+    };
+
+    const result = await launchHarness(
+      req({ paths, adapter: makeFixtureAdapter(), env, execHarness: exec }),
+    );
+
+    expect(result.mode).toBe('applied');
+    expect(
+      readFileSync(join(paths.envDir('writing'), 'skills', 'session-born', 'SKILL.md'), 'utf8'),
+    ).toContain('session-created session-born');
+    expect(
+      (await readState(paths)).generations.find((candidate) => candidate.id === result.generationId),
+    ).toMatchObject({ phase: 'swept' });
+    expect(result.notices.join(' ')).toMatch(/adopted skill 'session-born'.*writing/i);
+  });
+
+  it('honours capture.ignore for session-born inventory without blocking generation sweep', async () => {
+    const th = home();
+    const { paths, env } = scenario(th);
+    writeWritingEnvYaml(paths, ['scratch-*']);
+    const exec: ExecHarness = async (spec) => {
+      await spec.onSpawn?.({
+        processGroupId: 4260,
+        pid: 4261,
+        processStart: 'fixture-start-4261',
+      });
+      makeSessionSkill(spec.env[FIXTURE_CONFIG_ENV]!, 'scratch-notes');
+      return 0;
+    };
+
+    const result = await launchHarness(
+      req({ paths, adapter: makeFixtureAdapter(), env, execHarness: exec }),
+    );
+
+    expect(existsSync(join(paths.envDir('writing'), 'skills', 'scratch-notes'))).toBe(false);
+    expect(
+      (await readState(paths)).generations.find((candidate) => candidate.id === result.generationId),
+    ).toMatchObject({ phase: 'swept' });
+    expect(result.notices.join(' ')).toMatch(/ignored session-born skill 'scratch-notes'/i);
+  });
+
+  it('retains session-born bytes when the launch-time owner disappears before final sweep', async () => {
+    const th = home();
+    const { paths, env } = scenario(th);
+    writeWritingEnvYaml(paths);
+    let retained = '';
+    const exec: ExecHarness = async (spec) => {
+      await spec.onSpawn?.({
+        processGroupId: 4270,
+        pid: 4271,
+        processStart: 'fixture-start-4271',
+      });
+      retained = makeSessionSkill(spec.env[FIXTURE_CONFIG_ENV]!, 'ownerless');
+      await import('node:fs/promises').then(({ rm }) =>
+        rm(paths.envDir('writing'), { recursive: true, force: true }),
+      );
+      return 0;
+    };
+
+    const result = await launchHarness(
+      req({ paths, adapter: makeFixtureAdapter(), env, execHarness: exec }),
+    );
+
+    expect(existsSync(join(retained, 'SKILL.md'))).toBe(true);
+    expect(
+      (await readState(paths)).generations.find((candidate) => candidate.id === result.generationId),
+    ).toMatchObject({ phase: 'quarantined', failure: expect.stringMatching(/owner.*writing/i) });
+    expect(existsSync(join(paths.envDir('writing'), 'skills', 'ownerless'))).toBe(false);
+  });
+
+  it('retains secret-bearing session-born bytes instead of placing them in the store', async () => {
+    const th = home();
+    const { paths, env } = scenario(th);
+    writeWritingEnvYaml(paths);
+    let retained = '';
+    const exec: ExecHarness = async (spec) => {
+      await spec.onSpawn?.({
+        processGroupId: 4280,
+        pid: 4281,
+        processStart: 'fixture-start-4281',
+      });
+      retained = makeSessionSkill(spec.env[FIXTURE_CONFIG_ENV]!, 'leaky-session', {
+        file: 'credentials.txt',
+        text: 'aws_secret_access_key = AKIAZ7Q2W9E4R6T1Y8U3\n',
+      });
+      return 0;
+    };
+
+    const result = await launchHarness(
+      req({ paths, adapter: makeFixtureAdapter(), env, execHarness: exec }),
+    );
+
+    expect(existsSync(join(retained, 'credentials.txt'))).toBe(true);
+    expect(existsSync(join(paths.envDir('writing'), 'skills', 'leaky-session'))).toBe(false);
+    expect(
+      (await readState(paths)).generations.find((candidate) => candidate.id === result.generationId),
+    ).toMatchObject({ phase: 'quarantined', failure: expect.stringMatching(/secret/i) });
+  });
+
+  it('does not overwrite a destination created after launch and retains both identities', async () => {
+    const th = home();
+    const { paths, env } = scenario(th);
+    writeWritingEnvYaml(paths);
+    let retained = '';
+    const destination = join(paths.envDir('writing'), 'skills', 'raced');
+    const exec: ExecHarness = async (spec) => {
+      await spec.onSpawn?.({
+        processGroupId: 4290,
+        pid: 4291,
+        processStart: 'fixture-start-4291',
+      });
+      retained = makeSessionSkill(spec.env[FIXTURE_CONFIG_ENV]!, 'raced');
+      mkdirSync(destination, { recursive: true });
+      writeFileSync(join(destination, 'SKILL.md'), 'CONCURRENT CANONICAL\n');
+      return 0;
+    };
+
+    const result = await launchHarness(
+      req({ paths, adapter: makeFixtureAdapter(), env, execHarness: exec }),
+    );
+
+    expect(readFileSync(join(destination, 'SKILL.md'), 'utf8')).toBe('CONCURRENT CANONICAL\n');
+    expect(readFileSync(join(retained, 'SKILL.md'), 'utf8')).toContain('session-created raced');
+    expect(
+      (await readState(paths)).generations.find((candidate) => candidate.id === result.generationId),
+    ).toMatchObject({ phase: 'quarantined', failure: expect.stringMatching(/destination.*exists/i) });
   });
 
   it('quarantines a generation when its required final drift commit fails', async () => {

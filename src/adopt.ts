@@ -8,7 +8,7 @@ import { beginTransaction, recoverState } from './journal.js';
 import { withLock } from './lock.js';
 import type { Paths } from './paths.js';
 import { findOwner, readState, writeState, type ManifestItem, type StateManifest } from './state.js';
-import { environmentExists } from './store.js';
+import { environmentExists, readEnvConfig } from './store.js';
 
 /**
  * Auto-adoption (design D10). When a harness creates a NEW skill/agent/command
@@ -111,6 +111,7 @@ export type AdoptSkipReason =
   | 'project'
   | 'no-env'
   | 'owned'
+  | 'ignored'
   | 'invalid';
 
 /** One item the sweep did not adopt, with the guardrail that stopped it. */
@@ -241,6 +242,7 @@ export async function adoptSweep(req: AdoptSweepRequest): Promise<AdoptSweepResu
     // Guardrail 4 (no active env): the surface's target env is gone → nothing is
     // adopted; the items stay global. Evaluated per surface so no content is read.
     const envActive = surface.ownerEnv !== '' && (await environmentExists(paths, surface.ownerEnv));
+    let ignorePatterns: readonly string[] | undefined;
 
     for (const name of newNames) {
       const surfacePath = join(surface.dir, name);
@@ -257,6 +259,12 @@ export async function adoptSweep(req: AdoptSweepRequest): Promise<AdoptSweepResu
       // Guardrail 3 (project dir): never auto-adopt — project-static, team-shared.
       if (surface.scope === 'project') {
         result.skipped.push({ name, surfacePath, reason: 'project' });
+        continue;
+      }
+      ignorePatterns ??= (await readEnvConfig(paths, surface.ownerEnv)).capture?.ignore ?? [];
+      if (await itemMatchesCaptureIgnore(ignorePatterns, surface.storeKind, name, surfacePath)) {
+        result.skipped.push({ name, surfacePath, reason: 'ignored' });
+        note(`agentenv: ignoring '${name}' because it matches ${surface.ownerEnv}'s capture.ignore.`);
         continue;
       }
       // Junk gate, name half (Finding 2): a `.`-prefixed entry (`.DS_Store`, a
@@ -547,6 +555,14 @@ async function isAdoptableShape(
   return validateItemName(singular(storeKind), base.replace(/\.md$/i, '')) === null;
 }
 
+/** Public conservative shape check shared by launch-time generation adoption. */
+export function isAdoptableItemShape(
+  storeKind: 'skills' | 'agents' | 'commands',
+  surfacePath: string,
+): Promise<boolean> {
+  return isAdoptableShape(storeKind, surfacePath);
+}
+
 /**
  * Guardrail 1: whether `itemPath` is a symlink whose target is OUTSIDE the store
  * — the signature of another manager (the `skills` CLI links into `~/.agents/`).
@@ -584,6 +600,79 @@ async function pathHasSecret(itemPath: string): Promise<boolean> {
     return false;
   }
   return scanTextForSecrets(text).length > 0;
+}
+
+/**
+ * Whether a whole adoption candidate is excluded by an environment's capture
+ * patterns. Patterns are matched against both the surface-relative path and the
+ * store-kind-prefixed path; matching any nested path excludes the whole item so
+ * adoption never silently drops ignored children while moving their parent.
+ */
+export async function itemMatchesCaptureIgnore(
+  patterns: readonly string[],
+  storeKind: 'skills' | 'agents' | 'commands',
+  name: string,
+  itemPath: string,
+): Promise<boolean> {
+  if (patterns.length === 0) return false;
+  const paths = [normaliseCapturePath(name), normaliseCapturePath(`${storeKind}/${name}`)];
+  const visit = async (path: string, relativePath: string): Promise<void> => {
+    let st;
+    try {
+      st = await lstat(path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw err;
+    }
+    if (!st.isDirectory() || st.isSymbolicLink()) return;
+    for (const entry of await readdir(path, { withFileTypes: true })) {
+      const childRelative = normaliseCapturePath(`${relativePath}/${entry.name}`);
+      paths.push(childRelative, normaliseCapturePath(`${storeKind}/${childRelative}`));
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        await visit(join(path, entry.name), childRelative);
+      }
+    }
+  };
+  await visit(itemPath, name);
+  return patterns.some((pattern) => paths.some((path) => captureGlobMatches(pattern, path)));
+}
+
+function normaliseCapturePath(path: string): string {
+  return path.replaceAll('\\', '/').replace(/^\.\//, '').replace(/^\/+|\/+$/g, '');
+}
+
+function captureGlobMatches(rawPattern: string, rawPath: string): boolean {
+  const pattern = normaliseCapturePath(rawPattern.trim());
+  const path = normaliseCapturePath(rawPath);
+  if (pattern === '') return false;
+  let source = '^';
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index]!;
+    if (char === '*') {
+      if (pattern[index + 1] === '*') {
+        index += 1;
+        if (pattern[index + 1] === '/') {
+          index += 1;
+          source += '(?:.*/)?';
+        } else {
+          source += '.*';
+        }
+      } else {
+        source += '[^/]*';
+      }
+    } else if (char === '?') {
+      source += '[^/]';
+    } else {
+      source += char.replace(/[|\\{}()[\]^$+?.-]/g, '\\$&');
+    }
+  }
+  source += '$';
+  const expression = new RegExp(source);
+  if (expression.test(path)) return true;
+  if (!pattern.includes('/')) {
+    return path.split('/').some((segment) => expression.test(segment));
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
