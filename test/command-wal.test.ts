@@ -5,9 +5,10 @@ import {
   recoverCommandPlan,
   type CommandEffect,
 } from '../src/command-wal.js';
+import { withLock } from '../src/lock.js';
 import type { PathIdentity } from '../src/path-identity.js';
 import { resolvePaths } from '../src/paths.js';
-import { readState, type QuarantineRecord } from '../src/state.js';
+import { readState, writeState, type QuarantineRecord } from '../src/state.js';
 import { makeTempHome } from './helpers.js';
 
 const absent: PathIdentity = { kind: 'absent' };
@@ -69,6 +70,44 @@ describe('whole-command WAL executor', () => {
 
     expect(events).toEqual(['apply:a', 'apply:b', 'git']);
     expect((await readState(paths)).commands).toEqual([]);
+    th.cleanup();
+  });
+
+  it('runs effects outside the WAL lock and preserves state they commit under that lock', async () => {
+    const th = makeTempHome();
+    const paths = resolvePaths(th.env);
+    const state = { value: absent as PathIdentity };
+    const record: QuarantineRecord = {
+      schemaVersion: 2,
+      id: 'effect-state',
+      kind: 'effect-state',
+      path: '/a',
+      retainedPath: '/retained/a',
+      reason: 'proves nested state mutations survive WAL transitions',
+      createdAt: 1,
+      resolved: false,
+    };
+    const nested = effect('a', [], state);
+    nested.apply = async () => {
+      await withLock(
+        paths,
+        async () => {
+          const manifest = await readState(paths);
+          manifest.quarantine.push(record);
+          await writeState(paths, manifest);
+        },
+        { timeoutMs: 50, pollMs: 5 },
+      );
+      state.value = present('a');
+    };
+
+    await executeCommandPlan({
+      paths,
+      plan: plan(['a']),
+      effects: new Map([['a', nested]]),
+    });
+
+    expect((await readState(paths)).quarantine).toEqual([record]);
     th.cleanup();
   });
 
