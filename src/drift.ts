@@ -13,7 +13,7 @@ import { writeFileAtomic } from './fs-atomic.js';
 import { beginTransaction, recoverState } from './journal.js';
 import { withLock } from './lock.js';
 import type { Paths } from './paths.js';
-import { readState } from './state.js';
+import { readState, type StateManifest } from './state.js';
 
 /**
  * The per-invocation drift sweep (design D9). At the start of every mutating
@@ -47,6 +47,8 @@ export interface DriftSweepRequest {
   /** Adapters whose session views are swept (for the D15 session pass). */
   adapters: readonly Adapter[];
   env: NodeJS.ProcessEnv;
+  /** Restrict session-view scanning to these durable generations. */
+  generationIds?: readonly string[];
   onWarn?: (message: string) => void;
 }
 
@@ -148,7 +150,7 @@ export async function driftSweep(req: DriftSweepRequest): Promise<DriftSweepResu
   }
 
   // D) session-generated instruction files on disk (D15) → store instruction files.
-  await sweepSessionInstructions(req, result, onWarn);
+  await sweepSessionInstructions(req, manifest, result, onWarn);
 
   // TASK 2.1 HOOK POINT: `result.storePathsChanged` names every store file this
   // sweep touched. Task 2.1 commits them as `agentenv: sync drift` and queues a
@@ -336,6 +338,7 @@ function scanSubBlocks(text: string): SubBlockHit[] {
 
 async function sweepSessionInstructions(
   req: DriftSweepRequest,
+  manifest: StateManifest,
   result: DriftSweepResult,
   onWarn: (m: string) => void,
 ): Promise<void> {
@@ -343,17 +346,32 @@ async function sweepSessionInstructions(
   // The set of file-block instruction files each adapter generates, keyed by
   // adapter id → { relPath, layering }. Only INLINE surfaces carry content to
   // write back; import surfaces hold an include line, not editable content.
-  let sessions: string[];
-  try {
-    sessions = await readdir(paths.live);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return; // no session views yet
-    throw err;
+  const requested = req.generationIds ? new Set(req.generationIds) : null;
+  const roots: { adapter: Adapter; viewRoot: string }[] = [];
+  for (const generation of manifest.generations) {
+    if (requested && !requested.has(generation.id)) continue;
+    if (!['published', 'closing', 'sweeping'].includes(generation.phase)) continue;
+    if (!generation.adapterId || !generation.viewRoot) continue;
+    const adapter = adapters.find((candidate) => candidate.id === generation.adapterId);
+    if (adapter) roots.push({ adapter, viewRoot: generation.viewRoot });
   }
 
-  for (const session of sessions) {
-    for (const adapter of adapters) {
-      const viewRoot = join(paths.live, session, adapter.id);
+  // Preserve discovery of legacy mutable views until migration removes them.
+  if (!requested) {
+    let sessions: string[] = [];
+    try {
+      sessions = await readdir(paths.live);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    }
+    for (const session of sessions.filter((entry) => entry !== 'generations')) {
+      for (const adapter of adapters) {
+        roots.push({ adapter, viewRoot: join(paths.live, session, adapter.id) });
+      }
+    }
+  }
+
+  for (const { adapter, viewRoot } of roots) {
       for (const surface of adapter.surfaces) {
         if (surface.mechanism !== 'file-block' || !surface.supported || surface.layering !== 'inline') {
           continue;
@@ -383,6 +401,5 @@ async function sweepSessionInstructions(
           }
         }
       }
-    }
   }
 }

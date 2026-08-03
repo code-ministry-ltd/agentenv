@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import type { Adapter, SelfCheckContext } from '../adapter.js';
 import { renderSessionLaunch } from '../adapter-v2.js';
+import { driftSweep } from '../drift.js';
 import type { Paths } from '../paths.js';
 import { loadSecrets } from '../secrets.js';
 import { readState } from '../state.js';
@@ -9,7 +10,10 @@ import { composeView, type SurfaceSkip } from './composer.js';
 import { defaultCapture, defaultExecHarness, type CaptureFn, type ExecHarness } from './exec.js';
 import {
   attachSessionGenerationLease,
+  beginSessionGenerationSweep,
   beginSessionGeneration,
+  closeSessionGeneration,
+  completeSessionGenerationSweep,
   publishSessionGeneration,
   quarantineSessionGeneration,
   reserveSessionGeneration,
@@ -282,7 +286,16 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
   } finally {
     if (!lifecycleFailed) {
       try {
-        await sweepSessionGeneration(paths, generationId, reservationId, now());
+        await closeSessionGeneration(paths, generationId, reservationId, now());
+        await beginSessionGenerationSweep(paths, generationId);
+        await driftSweep({
+          paths,
+          adapters: [adapter],
+          env: execEnv,
+          generationIds: [generationId],
+          onWarn: (message) => notices.push(message),
+        });
+        await completeSessionGenerationSweep(paths, generationId, now());
       } catch (err) {
         notices.push(
           `agentenv: final generation sweep failed; retained for resolution ` +

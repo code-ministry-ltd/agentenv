@@ -134,6 +134,42 @@ export function sweepSessionGeneration(
   });
 }
 
+/** Release the launch reference and prevent any new reservation. */
+export function closeSessionGeneration(
+  paths: Paths,
+  id: string,
+  reservationId: string,
+  now: number,
+): Promise<ViewGeneration> {
+  return updateGeneration(paths, id, (current) => {
+    let generation = current;
+    if (generation.leases.some((lease) => lease.reservationId === reservationId)) {
+      generation = releaseGenerationLease(generation, reservationId);
+    } else if (generation.reservations.includes(reservationId)) {
+      generation = cancelGenerationReservation(generation, reservationId);
+    }
+    return { ...closeGeneration(generation), closedAt: now };
+  });
+}
+
+export function beginSessionGenerationSweep(
+  paths: Paths,
+  id: string,
+): Promise<ViewGeneration> {
+  return updateGeneration(paths, id, beginGenerationSweep);
+}
+
+export function completeSessionGenerationSweep(
+  paths: Paths,
+  id: string,
+  now: number,
+): Promise<ViewGeneration> {
+  return updateGeneration(paths, id, (generation) => ({
+    ...completeGenerationSweep(generation),
+    sweptAt: now,
+  }));
+}
+
 /** Preserve uncertain bytes and lifecycle references for explicit resolution. */
 export function quarantineSessionGeneration(
   paths: Paths,

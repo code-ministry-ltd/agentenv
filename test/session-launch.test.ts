@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { resolvePaths } from '../src/paths.js';
@@ -117,6 +117,42 @@ describe('session launch', () => {
     expect(result.viewRoot).toContain(join('live', 'generations', generationId));
     const swept = (await readState(paths)).generations.find((g) => g.id === generationId);
     expect(swept).toMatchObject({ phase: 'swept', reservations: [], leases: [] });
+  });
+
+  it('writes inline instruction drift back from its immutable generation before sweep completes', async () => {
+    const th = home();
+    const { paths, env } = scenario(th);
+    const storeInstruction = join(paths.envDir('writing'), 'instructions', 'base.md');
+    mkdirSync(join(paths.envDir('writing'), 'instructions'), { recursive: true });
+    writeFileSync(storeInstruction, 'ORIGINAL INSTRUCTION\n');
+    const exec: ExecHarness = async (spec) => {
+      const onSpawn = spec.onSpawn;
+      await onSpawn?.({
+        processGroupId: 4200,
+        pid: 4201,
+        processStart: 'fixture-start-4201',
+      });
+      const viewRoot = spec.env[FIXTURE_CONFIG_ENV];
+      if (!viewRoot) throw new Error('fixture view root missing');
+      const instructionFile = join(viewRoot, 'INSTRUCTIONS.md');
+      const generated = readFileSync(instructionFile, 'utf8');
+      writeFileSync(
+        instructionFile,
+        generated.replace('ORIGINAL INSTRUCTION', 'EDITED IN HARNESS'),
+      );
+      return 0;
+    };
+
+    const result = await launchHarness(
+      req({ paths, adapter: makeFixtureAdapter(), env, execHarness: exec }),
+    );
+
+    expect(result.mode).toBe('applied');
+    expect(readFileSync(storeInstruction, 'utf8')).toBe('EDITED IN HARNESS\n');
+    const generation = (await readState(paths)).generations.find(
+      (candidate) => candidate.id === result.generationId,
+    );
+    expect(generation?.phase).toBe('swept');
   });
 
   it('uses Adapter v2 launch arguments, environment, and optional root override', async () => {
