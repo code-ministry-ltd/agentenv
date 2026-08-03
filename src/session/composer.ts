@@ -76,6 +76,12 @@ export interface ComposeRequest {
   envs: readonly string[];
   /** The shell session id → `live/<session>/`. */
   session: string;
+  /**
+   * Durable lifecycle id. When present, publish beneath
+   * `live/generations/<id>/` and never replace an existing generation.
+   * Omitted only by legacy/direct composer callers.
+   */
+  generationId?: string;
   /** Where the harness reads config absent an override — the composition source. */
   realConfigRoot: string;
   /**
@@ -113,6 +119,8 @@ export interface ComposeResult {
   generation: number;
   /** Surfaces skipped (unsupported / collision), for `status`. */
   skipped: SurfaceSkip[];
+  /** Complete launch-time inventory captured from the published bytes. */
+  inventory: ViewInventoryEntry[];
 }
 
 /** Persisted beside the view: the staleness marker + build counter. */
@@ -154,8 +162,12 @@ export async function composeView(req: ComposeRequest): Promise<ComposeResult> {
   // escape it (empty, `.`/`..`, or a separator) before it is joined (L5). A throw
   // here fails open in the launch — a hostile session id never composes.
   assertSafeSegment(session, 'session id');
+  if (req.generationId) assertSafeSegment(req.generationId, 'generation id');
 
-  const sessionDir = join(paths.live, session);
+  const immutable = req.generationId !== undefined;
+  const sessionDir = immutable
+    ? join(paths.live, 'generations', req.generationId!)
+    : join(paths.live, session);
   const viewRoot = join(sessionDir, adapter.id);
   const metaPath = join(sessionDir, `${adapter.id}.meta.json`);
 
@@ -175,7 +187,12 @@ export async function composeView(req: ComposeRequest): Promise<ComposeResult> {
       fingerprint,
       generation: prevMeta.generation,
       skipped: [],
+      inventory: prevMeta.inventory,
     };
+  }
+
+  if (immutable && (prevMeta || (await pathExists(viewRoot)))) {
+    throw new Error(`generation '${req.generationId}' is already published and immutable`);
   }
 
   // Rebuild: compose into a temp dir, then publish by atomic rename.
@@ -211,12 +228,12 @@ export async function composeView(req: ComposeRequest): Promise<ComposeResult> {
     }
     await composeRawMappings(req, buildDir, skipped, onWarn);
     const inventory = await captureViewInventory(req, buildDir, viewRoot);
-    await publishAtomically(sessionDir, adapter.id, buildDir, viewRoot);
+    await publishAtomically(sessionDir, adapter.id, buildDir, viewRoot, immutable);
 
     const generation = (prevMeta?.generation ?? 0) + 1;
     const meta: ViewMeta = { fingerprint, generation, builtAt: now(), viewRoot, inventory };
     await writeFileAtomic(metaPath, `${JSON.stringify(meta, null, 2)}\n`);
-    return { viewRoot, rebuilt: true, fingerprint, generation, skipped };
+    return { viewRoot, rebuilt: true, fingerprint, generation, skipped, inventory };
   } catch (err) {
     await rm(buildDir, { recursive: true, force: true });
     throw err;
@@ -775,7 +792,12 @@ async function publishAtomically(
   harnessId: string,
   buildDir: string,
   viewRoot: string,
+  immutable = false,
 ): Promise<void> {
+  if (immutable) {
+    await rename(buildDir, viewRoot);
+    return;
+  }
   const graveyard = join(sessionDir, `${harnessId}.old-${rand()}`);
   let hadOld = false;
   try {

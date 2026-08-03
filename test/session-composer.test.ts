@@ -140,6 +140,40 @@ describe('session view composer', () => {
     expect(readFileSync(join(second.viewRoot, 'INSTRUCTIONS.md'), 'utf8')).toContain('EDITED instructions');
   });
 
+  it('publishes named generations immutably and returns their complete inventory', async () => {
+    const th = home();
+    const paths = resolvePaths(th.env);
+    const realRoot = join(th.home, 'real');
+    seedRealRoot(realRoot);
+    const envDir = paths.envDir('writing');
+    mkdirSync(envDir, { recursive: true });
+    seedEnv(envDir, 'writing');
+
+    const first = await composeView({
+      ...baseReq(th, realRoot, ['writing']),
+      generationId: 'gen-a',
+    } as ComposeRequest);
+    const firstBytes = readFileSync(join(first.viewRoot, 'INSTRUCTIONS.md'), 'utf8');
+
+    writeFileSync(join(envDir, 'instructions', 'base.md'), 'SECOND GENERATION\n');
+    const second = await composeView({
+      ...baseReq(th, realRoot, ['writing']),
+      generationId: 'gen-b',
+    } as ComposeRequest);
+
+    expect(first.viewRoot).not.toBe(second.viewRoot);
+    expect(first.viewRoot).toContain(join('live', 'generations', 'gen-a'));
+    expect(readFileSync(join(first.viewRoot, 'INSTRUCTIONS.md'), 'utf8')).toBe(firstBytes);
+    expect(readFileSync(join(second.viewRoot, 'INSTRUCTIONS.md'), 'utf8')).toContain(
+      'SECOND GENERATION',
+    );
+    expect(first.inventory.map((entry) => entry.surfaceId).sort()).toEqual([
+      'instructions',
+      'mcp',
+      'skills',
+    ]);
+  });
+
   it('AC: a kill mid-build (leftover temp dir) is discarded; the published view is only ever whole', async () => {
     const th = home();
     const paths = resolvePaths(th.env);
