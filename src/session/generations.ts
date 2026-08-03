@@ -1,6 +1,7 @@
 import { withLock } from '../lock.js';
 import type { Paths } from '../paths.js';
 import { readState, writeState } from '../state.js';
+import { recoverPendingFilesystemBundles } from '../filesystem-bundle.js';
 import {
   attachGenerationLease,
   beginGenerationSweep,
@@ -180,5 +181,33 @@ export function quarantineSessionGeneration(
     ...generation,
     phase: 'quarantined',
     failure,
+  }));
+}
+
+/** Resume a committed final sweep whose required local Git bookkeeping failed. */
+export async function resumeSessionGenerationSweep(
+  paths: Paths,
+  id: string,
+  gitBookkeeping: () => Promise<void>,
+  now: number,
+): Promise<ViewGeneration> {
+  const transactionId = `generation-${id}`;
+  const before = await readState(paths);
+  const generation = before.generations.find((candidate) => candidate.id === id);
+  if (!generation) throw new Error(`unknown generation '${id}'`);
+  if (generation.phase !== 'quarantined' && generation.phase !== 'sweeping') {
+    throw new Error(`generation must be quarantined or sweeping; it is ${generation.phase}`);
+  }
+  const pending = before.commands.find((plan) => plan.transactionId === transactionId);
+  if (!pending) throw new Error('generation has no retained final-sweep command');
+  await recoverPendingFilesystemBundles(paths, gitBookkeeping);
+  if (!pending.commitPoint) {
+    throw new Error('interrupted final-sweep publication was rolled back; retained generation remains');
+  }
+  return updateGeneration(paths, id, (current) => ({
+    ...current,
+    phase: 'swept',
+    sweptAt: now,
+    failure: undefined,
   }));
 }

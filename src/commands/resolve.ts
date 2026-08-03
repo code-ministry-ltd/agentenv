@@ -4,6 +4,7 @@ import type { Command, CommandContext, RunResult } from '../command.js';
 import { reconcileRetiredGlobalCows } from '../global-cow.js';
 import { withLock } from '../lock.js';
 import { resolveRetainedCandidate } from '../sync.js';
+import { resumeSessionGenerationSweep } from '../session/generations.js';
 import { readState, writeState } from '../state.js';
 import {
   closeStoreSync,
@@ -23,6 +24,7 @@ function fail(stderr: string): RunResult {
 const usage =
   'Usage:\n' +
   '  agentenv resolve projection <id> --quiescent\n' +
+  '  agentenv resolve generation <id> --retry\n' +
   '  agentenv resolve candidate <id> (--retry | --abandon)\n' +
   '  agentenv resolve rescue <id> --acknowledge\n';
 
@@ -109,6 +111,35 @@ async function resolveCandidate(ctx: CommandContext, id: string, rest: readonly 
   return ok(`Abandoned candidate '${id}'; its isolated worktree remains retained.\n`);
 }
 
+async function resolveGeneration(ctx: CommandContext, id: string, rest: readonly string[]): Promise<RunResult> {
+  const parsed = parseArgs(rest, { booleans: ['retry'] });
+  if (
+    parsed.unknown.length > 0 ||
+    parsed.positionals.length > 0 ||
+    !parsed.booleans.has('retry')
+  ) {
+    return fail(`resolve generation: an explicit --retry is required\n${usage}`);
+  }
+  const notices: string[] = [];
+  try {
+    await resumeSessionGenerationSweep(
+      ctx.paths,
+      id,
+      () =>
+        commitRequiredMutation(
+          { paths: ctx.paths, env: ctx.env, options: ctx.options },
+          `agentenv: sweep session generation ${id}`,
+          notices,
+        ),
+      (ctx.options.now ?? Date.now)(),
+    );
+  } catch (error) {
+    return fail(`resolve generation: ${(error as Error).message}\n`);
+  }
+  await closeStoreSync({ paths: ctx.paths, env: ctx.env, options: ctx.options }, notices);
+  return withNotices(ok(`Completed retained final sweep for generation '${id}'.\n`), notices);
+}
+
 async function resolveRescue(ctx: CommandContext, id: string, rest: readonly string[]): Promise<RunResult> {
   const parsed = parseArgs(rest, { booleans: ['acknowledge'] });
   if (
@@ -149,6 +180,8 @@ export const resolveCommand: Command = {
         return resolveProjection(ctx, id, rest);
       case 'candidate':
         return resolveCandidate(ctx, id, rest);
+      case 'generation':
+        return resolveGeneration(ctx, id, rest);
       case 'rescue':
         return resolveRescue(ctx, id, rest);
       default:

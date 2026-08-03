@@ -207,6 +207,18 @@ describe('session launch', () => {
     expect((await readState(paths)).commands).toMatchObject([
       { transactionId: `generation-${result.generationId}`, phase: 'git-pending' },
     ]);
+
+    const retried = await run(
+      ['resolve', 'generation', result.generationId!, '--retry'],
+      { env, adapters: [makeFixtureAdapter()] },
+    );
+    expect(retried.code, `${retried.stdout}${retried.stderr ?? ''}`).toBe(0);
+    expect(
+      (await readState(paths)).generations.find(
+        (candidate) => candidate.id === result.generationId,
+      ),
+    ).toMatchObject({ phase: 'swept' });
+    expect((await readState(paths)).commands).toEqual([]);
   });
 
   it('rolls final instruction drift back when canonical WAL publication faults', async () => {
