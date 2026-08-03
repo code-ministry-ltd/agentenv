@@ -12,9 +12,10 @@
 #   1. npm pack                              → the release artifact
 #   2. npm install -g <tgz> --prefix <tmp>   → a clean global install
 #   3. machine A: init → create → add skill/instructions/mcp → remote → sync
-#   4. machine B: init --remote → list → use --global
-#   5. assert the env materialised on TWO harnesses (Claude Code and Codex)
-#   6. env-less drop --global and assert the surfaces were handed back
+#   4. machine B: init --remote → list
+#   5. launch Codex through a composed private session view
+#   6. use --global and assert TWO harnesses (Claude Code and Codex)
+#   7. env-less drop --global and assert the surfaces were handed back
 #
 # SAFETY. Every agentenv invocation runs with BOTH `AGENTENV_HOME` and `HOME`
 # pointed at throwaway temp directories, so:
@@ -89,6 +90,7 @@ on_machine() {
   HOME="$home" \
   AGENTENV_HOME="$agentenv_home" \
   AGENTENV_SESSION="smoke-$$" \
+  PATH="$home/bin:$PREFIX/bin:$PATH" \
   GIT_CONFIG_GLOBAL="$home/.gitconfig" \
   GIT_CONFIG_SYSTEM=/dev/null \
   GIT_TERMINAL_PROMPT=0 \
@@ -192,9 +194,36 @@ ok "machine B cloned the store and sees 'writing'"
 assert_contains "$B_AGENTENV/store/environments/writing/skills/tone-of-voice/SKILL.md" \
   'SMOKE-SKILL-MARKER'
 
-# --- 5. activate, and assert TWO harnesses ------------------------------------
+# --- 5. activate in session mode, then assert TWO global harnesses ------------
 
-step "5. machine B — activate globally and check two harnesses"
+step "5. machine B — launch a composed session from the installed artifact"
+mkdir -p "$B_HOME/bin"
+FAKE_CODEX="$B_HOME/bin/codex"
+cat > "$FAKE_CODEX" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = mcp ] && [ "${2:-}" = get ]; then
+  printf '{"name":"%s"}\n' "${3:-}"
+  exit 0
+fi
+if [ "${1:-}" = mcp ] && [ "${2:-}" = list ]; then
+  printf '[]\n'
+  exit 0
+fi
+: "${CODEX_HOME:?agentenv did not provide a private CODEX_HOME}"
+grep -qF 'SMOKE-SKILL-MARKER' "$CODEX_HOME/skills/tone-of-voice/SKILL.md"
+grep -qF 'SMOKE-INSTRUCTIONS-MARKER' "$CODEX_HOME/AGENTS.md"
+grep -qF 'filesystem' "$CODEX_HOME/config.toml"
+printf 'SESSION-PROBE-PASS\n'
+EOF
+chmod +x "$FAKE_CODEX"
+
+SESSION_OUT="$WORK/session-probe.out"
+b run writing -- codex > "$SESSION_OUT"
+assert_contains "$SESSION_OUT" 'SESSION-PROBE-PASS'
+ok "installed CLI launched Codex against a composed private session view"
+
+step "6. machine B — activate globally and check two harnesses"
 b use writing --global >/dev/null
 
 echo "  -- harness 1: Claude Code"
@@ -214,9 +243,9 @@ ok "status reports the global stack"
 
 assert_no_home_fallback
 
-# --- 6. hand it all back ------------------------------------------------------
+# --- 7. hand it all back ------------------------------------------------------
 
-step "6. machine B — drop the stack and check the surfaces came back"
+step "7. machine B — drop the stack and check the surfaces came back"
 b drop --global >/dev/null
 
 assert_missing "$B_HOME/.claude/skills/tone-of-voice"
