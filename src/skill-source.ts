@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
-import { access } from 'node:fs/promises';
+import { access, mkdtemp, readdir, readFile, readlink, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -378,9 +377,14 @@ export async function scanSkillDirs(root: string): Promise<SkillCandidate[]> {
   return found;
 }
 
-/** Relative POSIX-style paths of every file under `dir` (excluding `.git`), sorted. */
-async function listFiles(dir: string): Promise<string[]> {
-  const files: string[] = [];
+interface SourceTreeEntry {
+  path: string;
+  kind: 'file' | 'symlink';
+}
+
+/** Relative POSIX-style paths and types, never following symlinks. */
+async function listTreeEntries(dir: string): Promise<SourceTreeEntry[]> {
+  const found: SourceTreeEntry[] = [];
   const walk = async (current: string): Promise<void> => {
     let entries;
     try {
@@ -392,11 +396,16 @@ async function listFiles(dir: string): Promise<string[]> {
       if (entry.name === '.git') continue;
       const full = join(current, entry.name);
       if (entry.isDirectory()) await walk(full);
-      else if (entry.isFile()) files.push(relative(dir, full).split(sep).join('/'));
+      else if (entry.isFile() || entry.isSymbolicLink()) {
+        found.push({
+          path: relative(dir, full).split(sep).join('/'),
+          kind: entry.isSymbolicLink() ? 'symlink' : 'file',
+        });
+      }
     }
   };
   await walk(dir);
-  return files.sort((a, b) => a.localeCompare(b));
+  return found.sort((a, b) => a.path.localeCompare(b.path));
 }
 
 /** A line-level diff (LCS) between two texts, unified-style (` `/`-`/`+`). */
@@ -446,19 +455,34 @@ async function readMaybe(p: string): Promise<string | null> {
  * unified line diff. Returns '' when the trees are byte-identical.
  */
 export async function diffDirs(oldDir: string, newDir: string): Promise<string> {
-  const oldFiles = new Set(await listFiles(oldDir));
-  const newFiles = new Set(await listFiles(newDir));
-  const all = [...new Set([...oldFiles, ...newFiles])].sort((a, b) => a.localeCompare(b));
+  const oldEntries = new Map((await listTreeEntries(oldDir)).map((entry) => [entry.path, entry]));
+  const newEntries = new Map((await listTreeEntries(newDir)).map((entry) => [entry.path, entry]));
+  const all = [...new Set([...oldEntries.keys(), ...newEntries.keys()])].sort((a, b) =>
+    a.localeCompare(b),
+  );
   const lines: string[] = [];
   for (const rel of all) {
-    const inOld = oldFiles.has(rel);
-    const inNew = newFiles.has(rel);
-    if (inOld && !inNew) {
+    const oldEntry = oldEntries.get(rel);
+    const newEntry = newEntries.get(rel);
+    if (oldEntry && !newEntry) {
       lines.push(`  removed: ${rel}`);
       continue;
     }
-    if (!inOld && inNew) {
+    if (!oldEntry && newEntry) {
       lines.push(`  added:   ${rel}`);
+      continue;
+    }
+    if (!oldEntry || !newEntry) continue;
+    if (oldEntry.kind !== newEntry.kind) {
+      lines.push(`  changed: ${rel} (${oldEntry.kind} -> ${newEntry.kind})`);
+      continue;
+    }
+    if (oldEntry.kind === 'symlink') {
+      const oldTarget = await readlink(join(oldDir, rel));
+      const newTarget = await readlink(join(newDir, rel));
+      if (oldTarget !== newTarget) {
+        lines.push(`  changed: ${rel} (symlink)`, `    -${oldTarget}`, `    +${newTarget}`);
+      }
       continue;
     }
     const oldText = await readMaybe(join(oldDir, rel));
@@ -493,26 +517,15 @@ async function readDescription(dir: string): Promise<string> {
  * excluded. Returns a hex digest.
  */
 export async function hashDir(dir: string): Promise<string> {
-  const files: string[] = [];
-  const walk = async (current: string): Promise<void> => {
-    const entries = await readdir(current, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.name === '.git') continue;
-      const full = join(current, entry.name);
-      if (entry.isDirectory()) {
-        await walk(full);
-      } else if (entry.isFile()) {
-        files.push(full);
-      }
-    }
-  };
-  await walk(dir);
-  files.sort((a, b) => relative(dir, a).localeCompare(relative(dir, b)));
   const hash = createHash('sha256');
-  for (const file of files) {
-    hash.update(relative(dir, file).split(sep).join('/'));
+  for (const entry of await listTreeEntries(dir)) {
+    const absolute = join(dir, entry.path);
+    hash.update(entry.path);
     hash.update('\0');
-    hash.update(await readFile(file));
+    hash.update(entry.kind);
+    hash.update('\0');
+    if (entry.kind === 'symlink') hash.update(await readlink(absolute));
+    else hash.update(await readFile(absolute));
     hash.update('\0');
   }
   return hash.digest('hex');

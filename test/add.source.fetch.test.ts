@@ -1,10 +1,11 @@
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   fetchSkillSource,
+  diffDirs,
   hashDir,
   resolveSkillSource,
   scanSkillDirs,
@@ -123,5 +124,23 @@ describe('add.source: hashDir', () => {
     expect(ha).toBe(hb);
     expect(ha).not.toBe(hc);
     expect(ha).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('hashes and diffs symlink identity without following the target', async () => {
+    const files = {
+      'SKILL.md': 'x',
+      'targets/one.txt': 'same bytes',
+      'targets/two.txt': 'same bytes',
+    };
+    const a = makeDir(files);
+    const b = makeDir(files);
+    symlinkSync('targets/one.txt', join(a, 'resource'));
+    symlinkSync('targets/two.txt', join(b, 'resource'));
+
+    expect(await hashDir(a)).not.toBe(await hashDir(b));
+    const diff = await diffDirs(a, b);
+    expect(diff).toContain('changed: resource (symlink)');
+    expect(diff).toContain('targets/one.txt');
+    expect(diff).toContain('targets/two.txt');
   });
 });
