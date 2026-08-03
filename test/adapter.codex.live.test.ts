@@ -3,16 +3,16 @@
  *
  * Codex config ISOLATION is fully verifiable while UNAUTHENTICATED (`codex mcp get`
  * reads `[mcp_servers.*]` from `$CODEX_HOME/config.toml` and prints each server's
- * name regardless of auth), so unlike Claude's live test this runs whenever `codex`
- * is installed — it is offline and deterministic (a stdio probe server never
- * connects). Live-login / auth pass-through is DEFERRED: no Codex account exists on
- * the reference machine, so `~/.codex/auth.json` is absent (spike caveat).
+ * name regardless of auth). It is still explicitly gated by `AGENTENV_LIVE=1` so
+ * a host-installed binary can never make the hermetic suite slow or flaky.
+ * Live-login / auth pass-through is DEFERRED: no Codex account exists on the
+ * reference machine, so `~/.codex/auth.json` is absent (spike caveat).
  *
  * SAFETY: the real `~/.codex` is only ever READ. `realConfigRoot` is a COPY; the
  * child is pointed only at the composed VIEW. A before/after sha of the real
  * config proves it is untouched. Every `codex` call is hard-timed.
  *
- * Run just this:  npm test -- test/adapter.codex.live.test.ts
+ * Run just this:  AGENTENV_LIVE=1 npm run test:live -- test/adapter.codex.live.test.ts
  */
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -68,7 +68,9 @@ function realConfigSha(): string {
   return h.digest('hex');
 }
 
-describe.skipIf(!hasCodex)('adapter.codex — live config isolation on a COPY of real ~/.codex', () => {
+const canRun = process.env.AGENTENV_LIVE === '1' && hasCodex;
+
+describe.skipIf(!canRun)('adapter.codex — live config isolation on a COPY of real ~/.codex', () => {
   it(
     'composes a session view whose child (`codex mcp get`) observes only the view',
     async () => {
