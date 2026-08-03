@@ -104,7 +104,7 @@ describe('adapter.pi — global materialise/restore (AC)', () => {
     seedPiHome(realHome);
     seedWritingEnv(paths.envDir('writing'));
     // realConfigRoot(env) reads PI_CODING_AGENT_DIR → point Pi at the copy.
-    const env: NodeJS.ProcessEnv = { ...th.env, PI_CODING_AGENT_DIR: realHome };
+    const env: NodeJS.ProcessEnv = { ...th.env, HOME: th.home, PI_CODING_AGENT_DIR: realHome };
     const opts = { env, adapters: [piAdapter] };
 
     const before = hashTree(realHome);
@@ -118,11 +118,11 @@ describe('adapter.pi — global materialise/restore (AC)', () => {
 
     // Global writers receive retained COW copies; the prompts surface draws
     // from the env's `commands/` store content (storeKind ≠ rootRelativePath).
-    for (const [dir, name, storeSub] of [
-      ['skills', 'w-skill', 'skills'],
-      ['prompts', 'w-cmd.md', 'commands'],
+    for (const [root, dir, name, storeSub] of [
+      [join(th.home, '.agents'), 'skills', 'w-skill', 'skills'],
+      [realHome, 'prompts', 'w-cmd.md', 'commands'],
     ] as const) {
-      const link = join(realHome, dir, name);
+      const link = join(root, dir, name);
       expect(lstatSync(link).isSymbolicLink()).toBe(false);
       const source = join(paths.envDir('writing'), storeSub, name);
       const leaf = name.endsWith('.md') ? '' : 'SKILL.md';
@@ -173,6 +173,7 @@ describe('adapter.pi — global materialise/restore (AC)', () => {
     expect(JSON.parse(afterSettingsBytes)).toEqual(JSON.parse(beforeSettingsBytes)); // data restored
     expect(afterSettingsBytes).not.toContain('@acme/writing-pack'); // env element gone
     expect(afterSettingsBytes).not.toMatch(/agentenv/); // no ownership residue
+    expect(() => lstatSync(join(th.home, '.agents', 'skills', 'w-skill'))).toThrow();
 
     const after = await readState(paths);
     expect(after.items).toEqual([]);

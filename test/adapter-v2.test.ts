@@ -56,6 +56,24 @@ describe('Adapter v2 contract', () => {
     });
   });
 
+  it('renders a parent-view placeholder for XDG-style config roots', () => {
+    const adapter = claudeLike();
+    adapter.session = {
+      supported: true,
+      launch: {
+        environment: { XDG_CONFIG_HOME: '{viewParent}' },
+        rootOverride: { variable: 'OPENCODE_CONFIG_DIR' },
+      },
+    };
+    expect(renderSessionLaunch(adapter, '/private/generation/opencode', [])).toEqual({
+      args: [],
+      env: {
+        XDG_CONFIG_HOME: '/private/generation',
+        OPENCODE_CONFIG_DIR: '/private/generation/opencode',
+      },
+    });
+  });
+
   it('resolves independent session and global destinations from explicit roots', () => {
     const surface = claudeLike().surfaces[0]!;
     expect(

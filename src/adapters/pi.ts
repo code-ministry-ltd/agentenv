@@ -1,7 +1,6 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type {
   Adapter,
@@ -14,6 +13,7 @@ import type {
   SurfaceDeclaration,
 } from '../adapter.js';
 import type { JsonValue } from '../config-keys.js';
+import { userHome, type AdapterV2 } from '../adapter-v2.js';
 import { resolveBinaryOnPath } from '../session/resolve.js';
 
 /**
@@ -136,6 +136,106 @@ const SURFACES: readonly SurfaceDeclaration[] = [
   },
 ];
 
+export const piDefinition: AdapterV2 = {
+  version: 2,
+  id: 'pi',
+  binaryName: 'pi',
+  session: {
+    supported: true,
+    launch: { rootOverride: { variable: CONFIG_ROOT_ENV } },
+  },
+  surfaces: [
+    {
+      id: 'skills',
+      storeKind: 'skills',
+      composition: { mechanism: 'dir-merge', mode: 'symlink' },
+      session: {
+        supported: true,
+        destination: { root: 'view', relativePath: 'skills' },
+        writer: 'direct',
+        hotReload: true,
+        adopt: true,
+      },
+      global: {
+        supported: true,
+        destination: { root: 'agents-standard', relativePath: '' },
+        writer: 'projection',
+        hotReload: true,
+        adopt: true,
+      },
+    },
+    {
+      id: 'instructions',
+      storeKind: 'instructions',
+      composition: { mechanism: 'file-block', layering: 'inline' },
+      session: {
+        supported: true,
+        destination: { root: 'view', relativePath: 'AGENTS.md' },
+        writer: 'direct',
+        inheritUserContent: true,
+      },
+      global: {
+        supported: true,
+        destination: { root: 'config', relativePath: 'AGENTS.md' },
+        writer: 'projection',
+      },
+    },
+    {
+      id: 'prompts',
+      storeKind: 'commands',
+      composition: { mechanism: 'dir-merge', mode: 'symlink' },
+      session: {
+        supported: true,
+        destination: { root: 'view', relativePath: 'prompts' },
+        writer: 'direct',
+        hotReload: true,
+        adopt: true,
+      },
+      global: {
+        supported: true,
+        destination: { root: 'config', relativePath: 'prompts' },
+        writer: 'projection',
+        hotReload: true,
+        adopt: true,
+      },
+    },
+    {
+      id: 'settings',
+      storeKind: 'files',
+      composition: {
+        mechanism: 'config-keys',
+        format: 'json',
+        style: 'array-element',
+        keyPath: ['packages'],
+      },
+      session: {
+        supported: true,
+        destination: { root: 'view', relativePath: 'settings.json' },
+        writer: 'direct',
+        inheritUserContent: true,
+      },
+      global: {
+        supported: true,
+        destination: { root: 'config', relativePath: 'settings.json' },
+        writer: 'projection',
+      },
+    },
+    {
+      id: 'mcp',
+      storeKind: 'mcp',
+      composition: {
+        mechanism: 'config-keys',
+        format: 'json',
+        style: 'keyed',
+        keyPath: ['mcpServers'],
+      },
+      session: { supported: false, reason: 'Pi has no native MCP support' },
+      global: { supported: false, reason: 'Pi has no native MCP support' },
+    },
+  ],
+  rawMappings: [],
+};
+
 /** Is `v` a plain (non-array) object? */
 function isObject(v: unknown): v is Record<string, JsonValue> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -185,6 +285,7 @@ async function readEnvSettings(envContentDir: string): Promise<Record<string, Js
 export const piAdapter: Adapter = {
   id: 'pi',
   binaryName: 'pi',
+  definition: piDefinition,
 
   sessionSupported: true,
 
@@ -201,7 +302,7 @@ export const piAdapter: Adapter = {
     if (configured && configured.trim() !== '') return configured;
     // Config root is ~/.pi/agent/, NOT ~/.pi/ (the bare ~/.pi/skills/ is not a load
     // location — live-verified against 0.80.3).
-    return join(homedir(), '.pi', 'agent');
+    return join(userHome(env), '.pi', 'agent');
   },
 
   surfaces: SURFACES,

@@ -91,7 +91,7 @@ describe('adapter.cursor — global materialise/restore (AC)', () => {
     seedCursorHome(realHome);
     seedWritingEnv(paths.envDir('writing'));
     // realConfigRoot(env) reads CURSOR_CONFIG_DIR → point the adapter at the copy.
-    const env: NodeJS.ProcessEnv = { ...th.env, CURSOR_CONFIG_DIR: realHome };
+    const env: NodeJS.ProcessEnv = { ...th.env, HOME: th.home, CURSOR_CONFIG_DIR: realHome };
     const opts = { env, adapters: [cursorAdapter] };
 
     const before = hashTree(realHome);
@@ -101,7 +101,7 @@ describe('adapter.cursor — global materialise/restore (AC)', () => {
     expect(hashTree(realHome)).not.toBe(before); // something changed
 
     // The env skill is a retained COW copy beside the user's own skill.
-    const wSkill = join(realHome, 'skills', 'w-skill');
+    const wSkill = join(th.home, '.agents', 'skills', 'w-skill');
     expect(lstatSync(wSkill).isSymbolicLink()).toBe(false);
     expect(readFileSync(join(wSkill, 'SKILL.md'), 'utf8')).toBe('# w skill\n');
     expect(readFileSync(join(realHome, 'skills', 'user-skill', 'SKILL.md'), 'utf8')).toBe(
@@ -140,6 +140,7 @@ describe('adapter.cursor — global materialise/restore (AC)', () => {
     const dropped = await run(['drop', '--global', '--all'], opts);
     expect(dropped.code).toBe(0);
     expect(hashTree(realHome)).toBe(before);
+    expect(() => lstatSync(wSkill)).toThrow();
     const after = await readState(paths);
     expect(after.items).toEqual([]);
     expect(after.globalStack).toEqual([]);

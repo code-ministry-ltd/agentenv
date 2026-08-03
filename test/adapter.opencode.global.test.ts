@@ -115,7 +115,7 @@ describe('adapter.opencode — global materialise/restore (AC)', () => {
     const realHome = join(xdgBase, 'opencode');
     seedOpencodeHome(realHome);
     seedWritingEnv(paths.envDir('writing'));
-    const env: NodeJS.ProcessEnv = { ...th.env, XDG_CONFIG_HOME: xdgBase };
+    const env: NodeJS.ProcessEnv = { ...th.env, HOME: th.home, XDG_CONFIG_HOME: xdgBase };
     expect(opencodeAdapter.realConfigRoot(env)).toBe(realHome);
     const opts = { env, adapters: [opencodeAdapter] };
 
@@ -126,12 +126,12 @@ describe('adapter.opencode — global materialise/restore (AC)', () => {
     expect(hashTree(realHome)).not.toBe(before); // something changed
 
     // Global writers receive retained COW copies; user items remain intact.
-    for (const [dir, name, storeSub] of [
-      ['skills', 'w-skill', 'skills'],
-      ['agents', 'w-agent.md', 'agents'],
-      ['commands', 'w-cmd.md', 'commands'],
+    for (const [root, dir, name, storeSub] of [
+      [join(th.home, '.agents'), 'skills', 'w-skill', 'skills'],
+      [realHome, 'agents', 'w-agent.md', 'agents'],
+      [realHome, 'commands', 'w-cmd.md', 'commands'],
     ] as const) {
-      const link = join(realHome, dir, name);
+      const link = join(root, dir, name);
       expect(lstatSync(link).isSymbolicLink()).toBe(false);
       const source = join(paths.envDir('writing'), storeSub, name);
       const leaf = name.endsWith('.md') ? '' : 'SKILL.md';
@@ -175,6 +175,7 @@ describe('adapter.opencode — global materialise/restore (AC)', () => {
     const dropped = await run(['drop', '--global', '--all'], opts);
     expect(dropped.code).toBe(0);
     expect(hashTree(realHome)).toBe(before);
+    expect(() => lstatSync(join(th.home, '.agents', 'skills', 'w-skill'))).toThrow();
     const after = await readState(paths);
     expect(after.items).toEqual([]);
     expect(after.globalStack).toEqual([]);

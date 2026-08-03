@@ -1,4 +1,4 @@
-import { isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { homedir } from 'node:os';
 import type { ConfigFormat, ConfigKeysStyle, StoreKind } from './adapter.js';
 
@@ -139,7 +139,9 @@ export function globalAdapterTargets(
 }
 
 function replaceView(value: string, viewRoot: string): string {
-  return value.replaceAll('{view}', viewRoot);
+  return value
+    .replaceAll('{viewParent}', dirname(viewRoot))
+    .replaceAll('{view}', viewRoot);
 }
 
 export function renderSessionLaunch(

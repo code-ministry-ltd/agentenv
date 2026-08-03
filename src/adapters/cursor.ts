@@ -1,7 +1,6 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseJsonc, type ParseError } from 'jsonc-parser';
 import { parse as parseYaml } from 'yaml';
@@ -17,6 +16,7 @@ import type {
   SurfaceDeclaration,
 } from '../adapter.js';
 import type { JsonValue } from '../config-keys.js';
+import { userHome, type AdapterV2 } from '../adapter-v2.js';
 import { resolveBinaryOnPath } from '../session/resolve.js';
 import {
   describeCanonicalDrift,
@@ -124,6 +124,58 @@ const SURFACES: readonly SurfaceDeclaration[] = [
     substitutePlaceholders: false,
   },
 ];
+
+const CURSOR_SESSION_REASON =
+  'Cursor does not expose an isolated config root and GUI launches do not inherit a shell environment';
+
+export const cursorDefinition: AdapterV2 = {
+  version: 2,
+  id: 'cursor',
+  binaryName: 'cursor-agent',
+  session: { supported: false, reason: CURSOR_SESSION_REASON },
+  surfaces: [
+    {
+      id: 'skills',
+      storeKind: 'skills',
+      composition: { mechanism: 'dir-merge', mode: 'symlink' },
+      session: { supported: false, reason: CURSOR_SESSION_REASON },
+      global: {
+        supported: true,
+        destination: { root: 'agents-standard', relativePath: '' },
+        writer: 'projection',
+        hotReload: true,
+        adopt: true,
+      },
+    },
+    {
+      id: 'instructions',
+      storeKind: 'instructions',
+      composition: { mechanism: 'dir-merge', mode: 'symlink' },
+      session: { supported: false, reason: CURSOR_SESSION_REASON },
+      global: {
+        supported: false,
+        reason: 'Cursor User Rules are stored in an app/cloud settings database',
+      },
+    },
+    {
+      id: 'mcp',
+      storeKind: 'mcp',
+      composition: {
+        mechanism: 'config-keys',
+        format: 'json',
+        style: 'keyed',
+        keyPath: ['mcpServers'],
+      },
+      session: { supported: false, reason: CURSOR_SESSION_REASON },
+      global: {
+        supported: true,
+        destination: { root: 'config', relativePath: 'mcp.json' },
+        writer: 'projection',
+      },
+    },
+  ],
+  rawMappings: [],
+};
 
 /** Is `v` a plain (non-array) object? */
 function isObject(v: unknown): v is Record<string, JsonValue> {
@@ -390,6 +442,7 @@ function isValidCursorServer(entry: unknown): boolean {
 export const cursorAdapter: Adapter = {
   id: 'cursor',
   binaryName: 'cursor-agent',
+  definition: cursorDefinition,
 
   // GUI/IDE + a CLI whose config-root override does not isolate mcp.json → no session
   // path (D11/D15). The shim launches untouched with a --global notice (launch path).
@@ -409,7 +462,7 @@ export const cursorAdapter: Adapter = {
   realConfigRoot(env) {
     const configured = env[CONFIG_ROOT_ENV];
     if (configured && configured.trim() !== '') return configured;
-    return join(homedir(), '.cursor');
+    return join(userHome(env), '.cursor');
   },
 
   surfaces: SURFACES,

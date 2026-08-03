@@ -1,7 +1,6 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import type {
@@ -18,6 +17,7 @@ import type {
   SurfaceDeclaration,
 } from '../adapter.js';
 import type { JsonValue } from '../config-keys.js';
+import { userHome, type AdapterV2 } from '../adapter-v2.js';
 import { resolveBinaryOnPath } from '../session/resolve.js';
 import {
   describeCanonicalDrift,
@@ -134,6 +134,85 @@ const SURFACES: readonly SurfaceDeclaration[] = [
     substitutePlaceholders: false,
   },
 ];
+
+export const opencodeDefinition: AdapterV2 = {
+  version: 2,
+  id: 'opencode',
+  binaryName: 'opencode',
+  session: {
+    supported: true,
+    launch: {
+      environment: { XDG_CONFIG_HOME: '{viewParent}' },
+      rootOverride: { variable: CONFIG_ROOT_ENV },
+    },
+  },
+  surfaces: [
+    ...(['skills', 'agents', 'commands'] as const).map((id) => ({
+      id,
+      storeKind: id,
+      composition: { mechanism: 'dir-merge' as const, mode: 'symlink' as const },
+      session: {
+        supported: true as const,
+        destination: { root: 'view' as const, relativePath: id },
+        writer: 'direct' as const,
+        hotReload: true,
+        adopt: true,
+      },
+      global: {
+        supported: true as const,
+        destination: id === 'skills'
+          ? { root: 'agents-standard' as const, relativePath: '' }
+          : { root: 'config' as const, relativePath: id },
+        writer: 'projection' as const,
+        hotReload: true,
+        adopt: true,
+      },
+    })),
+    {
+      id: 'instructions',
+      storeKind: 'instructions',
+      composition: {
+        mechanism: 'config-keys',
+        format: 'json',
+        style: 'array-element',
+        keyPath: ['instructions'],
+      },
+      session: {
+        supported: true,
+        destination: { root: 'view', relativePath: 'opencode.json' },
+        writer: 'direct',
+        inheritUserContent: true,
+      },
+      global: {
+        supported: true,
+        destination: { root: 'config', relativePath: 'opencode.json' },
+        writer: 'projection',
+      },
+    },
+    {
+      id: 'mcp',
+      storeKind: 'mcp',
+      composition: {
+        mechanism: 'config-keys',
+        format: 'json',
+        style: 'keyed',
+        keyPath: ['mcp'],
+      },
+      session: {
+        supported: true,
+        destination: { root: 'view', relativePath: 'opencode.json' },
+        writer: 'direct',
+        inheritUserContent: true,
+      },
+      global: {
+        supported: true,
+        destination: { root: 'config', relativePath: 'opencode.json' },
+        writer: 'projection',
+      },
+    },
+  ],
+  rawMappings: [],
+};
 
 /** The store instruction files an env contributes, in load order (base then harness). */
 const INSTRUCTION_STORE_FILES = ['base.md', 'opencode.md'] as const;
@@ -484,6 +563,7 @@ function overrideEnv(root: string): OverrideEnv {
 export const opencodeAdapter: Adapter = {
   id: 'opencode',
   binaryName: 'opencode',
+  definition: opencodeDefinition,
 
   sessionSupported: true,
 
@@ -501,7 +581,7 @@ export const opencodeAdapter: Adapter = {
     // `XDG_CONFIG_HOME` wins; `OPENCODE_CONFIG_DIR` is NOT a relocation, so it is
     // deliberately NOT consulted here.
     const xdg = env.XDG_CONFIG_HOME;
-    const base = xdg && xdg.trim() !== '' ? xdg : join(homedir(), '.config');
+    const base = xdg && xdg.trim() !== '' ? xdg : join(userHome(env), '.config');
     return join(base, 'opencode');
   },
 
