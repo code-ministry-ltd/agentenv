@@ -18,6 +18,7 @@ import {
   dematerialise as fbDematerialise,
   inspectOwnedRegion,
   materialise as fbMaterialise,
+  repairMangled as fbRepairMangled,
   type FileBlockItem,
 } from './file-block.js';
 import { beginTransaction, recoverState } from './journal.js';
@@ -278,7 +279,7 @@ async function detectMangledMarkers(
       // say which one this problem will get rather than promising a rollback the
       // absent case does not (and must not) perform.
       repair: conflict
-        ? 'restore the file to its pre-materialise backup and re-materialise a clean region'
+        ? 'retain the current bytes, remove only a safely bounded damaged region, and re-materialise it'
         : 're-insert the managed region from the manifest + store, leaving the rest of the file as it is',
     });
   }
@@ -422,14 +423,9 @@ async function repairStoreDrift(
 /**
  * Rebuild a broken file-block region, by HOW it is broken (Task 5.1):
  *
- * - **conflict** — markers claim this env but do not match the record (duplicated,
- *   relabelled, non-contiguous, or wrapped in merge fences). The
- *   mechanisms fail CLOSED on these (they refuse to reclaim a guessed span), so the
- *   only way to remove the mangled text is to go back to the item's preserved
- *   pre-materialise backup — removing the markers as bytes, not by trusting them —
- *   and re-materialise from the manifest's recorded sub-blocks + store. This DOES
- *   discard edits made to the file since activation; it is the fail-closed price of
- *   not guessing a span, and the reported `repair` line says so.
+ * - **conflict** — retain the exact current bytes, then repair only damage whose
+ *   boundary can be proven from the manifest and canonical rendering. Ambiguous
+ *   damage remains quarantined and is never replaced by an old whole-file backup.
  * - **absent** — the region is simply gone (a harness rewrote the file without it).
  *   Nothing mangled remains to remove, and `materialise` re-inserts into the file
  *   exactly as it stands, so rolling the file back would destroy the user's later
@@ -438,10 +434,8 @@ async function repairStoreDrift(
  * Either way the re-materialise is journalled and lock-guarded.
  *
  * Several envs owning regions in ONE file are handled by re-inspecting each record
- * against the file as it stands at its turn: a conflict repair that rolls the file
- * back also removes a sibling env's region, which then reads as `absent` and is
- * re-materialised in the same pass — so the pass converges with every env's region
- * present (pinned by doctor.hardening's shared-file test).
+ * against the file as it stands at its turn. A bounded repair touches only the
+ * damaged env's bytes, so healthy sibling regions remain byte-for-byte intact.
  */
 async function repairMangledMarkers(
   paths: Paths,
@@ -451,27 +445,16 @@ async function repairMangledMarkers(
   for (const item of fileBlockItems(manifest)) {
     const insp = await inspectOwnedRegion(paths, { target: item.path, env: item.ownerEnv });
     if (insp.status !== 'conflict' && insp.status !== 'absent') continue;
-    if (insp.status === 'conflict' && item.backupRef) {
-      // KNOWN GAP (data loss, unfixed): this rolls the file back to its activation-time
-      // bytes, discarding any edits the user made outside the region since — and those
-      // bytes are captured NOWHERE, so `--restore` cannot offer them back. `restore`
-      // overwrites without capturing, and the `fbMaterialise` below backs up the
-      // ALREADY-restored content.
-      //
-      // A plain `await backup(paths, item.path)` here does NOT fix it: backups are
-      // content-addressed and reachable only via a manifest item's `backupRef`, so a
-      // rescue copy is referenced by nothing, reads as an orphan, and is deleted by
-      // this same `repair()` run's orphaned-backup GC. Closing it properly needs a
-      // manifest-level "rescue" concept (a retained, GC-exempt ref surfaced by
-      // `--restore`), which is a design change, not a patch.
-      await restore(paths, item.backupRef, item.path);
+    if (insp.status === 'conflict') {
+      await fbRepairMangled(paths, { target: item.path, env: item.ownerEnv });
+    } else {
+      await fbMaterialise(paths, {
+        target: item.path,
+        env: item.ownerEnv,
+        mode: item.mode,
+        sources: item.subBlocks.map((sb) => ({ source: sb.source, storePath: sb.storePath })),
+      });
     }
-    await fbMaterialise(paths, {
-      target: item.path,
-      env: item.ownerEnv,
-      mode: item.mode,
-      sources: item.subBlocks.map((sb) => ({ source: sb.source, storePath: sb.storePath })),
-    });
     actions.push(
       insp.status === 'conflict'
         ? `restored mangled marker region in ${item.path} (env '${item.ownerEnv}')`

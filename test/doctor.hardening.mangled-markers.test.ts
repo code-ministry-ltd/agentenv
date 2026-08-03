@@ -1,9 +1,10 @@
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { run } from '../src/cli.js';
 import { closeMarker, materialise as fbMaterialise, openMarker } from '../src/file-block.js';
 import { resolvePaths, type Paths } from '../src/paths.js';
+import { readState } from '../src/state.js';
 import {
   expectRealHomeUntouched,
   guardRealHome,
@@ -172,6 +173,31 @@ describe('doctor.hardening: mangled markers (editor / merge / harness damage)', 
     expect((await run(['doctor'], { env: th.env })).code).toBe(0);
   });
 
+  it('retains and refuses truncated damage whose managed body also changed', async () => {
+    const th = home();
+    const f = seed(th);
+    await materialiseRegion(f, 'writing', [{ name: 'base.md', body: 'writing base\n' }]);
+
+    const damaged = readFileSync(f.target, 'utf8')
+      .replace('writing base', 'ambiguous edited body')
+      .replace(`${closeMarker('writing', 'base.md')}\n`, '');
+    writeFileSync(f.target, `${damaged}notes after the damaged region\n`);
+
+    await expect(run(['doctor', '--repair'], { env: th.env })).rejects.toThrow(
+      /no safe automatic boundary/,
+    );
+    expect(readFileSync(f.target, 'utf8')).toBe(`${damaged}notes after the damaged region\n`);
+
+    const state = await readState(f.paths);
+    const rescue = state.quarantine.find(
+      (record) => record.kind === 'doctor-file-block-rescue' && record.path === f.target,
+    );
+    expect(rescue).toMatchObject({ resolved: false });
+    expect(readFileSync(rescue!.retainedPath, 'utf8')).toBe(
+      `${damaged}notes after the damaged region\n`,
+    );
+  });
+
   it('a deleted block is re-inserted WITHOUT discarding edits made since activation', async () => {
     const th = home();
     const f = seed(th);
@@ -238,11 +264,7 @@ describe('doctor.hardening: mangled markers (editor / merge / harness damage)', 
     expect((await run(['doctor'], { env: th.env })).code).toBe(0);
   });
 
-  // KNOWN GAP, pinned deliberately: a `conflict` rollback discards post-activation user
-  // edits AND leaves no way back. This test asserts the CURRENT behaviour so the loss is
-  // visible in the suite rather than buried in a notes file — flip the final expectation
-  // when the manifest-level rescue concept lands (see `repairMangledMarkers`).
-  it('a conflict rollback discards post-activation edits with no backup to recover them', async () => {
+  it('repairs a conflict without discarding post-activation edits and retains a rescue', async () => {
     const th = home();
     const f = seed(th);
     await materialiseRegion(f, 'writing', [{ name: 'base.md', body: 'writing base\n' }]);
@@ -251,29 +273,25 @@ describe('doctor.hardening: mangled markers (editor / merge / harness damage)', 
     const POST_ACTIVATION = 'three months of notes\n';
     writeFileSync(f.target, `${readFileSync(f.target, 'utf8')}\n${POST_ACTIVATION}`);
 
-    // A harness duplicates the open marker: the region reads `conflict`, and repair is
-    // deliberately fail-closed — it rolls the file back to its activation-time bytes
-    // rather than guess the region's span. That discards the notes above.
+    // A harness duplicates the open marker: the region reads `conflict`.
     const open = openMarker('writing', 'base.md');
     writeFileSync(f.target, readFileSync(f.target, 'utf8').replace(open, `${open}\n${open}`));
 
     const repaired = await run(['doctor', '--repair'], { env: th.env });
     expect(repaired.code, `${repaired.stdout}${repaired.stderr ?? ''}`).toBe(0);
 
-    // The rollback itself is the accepted fail-closed trade: agentenv will not guess a
-    // mangled region's span. The part that is NOT acceptable — and is unfixed — is that
-    // the discarded bytes are recoverable from nowhere.
-    expect(readFileSync(f.target, 'utf8')).not.toContain(POST_ACTIVATION);
+    expect(readFileSync(f.target, 'utf8')).toContain(POST_ACTIVATION);
 
-    // Naively adding `backup(paths, item.path)` before the rollback does not help: a
-    // content-addressed backup that no manifest item references reads as an orphan and
-    // this same `--repair` run's GC deletes it. Hence the gap, and hence this pin.
-    const rescued = readdirSync(f.paths.backups).some((b) =>
-      readFileSync(join(f.paths.backups, b), 'utf8').includes(POST_ACTIVATION),
+    // Repair captures the exact ambiguous pre-repair bytes outside the ordinary backup
+    // GC domain. Even a successful automatic repair therefore leaves an audit/recovery
+    // artefact with durable state metadata.
+    const state = await readState(f.paths);
+    const rescue = state.quarantine.find(
+      (record) => record.kind === 'doctor-file-block-rescue' && record.path === f.target,
     );
-    expect(rescued, 'a rescue backup now survives — flip this pin and close the gap').toBe(
-      false,
-    );
+    expect(rescue).toBeDefined();
+    expect(readFileSync(rescue!.retainedPath, 'utf8')).toContain(POST_ACTIVATION);
+    expect(readFileSync(rescue!.retainedPath, 'utf8')).toContain(`${open}\n${open}`);
 
     expect((await run(['doctor'], { env: th.env })).code).toBe(0);
   });

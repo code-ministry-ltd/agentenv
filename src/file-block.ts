@@ -1,13 +1,14 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { readFile, rm } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { BackupRef } from './backups.js';
 import { backup } from './backups.js';
 import { writeFileAtomic } from './fs-atomic.js';
 import { beginTransaction } from './journal.js';
 import { withLock } from './lock.js';
 import type { Paths } from './paths.js';
-import type { ManifestItem, StateManifest } from './state.js';
-import { readState } from './state.js';
+import type { ManifestItem, QuarantineRecord, StateManifest } from './state.js';
+import { readState, writeState } from './state.js';
 
 /**
  * The file-block surface (design D2): agentenv owns a **marked region** in a
@@ -382,6 +383,119 @@ function detectEol(text: string): '\n' | '\r\n' {
   return text.includes('\r\n') ? '\r\n' : '\n';
 }
 
+/** Remove only adjacent duplicate marker lines, a common formatter/harness failure. */
+function collapseDuplicateMarkers(
+  content: string,
+  env: string,
+  subBlocks: FileSubBlock[],
+): string {
+  let repaired = content;
+  const markers = subBlocks.flatMap((sb) => [
+    openMarker(env, sb.source),
+    closeMarker(env, sb.source),
+  ]);
+  for (const marker of markers) {
+    for (const eol of ['\r\n', '\n'] as const) {
+      const duplicate = `${marker}${eol}${marker}`;
+      while (repaired.includes(duplicate)) repaired = repaired.replace(duplicate, marker);
+    }
+  }
+  return repaired;
+}
+
+/**
+ * Resolve a Git conflict only when choosing one complete side yields a manifest-
+ * anchored region. The unchosen bytes are retained by {@link repairMangled} before
+ * this helper is called; content outside the conflict block is never rewritten.
+ */
+function stripGeneratedConflict(
+  content: string,
+  env: string,
+  subBlocks: FileSubBlock[],
+): string | null {
+  const conflict =
+    /^<<<<<<<[^\r\n]*(?:\r?\n)([\s\S]*?)^=======[^\r\n]*(?:\r?\n)([\s\S]*?)^>>>>>>>[^\r\n]*(?:\r?\n|$)/gm;
+  for (let match = conflict.exec(content); match !== null; match = conflict.exec(content)) {
+    const whole = match[0];
+    if (!whole.includes(`agentenv:${env}/`)) continue;
+    for (const side of [match[1], match[2]]) {
+      if (side === undefined) continue;
+      const candidate = collapseDuplicateMarkers(
+        content.slice(0, match.index) + side + content.slice(match.index + whole.length),
+        env,
+        subBlocks,
+      );
+      const owned = locateOwnedRegion(candidate, env, subBlocks);
+      if (owned.status === 'clean') return stripSpan(candidate, owned.start, owned.end);
+    }
+  }
+  return null;
+}
+
+/** Index of `needle` only when it occurs exactly once. */
+function uniqueIndex(content: string, needle: string): number | null {
+  const first = content.indexOf(needle);
+  if (first < 0 || content.indexOf(needle, first + 1) >= 0) return null;
+  return first;
+}
+
+/**
+ * Strip a one-sub-block region whose open OR close marker was truncated, but only
+ * when the remaining bytes exactly match the current canonical rendering. If the
+ * body also changed, its boundary is ambiguous and automatic repair refuses it.
+ */
+async function stripCanonicalTruncation(
+  content: string,
+  item: FileBlockItem,
+): Promise<string | null> {
+  if (item.subBlocks.length !== 1) return null;
+  const sb = item.subBlocks[0];
+  if (!sb) return null;
+  const body = await renderBody(item.mode, { source: sb.source, storePath: sb.storePath });
+  const open = openMarker(item.ownerEnv, sb.source);
+  const close = closeMarker(item.ownerEnv, sb.source);
+
+  for (const eol of [detectEol(content), detectEol(content) === '\n' ? '\r\n' : '\n'] as const) {
+    const renderedBody = body.replace(/\r?\n/g, eol);
+    const fragments = [
+      `${open}${eol}${renderedBody}${eol}`,
+      `${renderedBody}${eol}${close}`,
+    ];
+    for (const fragment of fragments) {
+      const start = uniqueIndex(content, fragment);
+      if (start === null) continue;
+      const candidate = stripSpan(content, start, start + fragment.length);
+      const mine = scanMarkers(candidate).filter((hit) =>
+        hit.label.startsWith(`${item.ownerEnv}/`),
+      );
+      if (mine.length === 0) return candidate;
+    }
+  }
+  return null;
+}
+
+/**
+ * Derive user-owned bytes from a damaged managed region without restoring the
+ * activation-time whole-file backup. Only damage with a demonstrable boundary is
+ * repaired automatically; all other corruption remains quarantined for explicit
+ * resolution.
+ */
+async function stripRepairableDamage(
+  content: string,
+  item: FileBlockItem,
+): Promise<string | null> {
+  const collapsed = collapseDuplicateMarkers(content, item.ownerEnv, item.subBlocks);
+  const collapsedOwned = locateOwnedRegion(collapsed, item.ownerEnv, item.subBlocks);
+  if (collapsedOwned.status === 'clean') {
+    return stripSpan(collapsed, collapsedOwned.start, collapsedOwned.end);
+  }
+
+  const resolvedConflict = stripGeneratedConflict(content, item.ownerEnv, item.subBlocks);
+  if (resolvedConflict !== null) return resolvedConflict;
+
+  return stripCanonicalTruncation(content, item);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -502,6 +616,89 @@ export async function materialise(paths: Paths, opts: MaterialiseOptions): Promi
       throw err;
     }
     return item;
+  });
+}
+
+/**
+ * Repair a manifest-owned region whose markers are damaged without rolling the
+ * target back to its activation-time bytes.
+ *
+ * The exact pre-repair file is first copied to retained storage and referenced by
+ * `state.quarantine`, outside content-addressed backup GC. Automatic repair then
+ * proceeds only when the damaged region has a demonstrable boundary: adjacent
+ * duplicate markers, one complete side of a Git conflict, or a canonical body
+ * with one truncated boundary marker. Ambiguous damage is retained and refused.
+ */
+export async function repairMangled(paths: Paths, opts: FileBlockTargetOptions): Promise<void> {
+  const { target, env } = opts;
+  return withLock(paths, async () => {
+    let manifest = await readState(paths);
+    const record = findRecord(manifest, target, env);
+    if (!record) return;
+
+    const before = await readFileOrEmpty(target);
+    const owned = locateOwnedRegion(before, env, record.subBlocks);
+    if (owned.status !== 'conflict') return;
+
+    const id = `doctor-file-block-${Date.now()}-${randomBytes(6).toString('hex')}`;
+    const retainedPath = join(paths.live, 'quarantine', id, 'content');
+    await writeFileAtomic(retainedPath, before);
+    const rescue: QuarantineRecord = {
+      schemaVersion: 2,
+      id,
+      kind: 'doctor-file-block-rescue',
+      path: target,
+      retainedPath,
+      reason: `managed marker repair for env '${env}' retained the ambiguous input bytes`,
+      createdAt: Date.now(),
+      resolved: false,
+    };
+    manifest.quarantine.push(rescue);
+    await writeState(paths, manifest);
+
+    const userContent = await stripRepairableDamage(before, record);
+    if (userContent === null) {
+      throw new FileBlockConflictError(
+        target,
+        `marker damage has no safe automatic boundary; retained at ${retainedPath}`,
+      );
+    }
+
+    const bodies = new Map<string, string>();
+    const subBlocks: FileSubBlock[] = [];
+    for (const sb of record.subBlocks) {
+      const body = await renderBody(record.mode, { source: sb.source, storePath: sb.storePath });
+      bodies.set(sb.source, body);
+      subBlocks.push({
+        source: sb.source,
+        storePath: sb.storePath,
+        ...(record.mode === 'inline' ? { hash: hashBody(body) } : {}),
+      });
+    }
+    const eol = detectEol(before);
+    const after = appendRegion(userContent, renderRegion(env, subBlocks, bodies, eol), eol);
+    const updated: FileBlockItem = { ...record, subBlocks };
+    const currentBackup = await backup(paths, target);
+    const tx = await beginTransaction(paths);
+    try {
+      await tx.apply(
+        {
+          op: 'add',
+          item: updated as ManifestItem,
+          undo: { path: target, backupRef: currentBackup },
+        },
+        async () => writeFileAtomic(target, after),
+      );
+      await tx.commit();
+    } catch (error) {
+      await tx.rollback();
+      throw error;
+    }
+
+    manifest = await readState(paths);
+    const retained = manifest.quarantine.find((entry) => entry.id === id);
+    if (retained) retained.resolved = true;
+    await writeState(paths, manifest);
   });
 }
 
