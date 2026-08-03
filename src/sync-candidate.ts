@@ -22,6 +22,10 @@ export interface SyncCandidate extends CreateSyncCandidateInput {
   blockers: string[];
   reason: string | null;
   promotedRevision: string | null;
+  /** Canonical HEAD the isolated integration was prepared from. */
+  expectedCanonicalRevision: string | null;
+  /** Fully integrated revision named by the durable private ref. */
+  candidateRevision: string | null;
 }
 
 export function createSyncCandidate(input: CreateSyncCandidateInput): SyncCandidate {
@@ -33,6 +37,8 @@ export function createSyncCandidate(input: CreateSyncCandidateInput): SyncCandid
     blockers: [],
     reason: null,
     promotedRevision: null,
+    expectedCanonicalRevision: null,
+    candidateRevision: null,
   };
 }
 

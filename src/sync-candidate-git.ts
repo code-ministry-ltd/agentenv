@@ -134,7 +134,12 @@ export async function prepareSyncCandidate(
     ['diff', '--name-only', '-z', expectedHead, revision],
   );
   const touchedCanonicalPaths = changed.stdout.split('\0').filter((path) => path !== '').sort();
-  candidate = { ...candidate, touchedCanonicalPaths };
+  candidate = {
+    ...candidate,
+    touchedCanonicalPaths,
+    expectedCanonicalRevision: expectedHead,
+    candidateRevision: revision,
+  };
 
   // The durable private ref names the fully integrated candidate, not merely
   // the remote tip, so retry/promotion is stable and needs no network.

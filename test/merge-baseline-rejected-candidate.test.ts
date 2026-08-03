@@ -166,5 +166,20 @@ describe('merge baseline — rejected candidate visibility', () => {
         blockers: ['generation:live-generation'],
       }),
     );
+
+    const blocked = await readState(paths);
+    blocked.generations[0] = { ...blocked.generations[0]!, phase: 'swept' };
+    await writeState(paths, blocked);
+    const candidateId = blocked.candidates.find((candidate) => candidate.phase === 'deferred')!.id;
+
+    const retried = await run(['resolve', 'candidate', candidateId, '--retry'], {
+      env,
+      adapters,
+    });
+    expect(retried.code, `${retried.stdout}${retried.stderr ?? ''}`).toBe(0);
+    expect((await readState(paths)).candidates.find((candidate) => candidate.id === candidateId)).toMatchObject({
+      phase: 'promoted',
+    });
+    expect(readFileSync(paths.envYaml('work'), 'utf8')).toContain('valid remote environment');
   });
 });

@@ -3,7 +3,7 @@ import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
 import { reconcileRetiredGlobalCows } from '../global-cow.js';
 import { withLock } from '../lock.js';
-import { abandonCandidate } from '../sync-candidate.js';
+import { resolveRetainedCandidate } from '../sync.js';
 import { readState, writeState } from '../state.js';
 import { closeStoreSync, commitMutation, withNotices } from './store-sync.js';
 
@@ -18,7 +18,7 @@ function fail(stderr: string): RunResult {
 const usage =
   'Usage:\n' +
   '  agentenv resolve projection <id> --quiescent\n' +
-  '  agentenv resolve candidate <id> --abandon\n' +
+  '  agentenv resolve candidate <id> (--retry | --abandon)\n' +
   '  agentenv resolve rescue <id> --acknowledge\n';
 
 async function resolveProjection(ctx: CommandContext, id: string, rest: readonly string[]): Promise<RunResult> {
@@ -57,24 +57,37 @@ async function resolveProjection(ctx: CommandContext, id: string, rest: readonly
 }
 
 async function resolveCandidate(ctx: CommandContext, id: string, rest: readonly string[]): Promise<RunResult> {
-  const parsed = parseArgs(rest, { booleans: ['abandon'] });
+  const parsed = parseArgs(rest, { booleans: ['retry', 'abandon'] });
+  const retry = parsed.booleans.has('retry');
+  const abandon = parsed.booleans.has('abandon');
   if (
     parsed.unknown.length > 0 ||
     parsed.positionals.length > 0 ||
-    !parsed.booleans.has('abandon')
+    retry === abandon
   ) {
-    return fail(`resolve candidate: an explicit --abandon is required\n${usage}`);
+    return fail(`resolve candidate: choose exactly one of --retry or --abandon\n${usage}`);
   }
   try {
-    await withLock(ctx.paths, async () => {
-      const manifest = await readState(ctx.paths);
-      const index = manifest.candidates.findIndex((candidate) => candidate.id === id);
-      if (index < 0) throw new Error(`unknown candidate '${id}'`);
-      manifest.candidates[index] = abandonCandidate(manifest.candidates[index]!);
-      await writeState(ctx.paths, manifest);
+    const result = await resolveRetainedCandidate({
+      paths: ctx.paths,
+      env: ctx.env,
+      id,
+      action: retry ? 'retry' : 'abandon',
+      ...(ctx.options.gitRun ? { gitRun: ctx.options.gitRun } : {}),
     });
+    if (result.phase !== 'promoted' && result.phase !== 'abandoned') {
+      return fail(
+        `resolve candidate: '${id}' remains '${result.phase}' with ` +
+          `${result.blockerCount} blocker(s); isolated bytes were retained\n`,
+      );
+    }
   } catch (error) {
     return fail(`resolve candidate: ${(error as Error).message}\n`);
+  }
+  if (retry) {
+    const notices: string[] = [];
+    await closeStoreSync({ paths: ctx.paths, env: ctx.env, options: ctx.options }, notices);
+    return withNotices(ok(`Promoted candidate '${id}' from its retained private ref.\n`), notices);
   }
   return ok(`Abandoned candidate '${id}'; its isolated worktree remains retained.\n`);
 }

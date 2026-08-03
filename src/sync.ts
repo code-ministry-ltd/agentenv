@@ -25,12 +25,14 @@ import {
   promoteSyncCandidate,
 } from './sync-candidate-git.js';
 import {
+  abandonCandidate,
   approveCandidate,
   beginCandidatePromotion,
   beginCandidateValidation,
   completeCandidatePromotion,
   deferCandidate,
   rejectCandidate,
+  retryCandidate,
   type SyncCandidate,
 } from './sync-candidate.js';
 import { withLock } from './lock.js';
@@ -353,6 +355,88 @@ async function persistCandidate(paths: Paths, candidate: SyncCandidate): Promise
     else manifest.candidates[index] = candidate;
     await writeState(paths, manifest);
   });
+}
+
+export interface ResolveRetainedCandidateRequest {
+  paths: Paths;
+  env: NodeJS.ProcessEnv;
+  id: string;
+  action: 'retry' | 'abandon';
+  gitRun?: GitRunner;
+}
+
+export interface ResolveRetainedCandidateResult {
+  phase: SyncCandidate['phase'];
+  blockerCount: number;
+}
+
+/** Resolve an already-isolated candidate without fetching or exposing it first. */
+export async function resolveRetainedCandidate(
+  req: ResolveRetainedCandidateRequest,
+): Promise<ResolveRetainedCandidateResult> {
+  let candidate = await withLock(req.paths, async () => {
+    const manifest = await readState(req.paths);
+    const index = manifest.candidates.findIndex((entry) => entry.id === req.id);
+    if (index < 0) throw new Error(`unknown candidate '${req.id}'`);
+    const current = manifest.candidates[index]!;
+    const next = req.action === 'abandon' ? abandonCandidate(current) : retryCandidate(current);
+    manifest.candidates[index] = next;
+    await writeState(req.paths, manifest);
+    return next;
+  });
+  if (req.action === 'abandon') return { phase: candidate.phase, blockerCount: 0 };
+
+  const validation = await validatePulledStore(candidatePaths(req.paths, candidate.worktree));
+  if (!validation.ok) {
+    candidate = rejectCandidate(
+      candidate,
+      `retry validation failed (${validation.schemaProblems.length} malformed manifest(s), ` +
+        `${validation.secretFindings.length} suspected secret finding(s))`,
+    );
+    await persistCandidate(req.paths, candidate);
+    return { phase: candidate.phase, blockerCount: 0 };
+  }
+
+  const blockers = await retainedWriterBlockers(req.paths, candidate.touchedCanonicalPaths);
+  if (blockers.length > 0) {
+    candidate = deferCandidate(candidate, blockers);
+    await persistCandidate(req.paths, candidate);
+    return { phase: candidate.phase, blockerCount: blockers.length };
+  }
+
+  if (!candidate.expectedCanonicalRevision || !candidate.candidateRevision) {
+    candidate = rejectCandidate(candidate, 'candidate promotion provenance is incomplete; refetch required');
+    await persistCandidate(req.paths, candidate);
+    return { phase: candidate.phase, blockerCount: 0 };
+  }
+  const expectedCanonicalRevision = candidate.expectedCanonicalRevision;
+  const candidateRevision = candidate.candidateRevision;
+
+  candidate = beginCandidatePromotion(approveCandidate(candidate));
+  await persistCandidate(req.paths, candidate);
+  const promoted = await promoteSyncCandidate({
+    paths: req.paths,
+    env: req.env,
+    expectedHead: expectedCanonicalRevision,
+    revision: candidateRevision,
+    ...(req.gitRun ? { run: req.gitRun } : {}),
+  });
+  if (promoted.status !== 'promoted') {
+    candidate = {
+      ...candidate,
+      phase: promoted.status === 'deferred' ? 'deferred' : 'rejected',
+      blockers: promoted.blocker ? [promoted.blocker] : [],
+      reason: promoted.detail ?? null,
+    };
+    await persistCandidate(req.paths, candidate);
+    return { phase: candidate.phase, blockerCount: candidate.blockers.length };
+  }
+
+  candidate = completeCandidatePromotion(candidate, candidateRevision);
+  await persistCandidate(req.paths, candidate);
+  await clearConflictMarker(req.paths);
+  await reconcileManifest(req.paths, await activeEnvNames(req.paths));
+  return { phase: candidate.phase, blockerCount: 0 };
 }
 
 function pathsOverlap(left: string, right: string): boolean {
