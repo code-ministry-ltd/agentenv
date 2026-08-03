@@ -1,5 +1,6 @@
 import type { Command, GlobalCliOptions, RunOptions, RunResult } from './command.js';
 import { commands, findCommand } from './commands/index.js';
+import { closeStoreSync, openStoreSync, withNotices } from './commands/store-sync.js';
 import { resolvePaths } from './paths.js';
 import { getVersion } from './version.js';
 import { legacyMigrationRequired, migrationGateClosed } from './migration.js';
@@ -96,13 +97,32 @@ export async function run(
     }
   }
 
-  const result = await command.run({
+  const context = {
     args: rest.slice(1),
     paths,
     env,
     cwd,
     options: { ...options, globals },
-  });
+  };
+  let result: RunResult;
+  const readOnlyPersistenceCommands = new Set(['list', 'show', 'status']);
+  const servicePersistence =
+    readOnlyPersistenceCommands.has(command.name) &&
+    !(await migrationGateClosed(paths)) &&
+    !(await legacyMigrationRequired(paths));
+  if (servicePersistence) {
+    const notices: string[] = [];
+    const syncCtx = { paths, env, options: context.options };
+    await openStoreSync(syncCtx, notices, { skipFetch: true });
+    try {
+      result = await command.run(context);
+    } finally {
+      await closeStoreSync(syncCtx, notices);
+    }
+    result = withNotices(result, notices);
+  } else {
+    result = await command.run(context);
+  }
   return formatResult(command.name, globals, paths, result);
 }
 

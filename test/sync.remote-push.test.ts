@@ -176,6 +176,24 @@ describe('sync: push failure queues + flushes on the next reachable invocation (
     expect(remoteSubjects).toContain('agentenv: create env writing');
     expect(remoteSubjects).toContain('agentenv: create env other');
   });
+
+  it('a read-only invocation services the queued persistence lifecycle', async () => {
+    const th = gitHome();
+    const paths = resolvePaths(th.env);
+    await run(['init'], { env: th.env });
+    const remote = bareRemotePath(false);
+    await run(['remote', remote.url], { env: th.env });
+    await run(['create', 'writing'], { env: th.env });
+    expect(await isPushQueued(paths)).toBe(true);
+
+    execFileSync('git', ['init', '--bare', '-b', 'main', remote.dir], { encoding: 'utf8' });
+    const listed = await run(['list'], { env: th.env });
+
+    expect(listed.code).toBe(0);
+    expect(listed.stdout).toContain('writing');
+    expect(await isPushQueued(paths)).toBe(false);
+    expect(subjects(remote.dir)).toContain('agentenv: create env writing');
+  });
 });
 
 describe('sync: git stderr shown to the user is credential-redacted (F5)', () => {

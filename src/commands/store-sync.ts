@@ -74,7 +74,7 @@ export async function commitRequiredMutation(
 export async function openStoreSync(
   ctx: SyncCtx,
   notices: string[],
-  opts: { alreadySwept?: boolean; skipAdopt?: boolean } = {},
+  opts: { alreadySwept?: boolean; skipAdopt?: boolean; skipFetch?: boolean } = {},
 ): Promise<SyncBeforeResult> {
   const { paths, env, options } = ctx;
   return beginStoreSync({
@@ -86,6 +86,7 @@ export async function openStoreSync(
     ...(options.globals?.offline ? { offline: true } : {}),
     ...(opts.alreadySwept ? { alreadySwept: true } : {}),
     ...(opts.skipAdopt ? { skipAdopt: true } : {}),
+    ...(opts.skipFetch ? { skipFetch: true } : {}),
   });
 }
 

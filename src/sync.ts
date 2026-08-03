@@ -109,6 +109,8 @@ export interface SyncBeforeRequest {
   pullTimeoutMs?: number;
   /** Run local sweep/adoption/commit only; never contact a remote. */
   offline?: boolean;
+  /** Service local persistence but defer fetch; the caller may still push afterward. */
+  skipFetch?: boolean;
 }
 
 /**
@@ -198,6 +200,9 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
 
     if (req.offline) {
       onNotice('agentenv: offline mode — remote fetch and candidate promotion were skipped.');
+      return { synced: true, pulled: false, quarantined: false, conflicted: false, paused: false };
+    }
+    if (req.skipFetch) {
       return { synced: true, pulled: false, quarantined: false, conflicted: false, paused: false };
     }
 
