@@ -143,6 +143,7 @@ const boundaries: readonly MigrationBoundary[] = [
   'import-staged',
   'old-root-moved',
   'pointer-switched',
+  'global-cow-converted',
   'probes-passed',
   'before-open',
 ];

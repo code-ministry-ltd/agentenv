@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { readApprovals } from '../src/session/approvals.js';
@@ -135,6 +135,15 @@ describe('gated v1 migration', () => {
     const state = await readState(paths);
     expect(state.version).toBe('2.0');
     expect(state.items).toHaveLength(1);
+    expect(state.items[0]).toMatchObject({ action: 'cow', projectionId: expect.any(String) });
+    expect(state.globalProjections).toEqual([
+      expect.objectContaining({
+        phase: 'active',
+        surfacePath: external,
+        canonicalPath: join(paths.envDir('work'), 'skills', 'review'),
+        transform: 'identity',
+      }),
+    ]);
     expect(state.migration).toMatchObject({ phase: 'opened', gate: 'open', commitPoint: true });
     expect(state.generations).toEqual([
       expect.objectContaining({
@@ -149,6 +158,96 @@ describe('gated v1 migration', () => {
     expect(readFileSync(join(paths.shims, 'fixture-harness'), 'utf8')).toContain('agentenv __shim');
   });
 
+  it('replaces a legacy global symlink with a retained COW working copy', async () => {
+    const th = home();
+    const { external, paths } = cmFixture(th);
+    const canonical = join(paths.envDir('work'), 'skills', 'review');
+    rmSync(external, { force: true });
+    symlinkSync(canonical, external);
+    const canonicalBefore = await capturePathIdentity(canonical);
+
+    await migrateV1({ paths, ...quiet });
+
+    expect(lstatSync(external).isSymbolicLink()).toBe(false);
+    expect(readFileSync(join(external, 'SKILL.md'), 'utf8')).toBe('# review\n');
+    expect(await capturePathIdentity(canonical)).toEqual(canonicalBefore);
+    const state = await readState(paths);
+    expect(state.items[0]).toMatchObject({ action: 'cow', projectionId: expect.any(String) });
+    expect(state.globalProjections[0]).toMatchObject({
+      phase: 'active',
+      surfacePath: external,
+      canonicalPath: canonical,
+    });
+  });
+
+  it('retains legacy file-block and config-key writers with reverse provenance', async () => {
+    const th = home();
+    const paths = resolvePaths(th.env);
+    const externalRoot = join(th.home, '..', `${th.home.split('/').at(-1)}-mixed-external`);
+    externalRoots.push(externalRoot);
+    const instructions = join(paths.envDir('work'), 'instructions', 'base.md');
+    const servers = join(paths.envDir('work'), 'mcp', 'servers.yaml');
+    const instructionsTarget = join(externalRoot, 'INSTRUCTIONS.md');
+    const configTarget = join(externalRoot, 'config.json');
+    write(paths.envYaml('work'), 'version: 1.0\nname: work\n');
+    write(instructions, 'canonical instructions\n');
+    write(servers, 'linear:\n  command: linear-mcp\n');
+    write(instructionsTarget, 'rendered legacy instructions\n');
+    write(configTarget, '{"mcpServers":{"linear":{"command":"linear-mcp"}}}\n');
+    write(paths.state, `${JSON.stringify({
+      version: '1.0',
+      items: [
+        {
+          surface: 'file-block',
+          action: 'file-block',
+          path: instructionsTarget,
+          key: 'work',
+          ownerEnv: 'work',
+          mode: 'inline',
+          subBlocks: [{ source: 'base.md', storePath: instructions }],
+          backupRef: null,
+        },
+        {
+          surface: 'config-keys',
+          action: 'config-key',
+          path: configTarget,
+          key: 'mcpServers.linear',
+          ownerEnv: 'work',
+          mode: 'keyed',
+          format: 'json',
+          keyPath: ['mcpServers', 'linear'],
+          hash: 'legacy-hash',
+        },
+      ],
+      globalStack: ['work'],
+    }, null, 2)}\n`);
+    write(join(paths.base, 'sessions.json'), '{"version":"1.0","bindings":[]}\n');
+
+    await migrateV1({
+      paths,
+      ...quiet,
+      env: { ...th.env, FIXTURE_CONFIG_DIR: externalRoot },
+    });
+
+    const state = await readState(paths);
+    expect(state.globalProjections).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        phase: 'active',
+        transform: 'file-block',
+        surfacePath: instructionsTarget,
+        fileBlockProvenance: expect.objectContaining({ items: expect.any(Array) }),
+      }),
+      expect.objectContaining({
+        phase: 'active',
+        transform: 'config-keys',
+        surfacePath: configTarget,
+        configKeysProvenance: expect.objectContaining({ items: expect.any(Array) }),
+      }),
+    ]));
+    expect(readFileSync(instructionsTarget, 'utf8')).toBe('rendered legacy instructions\n');
+    expect(readFileSync(configTarget, 'utf8')).toContain('linear-mcp');
+  });
+
   it('migrates JJ v1 inventories, sessions, approvals, and ownership', async () => {
     const th = home();
     const { paths } = jjFixture(th);
@@ -160,9 +259,13 @@ describe('gated v1 migration', () => {
     expect(state.items).toEqual([
       expect.objectContaining({
         surface: 'dir-merge',
-        action: 'copy',
+        action: 'cow',
         ownerEnv: 'work',
+        projectionId: expect.any(String),
       }),
+    ]);
+    expect(state.globalProjections).toEqual([
+      expect.objectContaining({ phase: 'active', transform: 'identity' }),
     ]);
     expect(state.generations).toEqual([
       expect.objectContaining({
@@ -215,6 +318,7 @@ describe('gated v1 migration', () => {
     'import-staged',
     'old-root-moved',
     'pointer-switched',
+    'global-cow-converted',
     'probes-passed',
     'before-open',
   ])('rolls back byte-identically when %s fails before opening', async (boundary) => {

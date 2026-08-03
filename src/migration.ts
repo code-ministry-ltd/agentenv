@@ -9,15 +9,26 @@ import {
   readFile,
   readdir,
   readlink,
+  realpath,
   rename,
   rm,
+  stat,
   symlink,
 } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
-import type { Adapter } from './adapter.js';
+import type { Adapter, ConfigKeysSurface } from './adapter.js';
+import { resolveGlobalSurfaceDestination } from './adapter-v2.js';
 import { adapters as defaultAdapters } from './adapters/index.js';
+import type { ConfigKeysItem, RetainedConfigKeysItem } from './config-keys.js';
+import type { DirMergeItem } from './dir-merge.js';
+import type { FileBlockItem, RetainedFileBlockItem } from './file-block.js';
 import { writeFileAtomic } from './fs-atomic.js';
+import {
+  createGlobalProjection,
+  publishProjection,
+  type GlobalProjection,
+} from './global-projection.js';
 import { parseLegacyState, importLegacyState, type LegacyState } from './legacy-state.js';
 import { withLock } from './lock.js';
 import {
@@ -54,6 +65,7 @@ export type MigrationBoundary =
   | 'import-staged'
   | 'old-root-moved'
   | 'pointer-switched'
+  | 'global-cow-converted'
   | 'probes-passed'
   | 'before-open';
 
@@ -602,6 +614,285 @@ async function stageImport(
   await writeState(stagingPaths, manifest);
 }
 
+function migrationProjectionId(migrationId: string, mechanism: string, path: string): string {
+  const digest = createHash('sha256')
+    .update(migrationId)
+    .update('\0')
+    .update(mechanism)
+    .update('\0')
+    .update(path)
+    .digest('hex')
+    .slice(0, 24);
+  return `migration-cow-${digest}`;
+}
+
+function retainedProjectionPath(paths: Paths, id: string): string {
+  return join(paths.live, 'global-projections', id, 'content');
+}
+
+function requirePresentIdentity(identity: PathIdentity, label: string): PathIdentity {
+  if (identity.kind === 'absent') throw new Error(`legacy global surface is missing: ${label}`);
+  return identity;
+}
+
+async function convertLegacyDirMergeItem(
+  paths: Paths,
+  migrationId: string,
+  createdAt: number,
+  item: DirMergeItem,
+): Promise<{ item: DirMergeItem; projection: GlobalProjection }> {
+  if (!isAbsolute(item.path) || !isAbsolute(item.target)) {
+    throw new Error(`legacy dir-merge ownership is not absolute: ${item.path}`);
+  }
+  const before = requirePresentIdentity(await capturePathIdentity(item.path), item.path);
+  const canonicalBaseline = requirePresentIdentity(
+    await capturePathIdentity(item.target),
+    item.target,
+  );
+  if (before.kind === 'symlink') {
+    const observedTarget = resolve(dirname(item.path), before.target);
+    if (observedTarget !== resolve(item.target)) {
+      throw new Error(`legacy global symlink changed before COW conversion: ${item.path}`);
+    }
+    const source = await realpath(item.path);
+    const sourceStats = await stat(source);
+    const temp = join(dirname(item.path), `.agentenv-migration-cow-${randomUUID()}`);
+    await rm(temp, { recursive: true, force: true });
+    await cp(source, temp, {
+      recursive: sourceStats.isDirectory(),
+      verbatimSymlinks: true,
+      preserveTimestamps: true,
+    });
+    await rm(item.path, { force: true });
+    await rename(temp, item.path);
+  }
+  const baseline = requirePresentIdentity(await capturePathIdentity(item.path), item.path);
+  const id = migrationProjectionId(migrationId, 'dir-merge', item.path);
+  const converted: DirMergeItem = { ...item, action: 'cow', projectionId: id };
+  const projection = publishProjection(
+    createGlobalProjection(id, baseline, {
+      surfacePath: item.path,
+      retainedPath: retainedProjectionPath(paths, id),
+      canonicalPath: item.target,
+      canonicalBaseline,
+      ownerEnv: item.ownerEnv,
+      transform: 'identity',
+      createdAt,
+    }),
+  );
+  return { item: converted, projection };
+}
+
+async function convertLegacyFileBlock(
+  paths: Paths,
+  migrationId: string,
+  createdAt: number,
+  path: string,
+  items: FileBlockItem[],
+): Promise<GlobalProjection> {
+  const baseline = requirePresentIdentity(await capturePathIdentity(path), path);
+  if (baseline.kind !== 'file') throw new Error(`legacy file-block surface is not a file: ${path}`);
+  const provenance: RetainedFileBlockItem[] = [];
+  for (const item of items) {
+    if (!Array.isArray(item.subBlocks) || item.subBlocks.length === 0) {
+      throw new Error(`legacy file-block provenance is incomplete: ${path}`);
+    }
+    const canonical = [];
+    for (const subBlock of item.subBlocks) {
+      if (!isAbsolute(subBlock.storePath)) {
+        throw new Error(`legacy file-block source is not absolute: ${subBlock.storePath}`);
+      }
+      canonical.push({
+        storePath: subBlock.storePath,
+        baseline: requirePresentIdentity(
+          await capturePathIdentity(subBlock.storePath),
+          subBlock.storePath,
+        ),
+      });
+    }
+    provenance.push({ item, canonical });
+  }
+  const canonicalPath = items[0]!.subBlocks[0]!.storePath;
+  const canonicalBaseline = provenance[0]!.canonical[0]!.baseline;
+  const id = migrationProjectionId(migrationId, 'file-block', path);
+  return publishProjection(
+    createGlobalProjection(id, baseline, {
+      surfacePath: path,
+      retainedPath: retainedProjectionPath(paths, id),
+      canonicalPath,
+      canonicalBaseline,
+      ownerEnv: items.at(-1)!.ownerEnv,
+      transform: 'file-block',
+      fileBlockProvenance: { items: provenance },
+      createdAt,
+    }),
+  );
+}
+
+function legacyConfigSurface(
+  item: ConfigKeysItem,
+  adapters: readonly Adapter[],
+  env: NodeJS.ProcessEnv,
+): { adapter: Adapter; surface: ConfigKeysSurface } | null {
+  const legacySurfaceId = (item as ConfigKeysItem & { legacySurfaceId?: unknown }).legacySurfaceId;
+  const candidates = adapters.flatMap((adapter) =>
+    adapter.surfaces
+      .filter((surface): surface is ConfigKeysSurface => surface.mechanism === 'config-keys')
+      .map((surface) => ({ adapter, surface })),
+  );
+  const byLegacyId = typeof legacySurfaceId === 'string'
+    ? candidates.find(
+        ({ adapter, surface }) =>
+          legacySurfaceId === `${adapter.id}.${surface.id}` ||
+          legacySurfaceId === `${adapter.binaryName}.${surface.id}`,
+      )
+    : undefined;
+  if (byLegacyId) return byLegacyId;
+  return candidates.find(({ adapter, surface }) => {
+    if (!surface.supported || surface.style !== item.mode || surface.format !== item.format) return false;
+    if (!surface.keyPath.every((segment, index) => item.keyPath[index] === segment)) return false;
+    try {
+      return resolveGlobalSurfaceDestination(adapter, surface, env) === item.path;
+    } catch {
+      return false;
+    }
+  }) ?? null;
+}
+
+async function convertLegacyConfigKeys(
+  paths: Paths,
+  migrationId: string,
+  createdAt: number,
+  path: string,
+  items: ConfigKeysItem[],
+  adapters: readonly Adapter[],
+  env: NodeJS.ProcessEnv,
+): Promise<GlobalProjection> {
+  const baseline = requirePresentIdentity(await capturePathIdentity(path), path);
+  if (baseline.kind !== 'file') throw new Error(`legacy config-keys surface is not a file: ${path}`);
+  const provenance: RetainedConfigKeysItem[] = [];
+  let projectionCanonicalPath: string | undefined;
+  let projectionCanonicalBaseline: PathIdentity | undefined;
+  for (const item of items) {
+    const matched = legacyConfigSurface(item, adapters, env);
+    if (!matched) throw new Error(`could not resolve legacy config-key provenance for '${path}'`);
+    const canonicalPath = matched.surface.storeKind === 'mcp' && item.mode === 'keyed'
+      ? join(paths.envDir(item.ownerEnv), 'mcp', 'servers.yaml')
+      : undefined;
+    const canonicalBaseline = canonicalPath
+      ? requirePresentIdentity(await capturePathIdentity(canonicalPath), canonicalPath)
+      : undefined;
+    projectionCanonicalPath ??= join(paths.envDir(item.ownerEnv), matched.surface.storeKind);
+    projectionCanonicalBaseline ??= requirePresentIdentity(
+      await capturePathIdentity(projectionCanonicalPath),
+      projectionCanonicalPath,
+    );
+    provenance.push({
+      item,
+      adapterId: matched.adapter.id,
+      surfaceId: matched.surface.id,
+      ...(canonicalPath && canonicalBaseline ? { canonicalPath, canonicalBaseline } : {}),
+    });
+    if (matched.adapter.validateConfigFile) {
+      const content = await readFile(path, 'utf8');
+      let verdict;
+      try {
+        verdict = matched.adapter.validateConfigFile(path, content);
+      } catch (error) {
+        throw new Error(
+          `legacy config validation threw for ${matched.adapter.id}: ${(error as Error).message}`,
+          { cause: error },
+        );
+      }
+      if (!verdict.ok) {
+        throw new Error(
+          `legacy config validation failed for ${matched.adapter.id}` +
+            `${verdict.detail ? `: ${verdict.detail}` : ''}`,
+        );
+      }
+    }
+  }
+  if (!projectionCanonicalPath || !projectionCanonicalBaseline) {
+    throw new Error(`legacy config-key provenance is incomplete: ${path}`);
+  }
+  const id = migrationProjectionId(migrationId, 'config-keys', path);
+  return publishProjection(
+    createGlobalProjection(id, baseline, {
+      surfacePath: path,
+      retainedPath: retainedProjectionPath(paths, id),
+      canonicalPath: projectionCanonicalPath,
+      canonicalBaseline: projectionCanonicalBaseline,
+      ownerEnv: items.at(-1)!.ownerEnv,
+      transform: 'config-keys',
+      configKeysProvenance: { items: provenance },
+      createdAt,
+    }),
+  );
+}
+
+/** Convert imported v1 global writers into retained COW projections before gate-open. */
+async function convertImportedGlobalOwnership(
+  req: MigrationRequest,
+  wal: MigrationWal,
+  adapters: readonly Adapter[],
+): Promise<void> {
+  const manifest = await readState(req.paths);
+  const converted = [...manifest.items];
+  const projections: GlobalProjection[] = [];
+  const grouped = new Map<string, typeof manifest.items>();
+  for (const item of manifest.items) {
+    const key = JSON.stringify([item.surface, item.path]);
+    const group = grouped.get(key);
+    if (group) group.push(item);
+    else grouped.set(key, [item]);
+  }
+  for (const group of grouped.values()) {
+    const first = group[0]!;
+    if (first.surface === 'dir-merge') {
+      for (const original of group) {
+        const index = manifest.items.indexOf(original);
+        const result = await convertLegacyDirMergeItem(
+          req.paths,
+          wal.migration.id,
+          wal.createdAt,
+          original as DirMergeItem,
+        );
+        converted[index] = result.item;
+        projections.push(result.projection);
+      }
+    } else if (first.surface === 'file-block') {
+      projections.push(
+        await convertLegacyFileBlock(
+          req.paths,
+          wal.migration.id,
+          wal.createdAt,
+          first.path,
+          group as FileBlockItem[],
+        ),
+      );
+    } else if (first.surface === 'config-keys') {
+      projections.push(
+        await convertLegacyConfigKeys(
+          req.paths,
+          wal.migration.id,
+          wal.createdAt,
+          first.path,
+          group as ConfigKeysItem[],
+          adapters,
+          req.env ?? process.env,
+        ),
+      );
+    } else {
+      throw new Error(`unsupported legacy global surface '${first.surface}' at ${first.path}`);
+    }
+  }
+  manifest.items = converted;
+  manifest.globalProjections = projections;
+  await writeState(req.paths, manifest);
+  for (const entry of wal.externalEntries) entry.identity = await capturePathIdentity(entry.path);
+  await writeWal(req.paths, wal);
+}
+
 async function probeCutover(req: MigrationRequest, wal: MigrationWal): Promise<StateManifest> {
   const manifest = await readState(req.paths);
   if (
@@ -874,6 +1165,9 @@ export async function migrateV1(req: MigrationRequest): Promise<MigrationResult>
       wal.cutover = 'pointer-switched';
       await writeWal(req.paths, wal);
       await boundary(req, 'pointer-switched');
+
+      await convertImportedGlobalOwnership(req, wal, adapters);
+      await boundary(req, 'global-cow-converted');
 
       const manifest = await probeCutover(req, wal);
       await boundary(req, 'probes-passed');
