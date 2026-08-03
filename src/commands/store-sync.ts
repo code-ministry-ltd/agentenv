@@ -2,6 +2,7 @@ import { adapters as realAdapters } from '../adapters/index.js';
 import type { Adapter } from '../adapter.js';
 import type { RunOptions, RunResult } from '../command.js';
 import { type CommitResult, commitStore, describeFindings } from '../git.js';
+import { collectLifecycleGarbage } from '../lifecycle-gc.js';
 import type { Paths } from '../paths.js';
 import { beginStoreSync, endStoreSync, type SyncBeforeResult } from '../sync.js';
 
@@ -91,12 +92,18 @@ export async function openStoreSync(
  *  outcome so a reporting caller (`agentenv sync`) can say what happened. */
 export async function closeStoreSync(ctx: SyncCtx, notices: string[]): ReturnType<typeof endStoreSync> {
   const { paths, env, options } = ctx;
-  return endStoreSync({
+  const push = await endStoreSync({
     paths,
     env,
     onNotice: (n) => notices.push(n),
     ...(options.gitRun ? { gitRun: options.gitRun } : {}),
   });
+  try {
+    await collectLifecycleGarbage(paths, { limit: 4 });
+  } catch (error) {
+    notices.push(`agentenv: lifecycle cleanup skipped — ${(error as Error).message}`);
+  }
+  return push;
 }
 
 /**
