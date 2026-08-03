@@ -283,8 +283,20 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
   } catch (err) {
     notices.push(
       `agentenv: ${adapter.id} self-check errored (${(err as Error).message}) — ` +
-        `launching without overrides`,
+      `launching without overrides`,
     );
+    try {
+      await sweepSessionGeneration(paths, generationId, null, now());
+    } catch (sweepErr) {
+      notices.push(
+        `agentenv: unused generation ${generationId} retained (${(sweepErr as Error).message})`,
+      );
+      try {
+        await quarantineSessionGeneration(paths, generationId, (sweepErr as Error).message);
+      } catch {
+        // Preserve the self-check failure as the launch decision.
+      }
+    }
     return execUntouched('fail-open');
   }
   if (!check.ok) {

@@ -507,6 +507,27 @@ describe('session launch', () => {
     expect(result.notices.join(' ')).toContain('--global');
   });
 
+  it('settles the unused generation when self-check throws before launch', async () => {
+    const th = home();
+    const { paths, env } = scenario(th);
+    const adapter = makeFixtureAdapter();
+    adapter.selfCheck = async () => {
+      throw new Error('injected self-check crash');
+    };
+
+    const result = await launchHarness(req({
+      paths,
+      adapter,
+      env,
+      execHarness: capturingExec().exec,
+    }));
+
+    expect(result.mode).toBe('fail-open');
+    expect((await readState(paths)).generations).toContainEqual(
+      expect.objectContaining({ phase: 'swept', leases: [], reservations: [] }),
+    );
+  });
+
   it('a session-unsupported adapter (Cursor-like) launches untouched with a --global notice', async () => {
     const th = home();
     const { paths, env } = scenario(th);
