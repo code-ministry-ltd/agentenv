@@ -1,12 +1,16 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   publishStagedBundle,
   recoverPendingFilesystemBundles,
 } from '../src/filesystem-bundle.js';
+import { backup } from '../src/backups.js';
+import { advanceCommand, advanceOperation, createCommandPlan } from '../src/command-plan.js';
+import { run } from '../src/cli.js';
+import { capturePathIdentity } from '../src/path-identity.js';
 import { resolvePaths } from '../src/paths.js';
-import { readState } from '../src/state.js';
+import { emptyManifest, readState, writeState } from '../src/state.js';
 import { makeTempHome, type TempHome } from './helpers.js';
 
 const homes: TempHome[] = [];
@@ -16,6 +20,49 @@ afterEach(() => {
 });
 
 describe('whole-command staged filesystem publication', () => {
+  it('a normal invocation rolls back an interrupted bundle before touching the store', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const target = join(paths.store, 'environments', 'work', 'env.yaml');
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, 'version: "1.0"\ndescription: old\n');
+    const pre = await capturePathIdentity(target);
+    const undo = await backup(paths, target);
+
+    const stagingRoot = join(paths.live, 'commands', 'interrupted-bundle');
+    const staged = join(stagingRoot, 'env.yaml');
+    mkdirSync(stagingRoot, { recursive: true });
+    writeFileSync(staged, 'version: "1.0"\ndescription: new\n');
+    const post = await capturePathIdentity(staged);
+    let plan = createCommandPlan({
+      transactionId: 'interrupted-bundle',
+      kind: 'filesystem-bundle',
+      operations: [{
+        id: 'env',
+        kind: 'replace-path',
+        path: target,
+        preIdentity: pre,
+        postIdentity: post,
+        undoRef: JSON.stringify(undo),
+      }],
+    });
+    plan = advanceCommand(plan, 'applying');
+    plan = advanceOperation(plan, 'env', 'applying');
+    rmSync(target);
+    renameSync(staged, target);
+    plan = advanceOperation(plan, 'env', 'applied');
+    const manifest = emptyManifest();
+    manifest.commands.push(plan);
+    await writeState(paths, manifest);
+
+    const result = await run(['list'], { env: home.env });
+
+    expect(result.code).toBe(0);
+    expect(readFileSync(target, 'utf8')).toBe('version: "1.0"\ndescription: old\n');
+    expect((await readState(paths)).commands).toEqual([]);
+  });
+
   it('rolls content and metadata back together when the second effect fails', async () => {
     const home = makeTempHome();
     homes.push(home);

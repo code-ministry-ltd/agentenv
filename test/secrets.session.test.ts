@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { resolvePaths } from '../src/paths.js';
@@ -50,6 +50,8 @@ describe('secrets session: substitute rung composes literals into the private vi
 
     const cfg = JSON.parse(readFileSync(join(res.viewRoot, 'config.json'), 'utf8'));
     expect(cfg.mcpServers.gh.env.TOKEN).toBe('sess-secret-123');
+    expect(statSync(res.viewRoot).mode & 0o077).toBe(0);
+    expect(statSync(join(res.viewRoot, 'config.json')).mode & 0o077).toBe(0);
     // The store def is untouched — it still holds the placeholder.
     expect(readFileSync(join(paths.envDir('writing'), 'mcp', 'servers.yaml'), 'utf8')).toContain(
       '${SESSION_TOKEN}',

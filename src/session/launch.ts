@@ -214,6 +214,7 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
   // — the APPLYING path — anything broken here fails OPEN (never brick the tool).
   let viewRoot: string;
   let skipped: SurfaceSkip[];
+  let resolvedSecretNames: string[];
   const generationId = randomUUID();
   let generationBegun = false;
   try {
@@ -251,6 +252,7 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
     });
     viewRoot = composed.viewRoot;
     skipped = composed.skipped;
+    resolvedSecretNames = composed.resolvedSecretNames;
     await publishSessionGeneration(paths, generationId, {
       fingerprint: composed.fingerprint,
       inventory: composed.inventory,
@@ -337,6 +339,8 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
   // Machine-local secrets exist only in an applied child/materialiser. They override
   // the shell, while adapter-owned launch variables remain authoritative.
   const execEnv: NodeJS.ProcessEnv = { ...sanitisedEnv, ...secretEnv, ...launch.env };
+  const gitEnv: NodeJS.ProcessEnv = { ...sanitisedEnv, ...launch.env };
+  for (const name of resolvedSecretNames) delete gitEnv[name];
   const reservationId = randomUUID();
   try {
     await reserveSessionGeneration(paths, generationId, reservationId);
@@ -398,7 +402,7 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
           async () => {
             const commit = await commitStore(
               paths,
-              execEnv,
+              gitEnv,
               `agentenv: sweep session generation ${generationId}`,
               req.gitRun,
             );
@@ -432,7 +436,7 @@ export async function launchHarness(req: LaunchRequest): Promise<LaunchResult> {
       }
       if (sweepCompleted) {
         try {
-          const push = await pushStore(paths, execEnv, {
+          const push = await pushStore(paths, gitEnv, {
             ...(req.gitRun ? { run: req.gitRun } : {}),
             now,
           });

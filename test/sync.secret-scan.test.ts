@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { run } from '../src/cli.js';
@@ -65,6 +65,26 @@ describe('F2 unit: token-shape exemptions + allow-secret override', () => {
 });
 
 describe('F2 integration: the pre-commit gate scans the staged diff (D6/D9)', () => {
+  it('refuses rm before deleting the only uncommitted secret-bearing copy', async () => {
+    const th = gitHome();
+    const paths = resolvePaths(th.env);
+    await run(['init'], { env: th.env });
+    await run(['create', 'writing'], { env: th.env });
+    const headBefore = gitIn(paths.store, 'rev-parse', 'HEAD');
+    const leak = join(paths.envDir('writing'), 'only-copy.txt');
+    writeFileSync(leak, `api_key: ${REAL_AWS_KEY}\n`);
+
+    const result = await run(['rm', 'writing'], {
+      env: th.env,
+      confirm: async () => true,
+    });
+
+    expect(result.code).toBe(1);
+    expect(`${result.stdout}${result.stderr ?? ''}`).toMatch(/refus|blocked|secret/i);
+    expect(readFileSync(leak, 'utf8')).toContain(REAL_AWS_KEY);
+    expect(gitIn(paths.store, 'rev-parse', 'HEAD')).toBe(headBefore);
+  });
+
   it('a staged documented-example token commits fine', async () => {
     const th = gitHome();
     const paths = resolvePaths(th.env);

@@ -31,11 +31,10 @@ async function seedDangling(th: TempHome): Promise<{ linkPath: string; storeSour
   mkdirSync(storeSource, { recursive: true });
   writeFileSync(join(storeSource, 'SKILL.md'), '# w skill\n');
 
-  // The placed link is BROKEN — it points at a path that does not exist.
+  // The owned placement is missing while its canonical source still exists.
   const skillsDir = join(th.home, 'real', 'skills');
   mkdirSync(skillsDir, { recursive: true });
   const linkPath = join(skillsDir, 'w-skill');
-  symlinkSync(join(th.home, 'real', 'gone-target'), linkPath);
 
   const item: ManifestItem = {
     action: 'symlink',
@@ -55,13 +54,12 @@ describe('doctor: dangling symlinks', () => {
     const th = home();
     const { linkPath } = await seedDangling(th);
     // Sanity: the link is genuinely broken to start.
-    expect(lstatSync(linkPath).isSymbolicLink()).toBe(true);
-    expect(existsSync(linkPath)).toBe(false); // resolves to nothing
+    expect(existsSync(linkPath)).toBe(false);
 
     const res = await run(['doctor'], { env: th.env });
     expect(res.code).not.toBe(0);
     expect(`${res.stdout}${res.stderr ?? ''}`).toContain('dangling');
-    // Never mutates: still broken.
+    // Never mutates: still missing.
     expect(existsSync(linkPath)).toBe(false);
   });
 
@@ -79,5 +77,18 @@ describe('doctor: dangling symlinks', () => {
 
     const rerun = await run(['doctor'], { env: th.env });
     expect(rerun.code).toBe(0);
+  });
+
+  it('--repair preserves a foreign dangling symlink that replaced the owned path', async () => {
+    const th = home();
+    const { linkPath } = await seedDangling(th);
+    const foreignTarget = join(th.home, 'other-manager', 'temporarily-absent');
+    symlinkSync(foreignTarget, linkPath);
+
+    const repair = await run(['doctor', '--repair'], { env: th.env });
+
+    expect(repair.code).toBe(1);
+    expect(readlinkSync(linkPath)).toBe(foreignTarget);
+    expect(`${repair.stdout}${repair.stderr ?? ''}`).toMatch(/identity|ownership|refus|manual/i);
   });
 });

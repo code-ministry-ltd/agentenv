@@ -6,7 +6,7 @@ import { confirmDefault } from '../prompt.js';
 import { readSessionRegistry } from '../session/registry.js';
 import { readState } from '../state.js';
 import { environmentExists, validateEnvName } from '../store.js';
-import { withNotices, withStoreSync } from './store-sync.js';
+import { closeStoreSync, commitMutation, openStoreSync, withNotices } from './store-sync.js';
 
 export const rmCommand: Command = {
   name: 'rm',
@@ -65,12 +65,22 @@ export const rmCommand: Command = {
       };
     }
 
-    // Remove inside the git-sync lifecycle (pull → remove → commit → push).
+    // Open the Git lifecycle before deletion. If pre-existing drift contains a
+    // suspected secret, it may be the only copy; removing the environment would
+    // make the subsequent deletion-only commit look safe while losing those bytes.
     const notices: string[] = [];
-    await withStoreSync({ paths, env, options }, notices, async () => {
-      await removeDir(paths.envDir(name), { recursive: true, force: true });
-      return `agentenv: remove env ${name}`;
-    });
+    const syncCtx = { paths, env, options };
+    const before = await openStoreSync(syncCtx, notices);
+    if (before.driftCommitBlocked) {
+      return withNotices({
+        stdout: '',
+        stderr: `rm: refusing to remove '${name}' while secret-bearing store drift is uncommitted\n`,
+        code: 1,
+      }, notices);
+    }
+    await removeDir(paths.envDir(name), { recursive: true, force: true });
+    await commitMutation(syncCtx, `agentenv: remove env ${name}`, notices);
+    await closeStoreSync(syncCtx, notices);
     return withNotices({ stdout: `Removed environment '${name}'.\n`, code: 0 }, notices);
   },
 };

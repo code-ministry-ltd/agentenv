@@ -481,6 +481,37 @@ describe('session launch', () => {
     expect(unbound.calls[0]?.env.CHILD_ONLY).toBeUndefined();
   });
 
+  it('never passes resolved placeholder secrets to Git or its helpers', async () => {
+    const th = home();
+    const { paths, env } = scenario(th);
+    await run(['init'], { env });
+    mkdirSync(join(paths.envDir('writing'), 'mcp'), { recursive: true });
+    writeFileSync(
+      join(paths.envDir('writing'), 'mcp', 'servers.yaml'),
+      'private:\n  command: server\n  env:\n    TOKEN: ${PRIVATE_TOKEN}\n',
+    );
+    await writeSecrets(paths, new Map([['PRIVATE_TOKEN', 'machine-only-secret']]));
+    env.PRIVATE_TOKEN = 'shell-fallback-secret';
+    const seenGitEnvs: NodeJS.ProcessEnv[] = [];
+    const inspectingGit: GitRunner = (args, options) => {
+      seenGitEnvs.push(options.env);
+      return defaultGitRunner(args, options);
+    };
+    const child = capturingExec();
+
+    await launchHarness(req({
+      paths,
+      adapter: makeFixtureAdapter({ substituteMcp: true }),
+      env,
+      execHarness: child.exec,
+      gitRun: inspectingGit,
+    }));
+
+    expect(child.calls[0]?.env.PRIVATE_TOKEN).toBe('machine-only-secret');
+    expect(seenGitEnvs.length).toBeGreaterThan(0);
+    expect(seenGitEnvs.every((gitEnv) => gitEnv.PRIVATE_TOKEN === undefined)).toBe(true);
+  });
+
   it('AC: an unbound launch execs the real binary untouched (no overrides)', async () => {
     const th = home();
     const { paths, env } = scenario(th);

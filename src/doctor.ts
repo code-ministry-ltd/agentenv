@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
-import { access, readdir, rm, stat } from 'node:fs/promises';
+import { access, lstat, readlink, readdir, rm } from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { backup, restore, type BackupRef } from './backups.js';
 import {
   ConfigKeysError,
@@ -58,6 +58,7 @@ export type DoctorProblemKind =
   | 'quarantine-pending'
   | 'migration-pending'
   | 'dangling-symlink'
+  | 'ownership-conflict'
   | 'store-drift'
   | 'mangled-markers'
   | 'reserialised-config'
@@ -86,17 +87,6 @@ export interface RepairResult {
 // small fs helpers
 // ---------------------------------------------------------------------------
 
-/** Whether `p` exists (following symlinks — a broken link reads as absent). */
-async function resolves(p: string): Promise<boolean> {
-  try {
-    await stat(p);
-    return true;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
-    throw err;
-  }
-}
-
 /** Whether `p` exists WITHOUT following symlinks (the link/file/dir is present). */
 async function exists(p: string): Promise<boolean> {
   try {
@@ -123,7 +113,30 @@ async function exists(p: string): Promise<boolean> {
 async function isDangling(item: DirMergeItem): Promise<boolean> {
   if (item.action !== 'symlink') return false;
   if (!(await exists(item.target))) return false; // store source gone → store-drift, not dangling
-  return !(await resolves(item.path)); // link present but resolves to nothing
+  try {
+    await lstat(item.path);
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw error;
+  }
+}
+
+/** A present placement that is not agentenv's recorded symlink is a third
+ * identity. Doctor reports it but never replaces it automatically. */
+async function hasDirMergeOwnershipConflict(item: DirMergeItem): Promise<boolean> {
+  if (item.action !== 'symlink' || !(await exists(item.target))) return false;
+  try {
+    const st = await lstat(item.path);
+    if (!st.isSymbolicLink()) return true;
+    const link = await readlink(item.path);
+    const actual = resolve(dirname(item.path), link);
+    const expected = resolve(item.target);
+    return actual !== expected;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
 }
 
 /**
@@ -214,6 +227,22 @@ async function detectDanglingSymlinks(manifest: StateManifest): Promise<DoctorPr
       where: dm.path,
       what: `owned dir-merge link '${dm.path}' does not resolve (its store source is present)`,
       repair: `re-materialise the symlink to ${dm.target}`,
+    });
+  }
+  return out;
+}
+
+async function detectDirMergeOwnershipConflicts(manifest: StateManifest): Promise<DoctorProblem[]> {
+  const out: DoctorProblem[] = [];
+  for (const item of manifest.items) {
+    if (item.surface !== 'dir-merge') continue;
+    const dm = item as DirMergeItem;
+    if (!(await hasDirMergeOwnershipConflict(dm))) continue;
+    out.push({
+      kind: 'ownership-conflict',
+      where: dm.path,
+      what: `owned dir-merge path '${dm.path}' has a third identity`,
+      repair: 'NOT repairable automatically — preserve it and resolve ownership manually',
     });
   }
   return out;
@@ -501,6 +530,7 @@ export async function diagnose(paths: Paths): Promise<DoctorProblem[]> {
   problems.push(...detectJournal(paths, manifest));
   problems.push(...detectDurableLifecycle(paths, manifest));
   problems.push(...(await detectDanglingSymlinks(manifest)));
+  problems.push(...(await detectDirMergeOwnershipConflicts(manifest)));
   problems.push(...(await detectStoreDrift(manifest)));
   problems.push(...(await detectMangledMarkers(paths, manifest)));
   problems.push(...(await detectReserialisedConfig(manifest)));

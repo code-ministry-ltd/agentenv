@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import {
   copyFile,
+  chmod,
   lstat,
   mkdir,
   readdir,
@@ -122,6 +123,9 @@ export interface ComposeResult {
   skipped: SurfaceSkip[];
   /** Complete launch-time inventory captured from the published bytes. */
   inventory: ViewInventoryEntry[];
+  /** Placeholder variable names whose resolved values were available to this
+   * composition. Callers remove them from all non-child process environments. */
+  resolvedSecretNames: string[];
 }
 
 /** Persisted beside the view: the staleness marker + build counter. */
@@ -177,7 +181,8 @@ export async function composeView(req: ComposeRequest): Promise<ComposeResult> {
   // half-built temp dir can never be mistaken for a published view (AC: kill mid-build).
   await discardDebris(sessionDir, adapter.id);
 
-  const fingerprint = await fingerprintInputs(req);
+  const relevantSecrets = await relevantSecretFingerprint(req);
+  const fingerprint = await fingerprintInputs(req, relevantSecrets.digests);
   const prevMeta = await readMeta(metaPath);
 
   // Lazy generation: reuse an up-to-date, intact view (rebuild nothing).
@@ -189,6 +194,7 @@ export async function composeView(req: ComposeRequest): Promise<ComposeResult> {
       generation: prevMeta.generation,
       skipped: [],
       inventory: prevMeta.inventory,
+      resolvedSecretNames: relevantSecrets.names,
     };
   }
 
@@ -198,7 +204,8 @@ export async function composeView(req: ComposeRequest): Promise<ComposeResult> {
 
   // Rebuild: compose into a temp dir, then publish by atomic rename.
   const buildDir = join(sessionDir, `.build-${adapter.id}-${rand()}`);
-  await mkdir(buildDir, { recursive: true });
+  await mkdir(buildDir, { recursive: true, mode: 0o700 });
+  await chmod(buildDir, 0o700);
   const skipped: SurfaceSkip[] = [];
   try {
     await composeBucketOne(req, buildDir);
@@ -233,8 +240,16 @@ export async function composeView(req: ComposeRequest): Promise<ComposeResult> {
 
     const generation = (prevMeta?.generation ?? 0) + 1;
     const meta: ViewMeta = { fingerprint, generation, builtAt: now(), viewRoot, inventory };
-    await writeFileAtomic(metaPath, `${JSON.stringify(meta, null, 2)}\n`);
-    return { viewRoot, rebuilt: true, fingerprint, generation, skipped, inventory };
+    await writeFileAtomic(metaPath, `${JSON.stringify(meta, null, 2)}\n`, { mode: 0o600 });
+    return {
+      viewRoot,
+      rebuilt: true,
+      fingerprint,
+      generation,
+      skipped,
+      inventory,
+      resolvedSecretNames: relevantSecrets.names,
+    };
   } catch (err) {
     await rm(buildDir, { recursive: true, force: true });
     throw err;
@@ -580,7 +595,7 @@ async function composeFileBlock(
   if (userContent.trim() === '' && regions.length === 0) return; // nothing to write
   const region = regions.join('\n\n');
   const composed = region === '' ? userContent : appendRegion(userContent, region);
-  await writeFileAtomic(join(buildDir, surface.rootRelativePath), composed);
+  await writeFileAtomic(join(buildDir, surface.rootRelativePath), composed, { mode: 0o600 });
 }
 
 /** The store instruction files an env contributes: base.md then <harness>.md (D2). */
@@ -714,7 +729,7 @@ async function composeConfigKeysFile(
     }
   }
 
-  await writeFileAtomic(join(buildDir, file), serializeConfigDoc(format, seed));
+  await writeFileAtomic(join(buildDir, file), serializeConfigDoc(format, seed), { mode: 0o600 });
 }
 
 /**
@@ -840,7 +855,7 @@ async function discardDebris(sessionDir: string, harnessId: string): Promise<voi
  * launch), and per-surface the env store content (content-hashed — it is ours
  * and small) plus the real target the surface reads.
  */
-async function fingerprintInputs(req: ComposeRequest): Promise<string> {
+async function fingerprintInputs(req: ComposeRequest, secretDigests: readonly unknown[]): Promise<string> {
   const { paths, adapter, envs, realConfigRoot } = req;
   const parts: unknown[] = [
     COMPOSER_VERSION,
@@ -853,7 +868,7 @@ async function fingerprintInputs(req: ComposeRequest): Promise<string> {
     [...envs],
     req.projectRoot ?? null,
     await dirSignature(realConfigRoot),
-    await relevantSecretFingerprint(req),
+    secretDigests,
   ];
 
   for (const surface of adapter.surfaces) {
@@ -933,7 +948,9 @@ async function secretFingerprintKey(paths: Paths): Promise<Buffer> {
 }
 
 /** Keyed digests of only values a substitute-mode session would bake into its view. */
-async function relevantSecretFingerprint(req: ComposeRequest): Promise<unknown[]> {
+async function relevantSecretFingerprint(
+  req: ComposeRequest,
+): Promise<{ digests: unknown[]; names: string[] }> {
   const relevant: Array<{
     context: readonly unknown[];
     name: string;
@@ -970,10 +987,11 @@ async function relevantSecretFingerprint(req: ComposeRequest): Promise<unknown[]
       }
     }
   }
-  if (relevant.length === 0) return [];
+  if (relevant.length === 0) return { digests: [], names: [] };
 
   const key = await secretFingerprintKey(req.paths);
-  return relevant.map(({ context, name, value }) => {
+  const names = [...new Set(relevant.filter(({ value }) => value !== undefined).map(({ name }) => name))];
+  const digests = relevant.map(({ context, name, value }) => {
     const digest = createHmac('sha256', key)
       .update(JSON.stringify(context))
       .update('\0')
@@ -983,6 +1001,7 @@ async function relevantSecretFingerprint(req: ComposeRequest): Promise<unknown[]
       .digest('hex');
     return [context, name, digest];
   });
+  return { digests, names };
 }
 
 async function rawTreeSignature(root: string, allowExternalSymlinks = false): Promise<string> {

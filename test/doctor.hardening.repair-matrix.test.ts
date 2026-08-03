@@ -125,12 +125,11 @@ async function breakEverything(th: TempHome): Promise<Broken> {
   parsed.mcpServers.linear = { url: 'https://linear/v2' };
   writeFileSync(cfgFile, JSON.stringify(parsed, null, 2));
 
-  // --- dangling-symlink: store source present, placed link broken ---
+  // --- dangling-symlink: store source present, owned placement missing ---
   const liveSource = join(paths.envDir('writing'), 'skills', 'live-skill');
   mkdirSync(liveSource, { recursive: true });
   writeFileSync(join(liveSource, 'SKILL.md'), '# live skill\n');
   const danglingLink = join(skillsDir, 'live-skill');
-  symlinkSync(join(realHome, 'nowhere'), danglingLink);
 
   // --- store-drift: the store source was deleted, the link still points at it ---
   const goneSource = join(paths.envDir('writing'), 'skills', 'gone-skill');

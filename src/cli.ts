@@ -1,10 +1,17 @@
 import type { Command, GlobalCliOptions, RunOptions, RunResult } from './command.js';
 import { commands, findCommand } from './commands/index.js';
-import { closeStoreSync, openStoreSync, withNotices } from './commands/store-sync.js';
+import {
+  closeStoreSync,
+  commitRequiredMutation,
+  openStoreSync,
+  withNotices,
+} from './commands/store-sync.js';
+import { recoverPendingFilesystemBundles } from './filesystem-bundle.js';
 import { recoverPendingGlobalCommands } from './global-command.js';
 import { resolvePaths } from './paths.js';
 import { getVersion } from './version.js';
 import { legacyMigrationRequired, migrationGateClosed } from './migration.js';
+import { readState } from './state.js';
 
 export type { RunResult, RunOptions } from './command.js';
 
@@ -80,7 +87,8 @@ export async function run(
   }
 
   const paths = resolvePaths(env);
-  const recoveryCommands = new Set(['__shim', 'doctor', 'migrate', 'status']);
+  const recoveryCommands = new Set(['__shim', 'doctor', 'migrate', 'resolve', 'status']);
+  const recoveryNotices: string[] = [];
   if (!recoveryCommands.has(command.name)) {
     if (await migrationGateClosed(paths)) {
       return formatResult(command.name, globals, paths, {
@@ -101,6 +109,21 @@ export async function run(
     // and `doctor` remain observational/explicit recovery surfaces and therefore
     // intentionally report the pending intent instead.
     await recoverPendingGlobalCommands(paths);
+    const pendingBundle = (await readState(paths)).commands.find(
+      (plan) => plan.kind === 'filesystem-bundle',
+    );
+    if (pendingBundle) {
+      const gitBookkeeping = pendingBundle.commitPoint
+        ? pendingBundle.gitRequired && pendingBundle.gitMessage
+          ? () => commitRequiredMutation(
+              { paths, env, options: { ...options, globals } },
+              pendingBundle.gitMessage!,
+              recoveryNotices,
+            )
+          : undefined
+        : undefined;
+      await recoverPendingFilesystemBundles(paths, gitBookkeeping, pendingBundle.transactionId);
+    }
   }
 
   const context = {
@@ -129,7 +152,7 @@ export async function run(
   } else {
     result = await command.run(context);
   }
-  return formatResult(command.name, globals, paths, result);
+  return formatResult(command.name, globals, paths, withNotices(result, recoveryNotices));
 }
 
 function parseGlobalOptions(

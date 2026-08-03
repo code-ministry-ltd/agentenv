@@ -15,12 +15,16 @@ import { basename, dirname, join } from 'node:path';
  * durability of the directory entry but never process-crash consistency. The
  * parent directory is created if missing.
  */
-export async function writeFileAtomic(path: string, data: Buffer | string): Promise<void> {
+export async function writeFileAtomic(
+  path: string,
+  data: Buffer | string,
+  options: { mode?: number } = {},
+): Promise<void> {
   const dir = dirname(path);
   await mkdir(dir, { recursive: true });
   const tmp = join(dir, `.${basename(path)}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`);
   try {
-    const handle = await open(tmp, 'w');
+    const handle = await open(tmp, 'w', options.mode);
     try {
       await handle.writeFile(data);
       await handle.sync(); // fsync: flush the bytes to disk before the rename

@@ -82,6 +82,10 @@ export interface SyncBeforeResult {
    * Only `sync --resolve` / `--abort` may ever advance a held rebase.
    */
   paused: boolean;
+  /** Existing uncommitted store drift could not be safely committed because it
+   * contains a suspected secret. Destructive store commands must stop before
+   * applying their own effects so they cannot erase the only local copy. */
+  driftCommitBlocked?: boolean;
 }
 
 export interface SyncBeforeRequest {
@@ -140,6 +144,7 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
     return { synced: true, pulled: false, quarantined: false, conflicted: true, paused: true };
   }
 
+  let driftCommitBlocked = false;
   try {
     // 1. Sweep mid-session drift into the store working tree (D9), unless the
     //    caller already swept. The sweep writes back inline-block / config-key /
@@ -152,6 +157,7 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
     //    pulling, so every mid-session change type is committed within one command.
     const drift = await commitStore(paths, env, 'agentenv: sync drift', gitRun);
     if (drift.status === 'blocked') {
+      driftCommitBlocked = true;
       onNotice(
         'agentenv: BLOCKED committing store drift — a suspected secret is present:\n' +
           `${describeFindings(drift.findings ?? [])}\n` +
@@ -200,10 +206,10 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
 
     if (req.offline) {
       onNotice('agentenv: offline mode — remote fetch and candidate promotion were skipped.');
-      return { synced: true, pulled: false, quarantined: false, conflicted: false, paused: false };
+      return { synced: true, pulled: false, quarantined: false, conflicted: false, paused: false, driftCommitBlocked };
     }
     if (req.skipFetch) {
-      return { synced: true, pulled: false, quarantined: false, conflicted: false, paused: false };
+      return { synced: true, pulled: false, quarantined: false, conflicted: false, paused: false, driftCommitBlocked };
     }
 
     // 3. Fetch into a private ref and detached worktree. The canonical store is
@@ -220,11 +226,11 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
 
     if (prepared.status === 'offline' || prepared.status === 'error') {
       onNotice(`agentenv: pull skipped (${prepared.detail}); working offline from the local store.`);
-      return { synced: true, pulled: false, quarantined: false, conflicted: false, paused: false };
+      return { synced: true, pulled: false, quarantined: false, conflicted: false, paused: false, driftCommitBlocked };
     }
     if (prepared.status === 'no-remote' || prepared.status === 'nothing') {
       await clearConflictMarker(paths);
-      return { synced: true, pulled: false, quarantined: false, conflicted: false, paused: false };
+      return { synced: true, pulled: false, quarantined: false, conflicted: false, paused: false, driftCommitBlocked };
     }
     if (prepared.status === 'conflict') {
       const candidate = deferCandidate(beginCandidateValidation(prepared.candidate), [
@@ -236,7 +242,7 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
         `agentenv: sync blocked by a conflict — ${prepared.detail}. ` +
           'The candidate is retained in isolation; run `agentenv sync --resolve` to finish syncing.',
       );
-      return { synced: true, pulled: false, quarantined: false, conflicted: true, paused: false };
+      return { synced: true, pulled: false, quarantined: false, conflicted: true, paused: false, driftCommitBlocked };
     }
     if (prepared.status !== 'prepared') {
       throw new Error(`unexpected candidate preparation state: ${prepared.status}`);
@@ -274,7 +280,7 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
           'secret-bearing and were NOT promoted or materialised. The isolated candidate is retained ' +
           `at ${candidate.worktree} for inspection:\n${parts.join('\n')}`,
       );
-      return { synced: true, pulled: false, quarantined: true, conflicted: false, paused: false };
+      return { synced: true, pulled: false, quarantined: true, conflicted: false, paused: false, driftCommitBlocked };
     }
 
     const blockers = await retainedWriterBlockers(paths, candidate.touchedCanonicalPaths);
@@ -285,7 +291,7 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
         `agentenv: DEFERRED candidate '${candidate.id}' — retained writers must close before ` +
           `promotion (${blockers.join(', ')}). Nothing from the candidate was materialised.`,
       );
-      return { synced: true, pulled: false, quarantined: true, conflicted: false, paused: false };
+      return { synced: true, pulled: false, quarantined: true, conflicted: false, paused: false, driftCommitBlocked };
     }
 
     candidate = approveCandidate(candidate);
@@ -314,7 +320,7 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
         `agentenv: candidate '${candidate.id}' was NOT promoted — ` +
           `${promoted.blocker ?? promoted.detail ?? 'promotion failed'}. It remains isolated.`,
       );
-      return { synced: true, pulled: false, quarantined: true, conflicted: false, paused: false };
+      return { synced: true, pulled: false, quarantined: true, conflicted: false, paused: false, driftCommitBlocked };
     }
 
     candidate = completeCandidatePromotion(candidate, prepared.revision);
@@ -323,11 +329,11 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
     const active = await activeEnvNames(paths);
     const reconcile = await reconcileManifest(paths, active);
     for (const warning of reconcile.warnings) onNotice(warning);
-    return { synced: true, pulled: true, quarantined: false, conflicted: false, paused: false };
+    return { synced: true, pulled: true, quarantined: false, conflicted: false, paused: false, driftCommitBlocked };
   } catch (err) {
     // Fail-soft: sync is best-effort; the local command must still complete.
     onNotice(`agentenv: sync (pull phase) skipped — ${(err as Error).message}`);
-    return { synced: true, pulled: false, quarantined: false, conflicted: false, paused: false };
+    return { synced: true, pulled: false, quarantined: false, conflicted: false, paused: false, driftCommitBlocked };
   }
 }
 
