@@ -53,7 +53,7 @@ function remoteWithRejectedChange(): { remote: string; pushRejectedChange: () =>
   };
 }
 
-function remoteWithValidChange(): { remote: string; pushValidChange: () => void } {
+function remoteWithValidChange(envName = 'remote-env'): { remote: string; pushValidChange: () => void } {
   const root = mkdtempSync(join(tmpdir(), 'agentenv-candidate-valid-'));
   dirs.push(root);
   const bare = join(root, 'store.git');
@@ -64,7 +64,7 @@ function remoteWithValidChange(): { remote: string; pushValidChange: () => void 
     pushValidChange: () => {
       const clone = join(root, 'other');
       git(['clone', pathToFileURL(bare).href, clone]);
-      const added = join(clone, 'environments', 'remote-env');
+      const added = join(clone, 'environments', envName);
       mkdirSync(added, { recursive: true });
       writeFileSync(
         join(added, 'env.yaml'),
@@ -107,7 +107,7 @@ describe('merge baseline — rejected candidate visibility', () => {
     expect(`${status.stdout}\n${status.stderr ?? ''}`).toMatch(/rejected|quarantined|candidate/i);
   });
 
-  it('defers a valid candidate while a retained generation can still write', async () => {
+  it('promotes an unrelated candidate while a retained generation can still write', async () => {
     const th = makeTempHome({
       GIT_CONFIG_GLOBAL: '/dev/null',
       GIT_CONFIG_SYSTEM: '/dev/null',
@@ -128,8 +128,38 @@ describe('merge baseline — rejected candidate visibility', () => {
     remote.pushValidChange();
 
     const result = await run(['use', 'work', '--global'], { env, adapters });
+    expect(result.stderr ?? '').not.toMatch(/DEFERRED/);
+    expect(readFileSync(join(paths.envDir('remote-env'), 'env.yaml'), 'utf8')).toContain(
+      'valid remote environment',
+    );
+    expect((await readState(paths)).candidates).toContainEqual(
+      expect.objectContaining({
+        phase: 'promoted',
+      }),
+    );
+  });
+
+  it('defers a candidate that touches an environment owned by a retained generation', async () => {
+    const th = makeTempHome({
+      GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_CONFIG_SYSTEM: '/dev/null',
+    });
+    homes.push(th);
+    const env = { ...th.env, [FIXTURE_CONFIG_ENV]: join(th.home, 'fixture-real') };
+    const adapters = [makeFixtureAdapter()];
+    const paths = resolvePaths(env);
+
+    await run(['init'], { env });
+    await run(['create', 'work'], { env, adapters });
+    const remote = remoteWithValidChange('work');
+    await run(['remote', remote.remote], { env });
+    const state = await readState(paths);
+    state.generations.push(publishGeneration(createViewGeneration('live-generation', ['work'])));
+    await writeState(paths, state);
+    remote.pushValidChange();
+
+    const result = await run(['use', 'work', '--global'], { env, adapters });
     expect(result.stderr ?? '').toMatch(/DEFERRED/);
-    expect(() => readFileSync(join(paths.envDir('remote-env'), 'env.yaml'), 'utf8')).toThrow();
     expect((await readState(paths)).candidates).toContainEqual(
       expect.objectContaining({
         phase: 'deferred',

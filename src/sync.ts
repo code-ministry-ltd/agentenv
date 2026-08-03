@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { relative, sep } from 'node:path';
 import type { Adapter } from './adapter.js';
 import { adoptSweep, singular } from './adopt.js';
 import { driftSweep } from './drift.js';
@@ -252,7 +253,7 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
       return { synced: true, pulled: false, quarantined: true, conflicted: false, paused: false };
     }
 
-    const blockers = await retainedWriterBlockers(paths);
+    const blockers = await retainedWriterBlockers(paths, candidate.touchedCanonicalPaths);
     if (blockers.length > 0) {
       candidate = deferCandidate(candidate, blockers);
       await persistCandidate(paths, candidate);
@@ -354,17 +355,42 @@ async function persistCandidate(paths: Paths, candidate: SyncCandidate): Promise
   });
 }
 
-/** Conservative promotion gate until path-scoped writer reservations are wired. */
-async function retainedWriterBlockers(paths: Paths): Promise<string[]> {
+function pathsOverlap(left: string, right: string): boolean {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
+/** Block only retained writers that can still write one of the candidate's paths. */
+async function retainedWriterBlockers(
+  paths: Paths,
+  touchedCanonicalPaths: readonly string[],
+): Promise<string[]> {
   const manifest = await readState(paths);
   const blockers: string[] = [];
+  const touchedEnvs = new Set(
+    touchedCanonicalPaths
+      .map((path) => /^environments\/([^/]+)(?:\/|$)/.exec(path)?.[1])
+      .filter((name): name is string => name !== undefined),
+  );
   for (const generation of manifest.generations) {
-    if (generation.phase !== 'swept' && generation.phase !== 'collected') {
+    if (
+      generation.phase !== 'swept' &&
+      generation.phase !== 'collected' &&
+      generation.envs.some((env) => touchedEnvs.has(env))
+    ) {
       blockers.push(`generation:${generation.id}`);
     }
   }
   for (const projection of manifest.globalProjections) {
-    if (projection.phase !== 'reconciled' && projection.phase !== 'collected') {
+    const canonical = projection.canonicalPath
+      ? relative(paths.store, projection.canonicalPath).split(sep).join('/')
+      : null;
+    if (
+      projection.phase !== 'reconciled' &&
+      projection.phase !== 'collected' &&
+      canonical !== null &&
+      !canonical.startsWith('../') &&
+      touchedCanonicalPaths.some((path) => pathsOverlap(path, canonical))
+    ) {
       blockers.push(`global-projection:${projection.id}`);
     }
   }
