@@ -8,7 +8,8 @@ export async function retainGlobalCowBytes(projection: GlobalProjection): Promis
     throw new Error(`projection '${projection.id}' lacks retained paths`);
   }
   await mkdir(dirname(projection.retainedPath), { recursive: true });
-  await rm(projection.retainedPath, { recursive: true, force: true });
+  // Never remove an existing retained target. It may be the sole surviving inode
+  // after a killed handoff; callers recover from identities instead.
   await rename(projection.surfacePath, projection.retainedPath);
 }
 

@@ -423,7 +423,7 @@ function detectDurableLifecycle(paths: Paths, manifest: StateManifest): DoctorPr
   }
 
   for (const projection of manifest.globalProjections) {
-    if (!['building', 'retired', 'reconciling', 'quarantined'].includes(projection.phase)) {
+    if (!['building', 'retiring', 'retired', 'reconciling', 'quarantined'].includes(projection.phase)) {
       continue;
     }
     out.push({

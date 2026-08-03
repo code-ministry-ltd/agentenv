@@ -5,6 +5,7 @@ import type { RetainedConfigKeysProvenance } from './config-keys.js';
 export type GlobalProjectionPhase =
   | 'building'
   | 'active'
+  | 'retiring'
   | 'retired'
   | 'reconciling'
   | 'reconciled'
@@ -28,6 +29,8 @@ export interface GlobalProjection {
   createdAt?: number;
   retiredAt?: number;
   canonicalRevision?: string;
+  /** Identity of the fresh live copy restored during a crash-recoverable handoff. */
+  retirementSurfaceIdentity?: PathIdentity;
   failure?: string;
 }
 
@@ -62,7 +65,9 @@ export function publishProjection(projection: GlobalProjection): GlobalProjectio
 
 /** Retire only the live pointer; the backing projection remains retained. */
 export function retireProjection(projection: GlobalProjection): GlobalProjection {
-  requirePhase(projection, 'active');
+  if (projection.phase !== 'active' && projection.phase !== 'retiring') {
+    throw new Error(`projection must be active or retiring; it is ${projection.phase}`);
+  }
   return { ...projection, phase: 'retired' };
 }
 

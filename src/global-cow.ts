@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { chmod, lstat, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { chmod, cp, lstat, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import {
   beginProjectionReconciliation,
   completeProjectionReconciliation,
@@ -147,17 +147,81 @@ export async function retireActiveGlobalCowSurface(
   paths: Paths,
   surfacePath: string,
   now: number,
+  afterBoundary?: (boundary: 'intent' | 'retained' | 'restored') => Promise<void>,
 ): Promise<GlobalProjection | null> {
   return withLock(paths, async () => {
     const manifest = await readState(paths);
     const index = manifest.globalProjections.findIndex(
-      (projection) => projection.surfacePath === surfacePath && projection.phase === 'active',
+      (projection) =>
+        projection.surfacePath === surfacePath &&
+        (projection.phase === 'active' || projection.phase === 'retiring'),
     );
     if (index === -1) return null;
-    const projection = manifest.globalProjections[index]!;
-    await retainGlobalCowBytes(projection);
-    await mirrorCowToCanonical(projection.retainedPath!, surfacePath);
-    const observed = await capturePathIdentity(projection.retainedPath!);
+    let projection = manifest.globalProjections[index]!;
+    if (!projection.retainedPath) throw new Error(`projection '${projection.id}' lacks a retained path`);
+    const retainedPath = projection.retainedPath;
+
+    if (projection.phase === 'active') {
+      const retainedBefore = await capturePathIdentity(retainedPath);
+      if (retainedBefore.kind !== 'absent') {
+        manifest.globalProjections[index] = {
+          ...projection,
+          phase: 'quarantined',
+          failure: 'retained handoff target already existed before retirement',
+        };
+        await writeState(paths, manifest);
+        throw new Error(`projection '${projection.id}' retained handoff target already exists`);
+      }
+      projection = { ...projection, phase: 'retiring' };
+      manifest.globalProjections[index] = projection;
+      await writeState(paths, manifest);
+      await afterBoundary?.('intent');
+    }
+
+    let retained = await capturePathIdentity(retainedPath);
+    let live = await capturePathIdentity(surfacePath);
+    if (retained.kind === 'absent') {
+      if (live.kind === 'absent') {
+        manifest.globalProjections[index] = {
+          ...projection,
+          phase: 'quarantined',
+          failure: 'both live and retained projection bytes are absent during retirement',
+        };
+        await writeState(paths, manifest);
+        throw new Error(`projection '${projection.id}' has no live or retained bytes`);
+      }
+      await retainGlobalCowBytes(projection);
+      retained = await capturePathIdentity(retainedPath);
+      live = { kind: 'absent' };
+      await afterBoundary?.('retained');
+    }
+
+    if (live.kind === 'absent') {
+      await mirrorCowToCanonical(retainedPath, surfacePath);
+      live = await capturePathIdentity(surfacePath);
+      projection = { ...projection, retirementSurfaceIdentity: live };
+      manifest.globalProjections[index] = projection;
+      await writeState(paths, manifest);
+      await afterBoundary?.('restored');
+    } else if (
+      !projection.retirementSurfaceIdentity ||
+      !identitiesEqual(live, projection.retirementSurfaceIdentity)
+    ) {
+      if (!identitiesEqual(live, retained)) {
+        manifest.globalProjections[index] = {
+          ...projection,
+          phase: 'quarantined',
+          failure: 'live surface changed to a third identity during projection retirement',
+        };
+        await writeState(paths, manifest);
+        throw new Error(`projection '${projection.id}' live surface has a third identity`);
+      }
+      projection = { ...projection, retirementSurfaceIdentity: live };
+      manifest.globalProjections[index] = projection;
+      await writeState(paths, manifest);
+    }
+
+    const observed = await capturePathIdentity(retainedPath);
     const retired = {
       ...observeProjection(retireProjection(projection), observed),
       retiredAt: now,
@@ -235,6 +299,39 @@ async function publishCanonicalWrites(
   });
 }
 
+async function publishIdentityCanonical(
+  paths: Paths,
+  projectionId: string,
+  source: string,
+  target: string,
+  afterApply?: (entry: StagedBundleEntry) => Promise<void>,
+  gitBookkeeping?: () => Promise<void>,
+): Promise<void> {
+  const transactionId = `projection-${projectionId}`;
+  const stagingRoot = join(paths.live, 'commands', transactionId);
+  const staged = join(stagingRoot, 'canonical-identity');
+  await rm(stagingRoot, { recursive: true, force: true });
+  await mkdir(stagingRoot, { recursive: true });
+  const sourceStats = await lstat(source);
+  await cp(source, staged, {
+    recursive: sourceStats.isDirectory(),
+    verbatimSymlinks: true,
+    preserveTimestamps: true,
+  });
+  try {
+    await publishStagedBundle({
+      paths,
+      transactionId,
+      stagingRoot,
+      entries: [{ id: 'canonical-identity', target, staged }],
+      ...(afterApply ? { afterApply } : {}),
+      ...(gitBookkeeping ? { gitBookkeeping } : {}),
+    });
+  } finally {
+    await rm(stagingRoot, { recursive: true, force: true });
+  }
+}
+
 /** Explicit, three-way reverse projection for retained global writer copies. */
 export async function reconcileRetiredGlobalCows(
   paths: Paths,
@@ -301,6 +398,7 @@ export async function reconcileRetiredGlobalCows(
     );
     try {
       let canonicalWrites: Array<RetainedCanonicalWrite | RetainedConfigCanonicalWrite> = [];
+      let identityPublished = false;
       if (!identitiesEqual(observed, current.baseline)) {
         const source = current.transform === 'command-skill'
           ? join(current.retainedPath, 'SKILL.md')
@@ -336,17 +434,27 @@ export async function reconcileRetiredGlobalCows(
               req.adapters,
             );
           } else {
-            await mirrorCowToCanonical(source, current.canonicalPath);
+            await publishIdentityCanonical(
+              paths,
+              id,
+              source,
+              current.canonicalPath,
+              req.afterCanonicalApply,
+              req.gitBookkeeping,
+            );
+            identityPublished = true;
           }
         }
       }
-      await publishCanonicalWrites(
-        paths,
-        id,
-        canonicalWrites,
-        req.afterCanonicalApply,
-        req.gitBookkeeping,
-      );
+      if (!identityPublished) {
+        await publishCanonicalWrites(
+          paths,
+          id,
+          canonicalWrites,
+          req.afterCanonicalApply,
+          req.gitBookkeeping,
+        );
+      }
       const revision = JSON.stringify(await capturePathIdentity(current.canonicalPath));
       await updateProjection(paths, id, (projection) =>
         completeProjectionReconciliation(projection, revision),

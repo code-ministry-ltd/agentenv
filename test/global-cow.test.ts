@@ -12,7 +12,11 @@ import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { afterEach, describe, expect, it } from 'vitest';
 import { dematerialiseGlobal, materialiseGlobal } from '../src/engine.js';
-import { reconcileRetiredGlobalCows } from '../src/global-cow.js';
+import {
+  globalCowRetainedPath,
+  reconcileRetiredGlobalCows,
+  retireActiveGlobalCowSurface,
+} from '../src/global-cow.js';
 import { resolvePaths } from '../src/paths.js';
 import { readState } from '../src/state.js';
 import { FIXTURE_CONFIG_ENV, makeFixtureAdapter } from './fixtures/fixture-adapter.js';
@@ -24,6 +28,75 @@ afterEach(() => {
 });
 
 describe('retained global COW integration', () => {
+  it('resumes an interrupted live-to-retained handoff without deleting its only bytes', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const realRoot = join(home.home, 'real');
+    const canonical = join(paths.envDir('writing'), 'skills', 'w-skill', 'SKILL.md');
+    mkdirSync(join(canonical, '..'), { recursive: true });
+    writeFileSync(canonical, '# ORIGINAL\n');
+    const env = { ...home.env, [FIXTURE_CONFIG_ENV]: realRoot };
+    await materialiseGlobal({
+      paths,
+      adapters: [makeFixtureAdapter()],
+      envs: ['writing'],
+      env,
+    });
+    const live = join(realRoot, 'skills', 'w-skill');
+    const projection = (await readState(paths)).globalProjections.find(
+      (candidate) => candidate.surfacePath === live,
+    )!;
+
+    await expect(
+      retireActiveGlobalCowSurface(paths, live, Date.now(), async (boundary) => {
+        if (boundary === 'retained') throw new Error('injected kill after retain');
+      }),
+    ).rejects.toThrow(/injected kill/);
+    expect((await readState(paths)).globalProjections.find((item) => item.id === projection.id)?.phase)
+      .toBe('retiring');
+    expect(lstatSync(globalCowRetainedPath(paths, projection.id)).isDirectory()).toBe(true);
+    expect(() => lstatSync(live)).toThrow();
+
+    const retired = await retireActiveGlobalCowSurface(paths, live, Date.now());
+    expect(retired?.phase).toBe('retired');
+    expect(readFileSync(join(live, 'SKILL.md'), 'utf8')).toBe('# ORIGINAL\n');
+    expect(readFileSync(join(globalCowRetainedPath(paths, projection.id), 'SKILL.md'), 'utf8'))
+      .toBe('# ORIGINAL\n');
+  });
+
+  it('quarantines rather than deleting a pre-existing retained handoff target', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const realRoot = join(home.home, 'real');
+    const canonical = join(paths.envDir('writing'), 'skills', 'w-skill', 'SKILL.md');
+    mkdirSync(join(canonical, '..'), { recursive: true });
+    writeFileSync(canonical, '# ORIGINAL\n');
+    const env = { ...home.env, [FIXTURE_CONFIG_ENV]: realRoot };
+    await materialiseGlobal({
+      paths,
+      adapters: [makeFixtureAdapter()],
+      envs: ['writing'],
+      env,
+    });
+    const live = join(realRoot, 'skills', 'w-skill');
+    const projection = (await readState(paths)).globalProjections.find(
+      (candidate) => candidate.surfacePath === live,
+    )!;
+    const retained = globalCowRetainedPath(paths, projection.id);
+    mkdirSync(retained, { recursive: true });
+    writeFileSync(join(retained, 'SKILL.md'), '# THIRD IDENTITY\n');
+
+    await expect(retireActiveGlobalCowSurface(paths, live, Date.now())).rejects.toThrow(
+      /already exists/,
+    );
+    expect(readFileSync(join(live, 'SKILL.md'), 'utf8')).toBe('# ORIGINAL\n');
+    expect(readFileSync(join(retained, 'SKILL.md'), 'utf8')).toBe('# THIRD IDENTITY\n');
+    expect((await readState(paths)).globalProjections.find((item) => item.id === projection.id)?.phase)
+      .toBe('quarantined');
+  });
+
   it('keeps a late write through an open descriptor after global drop', async () => {
     const home = makeTempHome();
     homes.push(home);
@@ -80,6 +153,39 @@ describe('retained global COW integration', () => {
     expect(readFileSync(join(projection!.retainedPath!, 'SKILL.md'), 'utf8')).toBe(
       '# LATE WRITE\n',
     );
+  });
+
+  it('rolls an identity projection back when canonical publication faults', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const realRoot = join(home.home, 'real');
+    const envDir = paths.envDir('writing');
+    const canonical = join(envDir, 'skills', 'w-skill', 'SKILL.md');
+    mkdirSync(join(envDir, 'skills', 'w-skill'), { recursive: true });
+    writeFileSync(canonical, '# ORIGINAL\n');
+    const env = { ...home.env, [FIXTURE_CONFIG_ENV]: realRoot };
+    const adapter = makeFixtureAdapter();
+
+    await materialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], env });
+    await dematerialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], all: true, env });
+    const projection = (await readState(paths)).globalProjections.find(
+      (candidate) => candidate.canonicalPath === join(envDir, 'skills', 'w-skill'),
+    )!;
+    writeFileSync(join(projection.retainedPath!, 'SKILL.md'), '# EDITED\n');
+
+    expect(
+      await reconcileRetiredGlobalCows(paths, {
+        ids: [projection.id],
+        quiescent: true,
+        afterCanonicalApply: async () => {
+          throw new Error('injected identity publication failure');
+        },
+      }),
+    ).toEqual({ reconciled: 0, quarantined: 1 });
+    expect(readFileSync(canonical, 'utf8')).toBe('# ORIGINAL\n');
+    expect(readFileSync(join(projection.retainedPath!, 'SKILL.md'), 'utf8')).toBe('# EDITED\n');
+    expect((await readState(paths)).commands).toEqual([]);
   });
 
   it('retains late whole-file writes to a global instruction projection', async () => {

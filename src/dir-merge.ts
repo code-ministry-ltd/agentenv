@@ -12,13 +12,11 @@ import {
 } from 'node:fs/promises';
 import { basename, join, sep } from 'node:path';
 import { backup, restore, type BackupRef } from './backups.js';
-import { retainGlobalCowBytes } from './cow-files.js';
-import { observeProjection, retireProjection, type GlobalProjection } from './global-projection.js';
+import { retireActiveGlobalCowSurface } from './global-cow.js';
 import { beginTransaction } from './journal.js';
 import { withLock } from './lock.js';
-import { capturePathIdentity } from './path-identity.js';
 import type { Paths } from './paths.js';
-import { findOwner, readState, writeState, type ManifestItemBase } from './state.js';
+import { findOwner, readState, type ManifestItemBase } from './state.js';
 
 /**
  * The dir-merge surface: skills, agents and commands, whose harness home is a
@@ -371,23 +369,16 @@ export async function dematerialise(
   item: DirMergeItem,
   onWarn: (message: string) => void = (m: string) => console.warn(m),
 ): Promise<void> {
+  if ((item.action === 'copy' || item.action === 'cow') && item.projectionId) {
+    await retireActiveGlobalCowSurface(paths, item.path, Date.now());
+  }
   await withLock(paths, async () => {
     const restoreRef: BackupRef = item.backupRef ?? { kind: 'absent' };
     // Defensive: an `absent` backup means "we created this from nothing, so undo
     // = delete item.path". Only delete if it is still the item we placed; if the
     // user replaced it out-of-band, restoring `absent` would rm THEIR data — so
     // leave their content in place and drop only our ownership.
-    const initial = await readState(paths);
-    const projection = item.projectionId
-      ? initial.globalProjections.find((candidate) => candidate.id === item.projectionId)
-      : undefined;
     let effect = (): Promise<void> => restore(paths, restoreRef, item.path);
-    if ((item.action === 'copy' || item.action === 'cow') && projection?.phase === 'active') {
-      effect = async (): Promise<void> => {
-        await retainGlobalCowBytes(projection);
-        await restore(paths, restoreRef, item.path);
-      };
-    }
     if (restoreRef.kind === 'absent' && !(await isStillOurs(item))) {
       onWarn(
         `agentenv: '${item.path}' is no longer the item agentenv placed — leaving it ` +
@@ -407,20 +398,6 @@ export async function dematerialise(
         effect,
       );
       await tx.commit();
-      if (projection?.phase === 'active' && projection.retainedPath) {
-        const manifest = await readState(paths);
-        const index = manifest.globalProjections.findIndex(
-          (candidate) => candidate.id === projection.id,
-        );
-        if (index !== -1) {
-          const observed = await capturePathIdentity(projection.retainedPath);
-          manifest.globalProjections[index] = {
-            ...observeProjection(retireProjection(manifest.globalProjections[index]!), observed),
-            retiredAt: Date.now(),
-          } as GlobalProjection;
-          await writeState(paths, manifest);
-        }
-      }
     } catch (err) {
       await tx.rollback();
       throw err;

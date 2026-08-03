@@ -221,7 +221,7 @@ const COMMAND_PHASES = new Set([
 ]);
 const OPERATION_STATES = new Set<OperationState>(['pending', 'applying', 'applied', 'undoing', 'undone']);
 const GENERATION_PHASES = new Set(['building', 'published', 'closing', 'sweeping', 'swept', 'quarantined', 'collected']);
-const GLOBAL_PROJECTION_PHASES = new Set(['building', 'active', 'retired', 'reconciling', 'reconciled', 'quarantined', 'collected']);
+const GLOBAL_PROJECTION_PHASES = new Set(['building', 'active', 'retiring', 'retired', 'reconciling', 'reconciled', 'quarantined', 'collected']);
 const CANDIDATE_PHASES = new Set(['fetched', 'validating', 'approved', 'deferred', 'rejected', 'promoting', 'promoted', 'abandoned']);
 const MIGRATION_PHASES = new Set(['planned', 'backing-up', 'backed-up', 'importing', 'imported', 'probing', 'opened', 'rolling-back', 'rolled-back']);
 
@@ -368,6 +368,10 @@ function validateGlobalProjection(record: Record<string, unknown>, label: string
   if (record.canonicalBaseline !== undefined) {
     const canonical = validatePathIdentity(record.canonicalBaseline);
     if (canonical) return `${label}.canonicalBaseline ${canonical}`;
+  }
+  if (record.retirementSurfaceIdentity !== undefined) {
+    const restored = validatePathIdentity(record.retirementSurfaceIdentity);
+    if (restored) return `${label}.retirementSurfaceIdentity ${restored}`;
   }
   return null;
 }
