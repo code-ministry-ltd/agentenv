@@ -20,7 +20,7 @@ export interface GlobalProjection {
   canonicalPath?: string;
   canonicalBaseline?: PathIdentity;
   ownerEnv?: string;
-  transform?: 'identity' | 'command-skill';
+  transform?: 'identity' | 'command-skill' | 'file-block' | 'config-keys';
   createdAt?: number;
   retiredAt?: number;
   canonicalRevision?: string;

@@ -40,6 +40,7 @@ import {
   abandonBuildingGlobalCow,
   beginGlobalCowProjection,
   finishGlobalCowPublication,
+  retireActiveGlobalCowSurface,
 } from './global-cow.js';
 import { withLock } from './lock.js';
 import type { Paths } from './paths.js';
@@ -567,14 +568,43 @@ async function materialiseFileBlock(
   target: string,
 ): Promise<number> {
   const { paths, envs } = req;
-  let applied = 0;
+  const planned: { env: string; sources: FileBlockSource[] }[] = [];
   for (const env of envs) {
     const sources = await instructionSources(paths, adapter, env);
-    if (sources.length === 0) continue;
-    await fbMaterialise(paths, { target, env, mode: surface.layering, sources });
-    applied += 1;
+    if (sources.length > 0) planned.push({ env, sources });
   }
-  return applied;
+  if (planned.length === 0) return 0;
+
+  // Reconfiguration gets a new physical file. Detach an earlier projection
+  // first so a harness holding its old descriptor can only write retained bytes.
+  await retireActiveGlobalCowSurface(paths, target, Date.now());
+  const projectionId = randomUUID();
+  await beginGlobalCowProjection(paths, {
+    id: projectionId,
+    surfacePath: target,
+    canonicalPath: planned[0]!.sources[0]!.storePath,
+    ownerEnv: planned.at(-1)!.env,
+    transform: 'file-block',
+    createdAt: Date.now(),
+  });
+
+  let applied = 0;
+  try {
+    for (const { env, sources } of planned) {
+      await fbMaterialise(paths, { target, env, mode: surface.layering, sources });
+      applied += 1;
+    }
+    await finishGlobalCowPublication(paths, projectionId, target);
+    return applied;
+  } catch (error) {
+    // Keep intent when any file-block write committed; otherwise discard the
+    // inert building record. Doctor can diagnose the retained partial case.
+    const state = await readState(paths);
+    if (!state.items.some((item) => item.surface === 'file-block' && item.path === target)) {
+      await abandonBuildingGlobalCow(paths, projectionId);
+    }
+    throw error;
+  }
 }
 
 /**
@@ -682,17 +712,35 @@ async function materialiseConfigKeys(
     w.items.push({ item, surfaceId: p.surface.id, env: p.env });
   };
 
-  return withLock(paths, async () => {
-    // BASELINE validation (F5/7), BEFORE any write. Cursor's validator rejects the file
-    // if ANY entry is malformed — explicitly including a PRE-EXISTING user entry. Without
-    // this check a file that was already broken makes our own (valid) injection look like
-    // the culprit: we write, the whole file is rejected, we roll back, and we blame
-    // ourselves — forever, with nothing pointing at the real offender. So a file that is
-    // already invalid is left completely alone and reported under its own reason.
-    const blocked = await baselineRejectedFiles(paths, planned, skips, onWarn);
-    const writable = blocked.size === 0 ? planned : planned.filter((p) => !blocked.has(p.file));
-    if (writable.length === 0) return 0;
+  // BASELINE validation (F5/7), BEFORE any write. Cursor's validator rejects the file
+  // if ANY entry is malformed — explicitly including a PRE-EXISTING user entry. Without
+  // this check a file that was already broken makes our own (valid) injection look like
+  // the culprit: we write, the whole file is rejected, we roll back, and we blame
+  // ourselves — forever, with nothing pointing at the real offender. So a file that is
+  // already invalid is left completely alone and reported under its own reason.
+  const blocked = await baselineRejectedFiles(paths, planned, skips, onWarn);
+  const writable = blocked.size === 0 ? planned : planned.filter((p) => !blocked.has(p.file));
+  if (writable.length === 0) return 0;
 
+  // One retained whole-file projection per physical config. This happens before
+  // the config transaction because projection helpers own the lifecycle lock.
+  const projections = new Map<string, string>();
+  for (const p of writable) {
+    if (projections.has(p.file)) continue;
+    await retireActiveGlobalCowSurface(paths, p.file, Date.now());
+    const id = randomUUID();
+    await beginGlobalCowProjection(paths, {
+      id,
+      surfacePath: p.file,
+      canonicalPath: join(paths.envDir(p.env), p.surface.storeKind),
+      ownerEnv: p.env,
+      transform: 'config-keys',
+      createdAt: Date.now(),
+    });
+    projections.set(p.file, id);
+  }
+
+  const applied = await withLock(paths, async () => {
     const tx = await beginTransaction(paths);
     const manifest = await readState(paths); // ownership snapshot for idempotency
     let applied = 0;
@@ -795,6 +843,15 @@ async function materialiseConfigKeys(
     applied -= await validateWrittenConfigFiles(paths, written, skips, onWarn);
     return applied;
   });
+  const postApply = await readState(paths);
+  for (const [file, id] of projections) {
+    if (postApply.items.some((item) => item.surface === 'config-keys' && item.path === file)) {
+      await finishGlobalCowPublication(paths, id, file);
+    } else {
+      await abandonBuildingGlobalCow(paths, id);
+    }
+  }
+  return applied;
 }
 
 /** One config-keys injection, resolved to the real file it targets. */
@@ -1280,6 +1337,18 @@ export async function dematerialiseGlobal(req: DematerialiseGlobalRequest): Prom
   };
 
   const owned = manifest.items.filter((i) => toDrop.includes(i.ownerEnv) && inScope(i.path));
+
+  // Retire whole-file writer projections before any marker/key surgery replaces
+  // their live inode. Existing descriptors continue writing the retained path;
+  // dematerialisation operates on the fresh copy restored at the real path.
+  const wholeFilePaths = new Set(
+    owned
+      .filter((item) => item.surface === 'file-block' || item.surface === 'config-keys')
+      .map((item) => item.path),
+  );
+  for (const path of wholeFilePaths) {
+    await retireActiveGlobalCowSurface(paths, path, Date.now());
+  }
 
   // dir-merge and file-block: each self-locks + self-journals (one atomic op).
   let removed = 0;

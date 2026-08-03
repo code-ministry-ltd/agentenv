@@ -11,6 +11,7 @@ import {
   type GlobalProjection,
 } from './global-projection.js';
 import { mirrorCowToCanonical } from './cow-files.js';
+import { retainGlobalCowBytes } from './cow-files.js';
 import { scanTextForSecrets } from './git.js';
 import { withLock } from './lock.js';
 import { capturePathIdentity, identitiesEqual } from './path-identity.js';
@@ -22,7 +23,7 @@ export interface BeginGlobalCowRequest {
   surfacePath: string;
   canonicalPath: string;
   ownerEnv: string;
-  transform?: 'identity' | 'command-skill';
+  transform?: 'identity' | 'command-skill' | 'file-block' | 'config-keys';
   createdAt: number;
 }
 
@@ -111,6 +112,36 @@ export async function markGlobalCowRetired(
   }));
 }
 
+/**
+ * Detach an active projection without invalidating already-open descriptors, then
+ * seed a fresh live path from the retained bytes for safe dematerialisation or
+ * replacement. The old inode remains addressable through `retainedPath`.
+ */
+export async function retireActiveGlobalCowSurface(
+  paths: Paths,
+  surfacePath: string,
+  now: number,
+): Promise<GlobalProjection | null> {
+  return withLock(paths, async () => {
+    const manifest = await readState(paths);
+    const index = manifest.globalProjections.findIndex(
+      (projection) => projection.surfacePath === surfacePath && projection.phase === 'active',
+    );
+    if (index === -1) return null;
+    const projection = manifest.globalProjections[index]!;
+    await retainGlobalCowBytes(projection);
+    await mirrorCowToCanonical(projection.retainedPath!, surfacePath);
+    const observed = await capturePathIdentity(projection.retainedPath!);
+    const retired = {
+      ...observeProjection(retireProjection(projection), observed),
+      retiredAt: now,
+    };
+    manifest.globalProjections[index] = retired;
+    await writeState(paths, manifest);
+    return retired;
+  });
+}
+
 export interface ReconcileGlobalCowRequest {
   ids: readonly string[];
   /** Callers assert every unsupervised writer for these ids is closed. */
@@ -178,6 +209,11 @@ export async function reconcileRetiredGlobalCows(
         throw new Error('canonical changed concurrently with retained projection');
       }
       if (!identitiesEqual(observed, current.baseline)) {
+        if (current.transform === 'file-block' || current.transform === 'config-keys') {
+          throw new Error(
+            `retained ${current.transform} projection requires field-level reconciliation`,
+          );
+        }
         const source = current.transform === 'command-skill'
           ? join(current.retainedPath, 'SKILL.md')
           : current.retainedPath;

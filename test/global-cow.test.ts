@@ -81,6 +81,96 @@ describe('retained global COW integration', () => {
     );
   });
 
+  it('retains late whole-file writes to a global instruction projection', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const realRoot = join(home.home, 'real');
+    const instructionFile = join(realRoot, 'INSTRUCTIONS.md');
+    const canonical = join(paths.envDir('writing'), 'instructions', 'base.md');
+    mkdirSync(join(paths.envDir('writing'), 'instructions'), { recursive: true });
+    mkdirSync(realRoot, { recursive: true });
+    writeFileSync(instructionFile, '# USER INSTRUCTIONS\n');
+    writeFileSync(canonical, '# MANAGED BASELINE\n');
+    const env = { ...home.env, [FIXTURE_CONFIG_ENV]: realRoot };
+    const adapter = makeFixtureAdapter();
+
+    await materialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], env });
+    const descriptor = openSync(instructionFile, 'r+');
+
+    await dematerialiseGlobal({
+      paths,
+      adapters: [adapter],
+      envs: ['writing'],
+      all: true,
+      env,
+    });
+
+    ftruncateSync(descriptor, 0);
+    writeSync(descriptor, '# LATE WHOLE-FILE WRITE\n', 0, 'utf8');
+    closeSync(descriptor);
+
+    const projection = (await readState(paths)).globalProjections.find(
+      (candidate) => candidate.surfacePath === instructionFile,
+    );
+    expect(projection).toMatchObject({ phase: 'retired', transform: 'file-block' });
+    expect(readFileSync(projection!.retainedPath!, 'utf8')).toBe('# LATE WHOLE-FILE WRITE\n');
+    expect(readFileSync(instructionFile, 'utf8')).toBe('# USER INSTRUCTIONS\n');
+    expect(readFileSync(canonical, 'utf8')).toBe('# MANAGED BASELINE\n');
+
+    expect(
+      await reconcileRetiredGlobalCows(paths, { ids: [projection!.id], quiescent: true }),
+    ).toEqual({ reconciled: 0, quarantined: 1 });
+    expect(readFileSync(canonical, 'utf8')).toBe('# MANAGED BASELINE\n');
+    expect(readFileSync(projection!.retainedPath!, 'utf8')).toBe('# LATE WHOLE-FILE WRITE\n');
+  });
+
+  it('retains late whole-file writes to a global config-key projection', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const realRoot = join(home.home, 'real');
+    const configFile = join(realRoot, 'config.json');
+    const canonical = join(paths.envDir('writing'), 'mcp', 'servers.yaml');
+    mkdirSync(join(paths.envDir('writing'), 'mcp'), { recursive: true });
+    mkdirSync(realRoot, { recursive: true });
+    writeFileSync(configFile, '{"mcpServers":{"user":{"url":"https://user"}}}\n');
+    writeFileSync(canonical, 'managed:\n  url: https://managed\n');
+    const env = { ...home.env, [FIXTURE_CONFIG_ENV]: realRoot };
+    const adapter = makeFixtureAdapter();
+
+    await materialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], env });
+    const descriptor = openSync(configFile, 'r+');
+
+    await dematerialiseGlobal({
+      paths,
+      adapters: [adapter],
+      envs: ['writing'],
+      all: true,
+      env,
+    });
+
+    ftruncateSync(descriptor, 0);
+    writeSync(descriptor, '{"late":true}\n', 0, 'utf8');
+    closeSync(descriptor);
+
+    const projection = (await readState(paths)).globalProjections.find(
+      (candidate) => candidate.surfacePath === configFile,
+    );
+    expect(projection).toMatchObject({ phase: 'retired', transform: 'config-keys' });
+    expect(readFileSync(projection!.retainedPath!, 'utf8')).toBe('{"late":true}\n');
+    expect(JSON.parse(readFileSync(configFile, 'utf8'))).toEqual({
+      mcpServers: { user: { url: 'https://user' } },
+    });
+    expect(readFileSync(canonical, 'utf8')).toBe('managed:\n  url: https://managed\n');
+
+    expect(
+      await reconcileRetiredGlobalCows(paths, { ids: [projection!.id], quiescent: true }),
+    ).toEqual({ reconciled: 0, quarantined: 1 });
+    expect(readFileSync(canonical, 'utf8')).toBe('managed:\n  url: https://managed\n');
+    expect(readFileSync(projection!.retainedPath!, 'utf8')).toBe('{"late":true}\n');
+  });
+
   it('requires an explicit quiescent assertion before reverse projection', async () => {
     const home = makeTempHome();
     homes.push(home);
