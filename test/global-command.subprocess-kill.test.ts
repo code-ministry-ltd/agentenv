@@ -2,6 +2,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { run } from '../src/cli.js';
 import { resolvePaths } from '../src/paths.js';
 import { readState } from '../src/state.js';
 import { makeTempHome, type TempHome } from './helpers.js';
@@ -68,7 +69,8 @@ function recover(home: TempHome): void {
 describe.skipIf(process.platform === 'win32')('global command real subprocess recovery', () => {
   it('restores exact pre-command surfaces after a kill between surface and state publication', async () => {
     const home = await killAt('applying|applied,pending');
-    recover(home);
+    const serviced = await run(['list'], { env: home.env });
+    expect(serviced.code).toBe(0);
     const paths = resolvePaths(home.env);
     const real = join(paths.base, 'real-harness', 'skills');
     expect(existsSync(join(real, 'managed'))).toBe(false);

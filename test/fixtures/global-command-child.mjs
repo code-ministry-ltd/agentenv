@@ -31,6 +31,7 @@ if (process.env.MODE === 'recover') {
 } else {
   const canonical = join(paths.envDir('writing'), 'skills', 'managed', 'SKILL.md');
   await mkdir(join(canonical, '..'), { recursive: true });
+  await writeFile(paths.envYaml('writing'), 'version: 1.0\ndescription: writing\n', 'utf8');
   await writeFile(canonical, '# MANAGED\n', 'utf8');
   await mkdir(join(realRoot, 'skills', 'user'), { recursive: true });
   await writeFile(join(realRoot, 'skills', 'user', 'SKILL.md'), '# USER\n', 'utf8');

@@ -1,6 +1,7 @@
 import type { Command, GlobalCliOptions, RunOptions, RunResult } from './command.js';
 import { commands, findCommand } from './commands/index.js';
 import { closeStoreSync, openStoreSync, withNotices } from './commands/store-sync.js';
+import { recoverPendingGlobalCommands } from './global-command.js';
 import { resolvePaths } from './paths.js';
 import { getVersion } from './version.js';
 import { legacyMigrationRequired, migrationGateClosed } from './migration.js';
@@ -95,6 +96,11 @@ export async function run(
         code: 2,
       });
     }
+    // A global activation/drop carries every undo input in its durable plan, so
+    // any normal invocation can settle it before doing unrelated work. `status`
+    // and `doctor` remain observational/explicit recovery surfaces and therefore
+    // intentionally report the pending intent instead.
+    await recoverPendingGlobalCommands(paths);
   }
 
   const context = {
