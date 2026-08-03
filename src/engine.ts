@@ -34,6 +34,7 @@ import {
   dematerialise as fbDematerialise,
   materialise as fbMaterialise,
   type FileBlockSource,
+  type RetainedFileBlockItem,
 } from './file-block.js';
 import { beginTransaction, recoverState } from './journal.js';
 import {
@@ -43,6 +44,7 @@ import {
   retireActiveGlobalCowSurface,
 } from './global-cow.js';
 import { withLock } from './lock.js';
+import { capturePathIdentity } from './path-identity.js';
 import type { Paths } from './paths.js';
 import { listRawFiles, rawMappingStoreRoot, type RawFile } from './raw-mapping.js';
 import { loadResolver, substituteSecretFields, type SecretResolver } from './secrets.js';
@@ -589,12 +591,27 @@ async function materialiseFileBlock(
   });
 
   let applied = 0;
+  const reverseItems: RetainedFileBlockItem[] = [];
   try {
     for (const { env, sources } of planned) {
-      await fbMaterialise(paths, { target, env, mode: surface.layering, sources });
+      const item = await fbMaterialise(paths, { target, env, mode: surface.layering, sources });
+      const canonical = [];
+      for (const subBlock of item.subBlocks) {
+        const baseline = await capturePathIdentity(subBlock.storePath);
+        if (
+          item.mode === 'inline' &&
+          (baseline.kind !== 'file' || baseline.digest !== subBlock.hash)
+        ) {
+          throw new Error(
+            `canonical instruction source changed while rendering '${subBlock.storePath}'`,
+          );
+        }
+        canonical.push({ storePath: subBlock.storePath, baseline });
+      }
+      reverseItems.push({ item, canonical });
       applied += 1;
     }
-    await finishGlobalCowPublication(paths, projectionId, target);
+    await finishGlobalCowPublication(paths, projectionId, target, { items: reverseItems });
     return applied;
   } catch (error) {
     // Keep intent when any file-block write committed; otherwise discard the

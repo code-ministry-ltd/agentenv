@@ -12,6 +12,10 @@ import {
 } from './global-projection.js';
 import { mirrorCowToCanonical } from './cow-files.js';
 import { retainGlobalCowBytes } from './cow-files.js';
+import {
+  reconcileRetainedFileBlockProjection,
+  type RetainedFileBlockProvenance,
+} from './file-block.js';
 import { scanTextForSecrets } from './git.js';
 import { withLock } from './lock.js';
 import { capturePathIdentity, identitiesEqual } from './path-identity.js';
@@ -78,10 +82,16 @@ export async function finishGlobalCowPublication(
   paths: Paths,
   id: string,
   surfacePath: string,
+  fileBlockProvenance?: RetainedFileBlockProvenance,
 ): Promise<GlobalProjection> {
   const baseline = await capturePathIdentity(surfacePath);
   return updateProjection(paths, id, (projection) =>
-    publishProjection({ ...projection, baseline, observed: baseline }),
+    publishProjection({
+      ...projection,
+      baseline,
+      observed: baseline,
+      ...(fileBlockProvenance ? { fileBlockProvenance } : {}),
+    }),
   );
 }
 
@@ -202,18 +212,7 @@ export async function reconcileRetiredGlobalCows(
       beginProjectionReconciliation(observeProjection(projection, observed)),
     );
     try {
-      if (
-        !identitiesEqual(observed, current.baseline) &&
-        !identitiesEqual(canonicalNow, current.canonicalBaseline)
-      ) {
-        throw new Error('canonical changed concurrently with retained projection');
-      }
       if (!identitiesEqual(observed, current.baseline)) {
-        if (current.transform === 'file-block' || current.transform === 'config-keys') {
-          throw new Error(
-            `retained ${current.transform} projection requires field-level reconciliation`,
-          );
-        }
         const source = current.transform === 'command-skill'
           ? join(current.retainedPath, 'SKILL.md')
           : current.retainedPath;
@@ -223,7 +222,22 @@ export async function reconcileRetiredGlobalCows(
             `retained projection has ${secretCount} suspected secret finding(s); canonical write blocked`,
           );
         }
-        await mirrorCowToCanonical(source, current.canonicalPath);
+        if (current.transform === 'file-block') {
+          if (!current.fileBlockProvenance) {
+            throw new Error('retained file-block projection provenance is incomplete');
+          }
+          await reconcileRetainedFileBlockProjection(source, current.fileBlockProvenance);
+        } else {
+          if (!identitiesEqual(canonicalNow, current.canonicalBaseline)) {
+            throw new Error('canonical changed concurrently with retained projection');
+          }
+          if (current.transform === 'config-keys') {
+            throw new Error(
+              'retained config-keys projection requires field-level reconciliation',
+            );
+          }
+          await mirrorCowToCanonical(source, current.canonicalPath);
+        }
       }
       const revision = JSON.stringify(await capturePathIdentity(current.canonicalPath));
       await updateProjection(paths, id, (projection) =>

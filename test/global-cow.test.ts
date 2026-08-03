@@ -171,6 +171,74 @@ describe('retained global COW integration', () => {
     expect(readFileSync(projection!.retainedPath!, 'utf8')).toBe('{"late":true}\n');
   });
 
+  it('reverse-projects only an attributable late instruction sub-block edit', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const realRoot = join(home.home, 'real');
+    const instructionFile = join(realRoot, 'INSTRUCTIONS.md');
+    const canonical = join(paths.envDir('writing'), 'instructions', 'base.md');
+    mkdirSync(join(paths.envDir('writing'), 'instructions'), { recursive: true });
+    mkdirSync(realRoot, { recursive: true });
+    writeFileSync(instructionFile, '# USER INSTRUCTIONS\n');
+    writeFileSync(canonical, '# MANAGED BASELINE\n');
+    const env = { ...home.env, [FIXTURE_CONFIG_ENV]: realRoot };
+    const adapter = makeFixtureAdapter();
+
+    await materialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], env });
+    const rendered = readFileSync(instructionFile, 'utf8');
+    const edited = rendered.replace('# MANAGED BASELINE', '# ATTRIBUTABLE EDIT');
+    const descriptor = openSync(instructionFile, 'r+');
+
+    await dematerialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], all: true, env });
+    ftruncateSync(descriptor, 0);
+    writeSync(descriptor, edited, 0, 'utf8');
+    closeSync(descriptor);
+
+    const projection = (await readState(paths)).globalProjections.find(
+      (candidate) => candidate.surfacePath === instructionFile,
+    )!;
+    expect(
+      await reconcileRetiredGlobalCows(paths, { ids: [projection.id], quiescent: true }),
+    ).toEqual({ reconciled: 1, quarantined: 0 });
+    expect(readFileSync(canonical, 'utf8')).toBe('# ATTRIBUTABLE EDIT\n');
+    expect(readFileSync(instructionFile, 'utf8')).toBe('# USER INSTRUCTIONS\n');
+    expect(readFileSync(projection.retainedPath!, 'utf8')).toBe(edited);
+  });
+
+  it('quarantines an instruction edit when its canonical source changed concurrently', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const realRoot = join(home.home, 'real');
+    const instructionFile = join(realRoot, 'INSTRUCTIONS.md');
+    const canonical = join(paths.envDir('writing'), 'instructions', 'base.md');
+    mkdirSync(join(paths.envDir('writing'), 'instructions'), { recursive: true });
+    mkdirSync(realRoot, { recursive: true });
+    writeFileSync(instructionFile, '# USER\n');
+    writeFileSync(canonical, '# BASELINE\n');
+    const env = { ...home.env, [FIXTURE_CONFIG_ENV]: realRoot };
+    const adapter = makeFixtureAdapter();
+
+    await materialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], env });
+    const edited = readFileSync(instructionFile, 'utf8').replace('# BASELINE', '# LATE EDIT');
+    const descriptor = openSync(instructionFile, 'r+');
+    await dematerialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], all: true, env });
+    ftruncateSync(descriptor, 0);
+    writeSync(descriptor, edited, 0, 'utf8');
+    closeSync(descriptor);
+    writeFileSync(canonical, '# CONCURRENT CANONICAL\n');
+
+    const projection = (await readState(paths)).globalProjections.find(
+      (candidate) => candidate.surfacePath === instructionFile,
+    )!;
+    expect(
+      await reconcileRetiredGlobalCows(paths, { ids: [projection.id], quiescent: true }),
+    ).toEqual({ reconciled: 0, quarantined: 1 });
+    expect(readFileSync(canonical, 'utf8')).toBe('# CONCURRENT CANONICAL\n');
+    expect(readFileSync(projection.retainedPath!, 'utf8')).toBe(edited);
+  });
+
   it('requires an explicit quiescent assertion before reverse projection', async () => {
     const home = makeTempHome();
     homes.push(home);

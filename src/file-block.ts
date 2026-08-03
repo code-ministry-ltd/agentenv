@@ -6,6 +6,11 @@ import { backup } from './backups.js';
 import { writeFileAtomic } from './fs-atomic.js';
 import { beginTransaction } from './journal.js';
 import { withLock } from './lock.js';
+import {
+  capturePathIdentity,
+  identitiesEqual,
+  type PathIdentity,
+} from './path-identity.js';
 import type { Paths } from './paths.js';
 import type { ManifestItem, QuarantineRecord, StateManifest } from './state.js';
 import { readState, writeState } from './state.js';
@@ -96,6 +101,22 @@ declare module './state.js' {
 
 /** Convenience alias for the registered file-block variant. */
 export type FileBlockItem = import('./state.js').ManifestItemVariants['file-block'];
+
+/** Canonical identity captured when a whole-file global projection was rendered. */
+export interface RetainedFileBlockCanonical {
+  storePath: string;
+  baseline: PathIdentity;
+}
+
+/** Field-level provenance retained after a global instruction file is detached. */
+export interface RetainedFileBlockItem {
+  item: FileBlockItem;
+  canonical: RetainedFileBlockCanonical[];
+}
+
+export interface RetainedFileBlockProvenance {
+  items: RetainedFileBlockItem[];
+}
 
 /** Inputs to {@link dematerialise} and {@link syncBack}. */
 export interface FileBlockTargetOptions {
@@ -875,6 +896,65 @@ export async function syncBack(paths: Paths, opts: FileBlockTargetOptions): Prom
     }
     return result;
   });
+}
+
+/**
+ * Reverse only manifest-anchored inline bodies from a quiescent retained file.
+ * Every changed source is validated before the first write and revalidated at
+ * its destructive boundary. User bytes outside markers are never copied.
+ */
+export async function reconcileRetainedFileBlockProjection(
+  retainedPath: string,
+  provenance: RetainedFileBlockProvenance,
+): Promise<string[]> {
+  const content = await readFileOrEmpty(retainedPath);
+  const writes: { path: string; body: string; baseline: PathIdentity }[] = [];
+
+  for (const entry of provenance.items) {
+    const { item } = entry;
+    const owned = locateOwnedRegion(content, item.ownerEnv, item.subBlocks);
+    if (owned.status !== 'clean') {
+      const detail = owned.status === 'conflict' ? owned.detail : 'managed region is absent';
+      throw new FileBlockConflictError(retainedPath, detail);
+    }
+    for (const subBlock of item.subBlocks) {
+      const observedBody = owned.bodies.get(subBlock.source);
+      if (observedBody === undefined) {
+        throw new FileBlockConflictError(
+          retainedPath,
+          `managed sub-block '${subBlock.source}' is absent`,
+        );
+      }
+      if (item.mode === 'import') {
+        if (observedBody !== `@${subBlock.storePath}`) {
+          throw new FileBlockConflictError(
+            retainedPath,
+            `import sub-block '${subBlock.source}' changed and is not reversible`,
+          );
+        }
+        continue;
+      }
+      if (!subBlock.hash || hashBody(observedBody) === subBlock.hash) continue;
+      const canonical = entry.canonical.find(
+        (candidate) => candidate.storePath === subBlock.storePath,
+      );
+      if (!canonical) {
+        throw new Error(`canonical provenance missing for '${subBlock.source}'`);
+      }
+      if (!identitiesEqual(await capturePathIdentity(subBlock.storePath), canonical.baseline)) {
+        throw new Error(`canonical source changed concurrently for '${subBlock.source}'`);
+      }
+      writes.push({ path: subBlock.storePath, body: observedBody, baseline: canonical.baseline });
+    }
+  }
+
+  for (const write of writes) {
+    if (!identitiesEqual(await capturePathIdentity(write.path), write.baseline)) {
+      throw new Error(`canonical source changed before write for '${write.path}'`);
+    }
+  }
+  for (const write of writes) await writeFileAtomic(write.path, write.body);
+  return writes.map((write) => write.path);
 }
 
 // ---------------------------------------------------------------------------

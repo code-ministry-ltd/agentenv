@@ -1,4 +1,5 @@
 import { identitiesEqual, type PathIdentity } from './path-identity.js';
+import type { RetainedFileBlockProvenance } from './file-block.js';
 
 export type GlobalProjectionPhase =
   | 'building'
@@ -21,6 +22,7 @@ export interface GlobalProjection {
   canonicalBaseline?: PathIdentity;
   ownerEnv?: string;
   transform?: 'identity' | 'command-skill' | 'file-block' | 'config-keys';
+  fileBlockProvenance?: RetainedFileBlockProvenance;
   createdAt?: number;
   retiredAt?: number;
   canonicalRevision?: string;
