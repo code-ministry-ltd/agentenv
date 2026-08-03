@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { access, cp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join, relative, resolve, sep } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
@@ -10,7 +11,8 @@ import {
   validateSkillName,
 } from '../content-items.js';
 import type { SkillSourceRecord } from '../env-config.js';
-import { upsertEnvSource } from '../env-config.js';
+import { parseEnvConfig, upsertEnvSource } from '../env-config.js';
+import { publishStagedBundle } from '../filesystem-bundle.js';
 import { confirmDefault, selectSkillsDefault } from '../prompt.js';
 import {
   diffDirs,
@@ -187,7 +189,7 @@ async function copySkillDir(
   const destDir = join(skillsDir, name);
   await mkdir(skillsDir, { recursive: true });
   await rm(destDir, { recursive: true, force: true });
-  await cp(sourceDir, destDir, { recursive: true });
+  await cp(sourceDir, destDir, { recursive: true, verbatimSymlinks: true });
 }
 
 /**
@@ -202,9 +204,32 @@ async function writeVendoredSkill(
   sourceDir: string,
   provenance: SkillSourceRecord,
 ): Promise<void> {
-  await copySkillDir(ctx, env, name, sourceDir);
-  const yamlText = await readFile(ctx.paths.envYaml(env), 'utf8');
-  await writeFile(ctx.paths.envYaml(env), upsertEnvSource(yamlText, name, provenance), 'utf8');
+  const yamlPath = ctx.paths.envYaml(env);
+  const yamlText = await readFile(yamlPath, 'utf8');
+  const yamlAfter = upsertEnvSource(yamlText, name, provenance);
+  parseEnvConfig(yamlAfter, yamlPath);
+
+  const transactionId = randomUUID();
+  const stagingRoot = join(ctx.paths.live, 'commands', transactionId);
+  const stagedSkill = join(stagingRoot, 'skill');
+  const stagedYaml = join(stagingRoot, 'env.yaml');
+  await mkdir(stagingRoot, { recursive: true });
+  await cp(sourceDir, stagedSkill, { recursive: true, verbatimSymlinks: true });
+  await writeFile(stagedYaml, yamlAfter, 'utf8');
+
+  await publishStagedBundle({
+    paths: ctx.paths,
+    transactionId,
+    stagingRoot,
+    entries: [
+      {
+        id: 'skill-content',
+        target: join(ctx.paths.envDir(env), 'skills', name),
+        staged: stagedSkill,
+      },
+      { id: 'skill-provenance', target: yamlPath, staged: stagedYaml },
+    ],
+  });
 }
 
 /** The recorded provenance for `name` in `env`, or undefined when there is none. */
