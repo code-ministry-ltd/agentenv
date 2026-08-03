@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, readdir, readFile, readlink, rm, symlink } from 'node:fs/promises';
-import { basename, dirname, extname, join, sep } from 'node:path';
+import { basename, dirname, extname, join, relative, sep } from 'node:path';
 import {
   globalDestinationRoots,
   resolveGlobalSurfaceDestination,
@@ -38,6 +38,7 @@ import {
   type RetainedFileBlockItem,
 } from './file-block.js';
 import { beginTransaction, recoverState } from './journal.js';
+import { executeGlobalCommand, type GlobalCommandHooks } from './global-command.js';
 import {
   abandonBuildingGlobalCow,
   beginGlobalCowProjection,
@@ -59,23 +60,11 @@ import { buildSurfaceGraph, type SurfaceGraph } from './surface-graph.js';
  * from the MANIFEST only. This is the "explicit fallback" for GUI apps and
  * machine-wide setups that session mode (the default) cannot reach.
  *
- * Transaction shape. The three mechanisms are consumed as libraries with two
- * different transaction contracts, which the FROZEN interfaces fix:
- *
- * - dir-merge and file-block each open their OWN `withLock` + journal transaction
- *   per item/file (their `materialise`/`dematerialise` are self-contained and
- *   atomic). `withLock` is non-reentrant, so the engine CANNOT wrap them in an
- *   outer lock — it drives them sequentially, each atomic.
- * - config-keys takes an OPEN transaction, so the engine batches every key across
- *   every surface and adapter under ONE `withLock` + journal transaction.
- *
- * The whole invocation is therefore **recovery-first + plan → journal → apply →
- * verify**, with each mechanism op individually atomic and the whole thing
- * idempotent. A kill mid-invocation leaves at most one pending journal, which the
- * next command's {@link recoverState} rolls back deterministically; re-running
- * `use` then completes the stack (idempotent). This is the closest crash-safe
- * shape achievable without editing the frozen self-locking mechanisms — see the
- * Task 1.7 report for the deviation note.
+ * Every invocation is first rendered against a private copy of its physical
+ * surfaces and ownership state. The complete resulting diff is then published
+ * through one whole-command WAL, with exact pre/post identities and backups.
+ * Existing surface mechanisms keep their focused journals inside the private
+ * renderer; they never expose partial state on real harness paths.
  */
 
 /** A surface/env the engine did not fully apply, surfaced to the user + `status` (D6/D7). */
@@ -127,6 +116,8 @@ export interface MaterialiseGlobalRequest {
   /** Environment used to resolve each adapter's real config root. */
   env: NodeJS.ProcessEnv;
   onWarn?: (message: string) => void;
+  /** Fault-injection/diagnostic seams; production callers leave this unset. */
+  commandHooks?: GlobalCommandHooks;
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +266,26 @@ async function instructionSources(
  * config-keys are batched under one transaction; idempotent.
  */
 export async function materialiseGlobal(req: MaterialiseGlobalRequest): Promise<GlobalResult> {
+  const onWarn = req.onWarn ?? ((message: string) => console.warn(message));
+  return executeGlobalCommand({
+    paths: req.paths,
+    adapters: req.adapters,
+    env: req.env,
+    onWarn,
+    kind: 'global-activation',
+    ...(req.commandHooks ? { hooks: req.commandHooks } : {}),
+    render: (staged) =>
+      materialiseGlobalCore({
+        ...req,
+        paths: staged.paths,
+        adapters: staged.adapters,
+        env: staged.env,
+        onWarn: staged.onWarn,
+      }),
+  });
+}
+
+async function materialiseGlobalCore(req: MaterialiseGlobalRequest): Promise<GlobalResult> {
   const { paths, adapters, envs, env } = req;
   const onWarn = req.onWarn ?? ((m: string) => console.warn(m));
   const skips: GlobalSkip[] = [];
@@ -1411,6 +1422,8 @@ export interface DematerialiseGlobalRequest {
    */
   restrictToRoots?: readonly string[];
   onWarn?: (message: string) => void;
+  /** Fault-injection/diagnostic seams; production callers leave this unset. */
+  commandHooks?: GlobalCommandHooks;
 }
 
 /**
@@ -1420,6 +1433,41 @@ export interface DematerialiseGlobalRequest {
  * recovery-first and idempotent. `all` clears the whole global stack.
  */
 export async function dematerialiseGlobal(req: DematerialiseGlobalRequest): Promise<GlobalResult> {
+  const onWarn = req.onWarn ?? ((message: string) => console.warn(message));
+  return executeGlobalCommand({
+    paths: req.paths,
+    adapters: req.adapters,
+    env: req.env,
+    onWarn,
+    kind: 'global-drop',
+    ...(req.commandHooks ? { hooks: req.commandHooks } : {}),
+    render: (staged) =>
+      dematerialiseGlobalCore({
+        ...req,
+        paths: staged.paths,
+        adapters: staged.adapters,
+        env: staged.env,
+        onWarn: staged.onWarn,
+        ...(req.restrictToRoots
+          ? {
+              restrictToRoots: req.restrictToRoots.map((root) => {
+                const adapter = req.adapters.find((candidate) =>
+                  root === candidate.realConfigRoot(req.env) ||
+                  root.startsWith(candidate.realConfigRoot(req.env) + sep),
+                );
+                if (!adapter) return root;
+                const index = req.adapters.indexOf(adapter);
+                const actualBase = adapter.realConfigRoot(req.env);
+                const stagedBase = staged.adapters[index]!.realConfigRoot(staged.env);
+                return join(stagedBase, relative(actualBase, root));
+              }),
+            }
+          : {}),
+      }),
+  });
+}
+
+async function dematerialiseGlobalCore(req: DematerialiseGlobalRequest): Promise<GlobalResult> {
   const { paths, adapters, env, all } = req;
   const onWarn = req.onWarn ?? ((m: string) => console.warn(m));
   const skips: GlobalSkip[] = [];
@@ -1489,7 +1537,7 @@ export async function dematerialiseGlobal(req: DematerialiseGlobalRequest): Prom
     if (adapters.length === 0) {
       onWarn('agentenv: no in-scope adapter to re-materialise the remaining stack');
     } else {
-      const re = await materialiseGlobal({ paths, adapters, envs: remaining, env, onWarn });
+      const re = await materialiseGlobalCore({ paths, adapters, envs: remaining, env, onWarn });
       applied = re.applied;
       skips.push(...re.skips);
     }

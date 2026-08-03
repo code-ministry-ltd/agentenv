@@ -1,7 +1,8 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { run } from '../src/cli.js';
+import { materialiseGlobal } from '../src/engine.js';
 import { resolvePaths } from '../src/paths.js';
 import { readState } from '../src/state.js';
 import { FIXTURE_CONFIG_ENV, makeFixtureAdapter } from './fixtures/fixture-adapter.js';
@@ -93,6 +94,89 @@ describe('engine: global use (materialise)', () => {
     const cfg = JSON.parse(readFileSync(join(realHome, 'config.json'), 'utf8'));
     expect(Object.keys(cfg.mcpServers).filter((k) => k === 'linear')).toHaveLength(1);
     expect((await readState(paths)).items.length).toBe(itemsFirst);
+  });
+
+  it('plans every surface before publishing and leaves no partial activation on a late failure', async () => {
+    const th = home();
+    const { paths, realHome, env } = scenario(th);
+    const badSource = join(paths.envDir('writing'), 'instructions', 'base.md');
+    rmSync(badSource);
+    mkdirSync(badSource);
+
+    await expect(
+      materialiseGlobal({
+        paths,
+        adapters: [makeFixtureAdapter()],
+        envs: ['writing'],
+        env,
+      }),
+    ).rejects.toThrow();
+
+    expect(existsSync(join(realHome, 'skills', 'w-skill'))).toBe(false);
+    expect(readFileSync(join(realHome, 'INSTRUCTIONS.md'), 'utf8')).toBe(
+      '# user instructions\n\nkeep me.\n',
+    );
+    expect((await readState(paths)).items).toEqual([]);
+    expect((await readState(paths)).commands).toEqual([]);
+  });
+
+  it('rolls every already-published surface back when the whole-command publish faults', async () => {
+    const th = home();
+    const { paths, realHome, env } = scenario(th);
+    let injected = false;
+
+    await expect(
+      materialiseGlobal({
+        paths,
+        adapters: [makeFixtureAdapter()],
+        envs: ['writing'],
+        env,
+        commandHooks: {
+          afterPublish: async (path) => {
+            if (path === paths.state || injected) return;
+            injected = true;
+            throw new Error('injected global publish fault');
+          },
+        },
+      }),
+    ).rejects.toThrow(/injected global publish fault/);
+
+    expect(injected).toBe(true);
+    expect(existsSync(join(realHome, 'skills', 'w-skill'))).toBe(false);
+    expect(readFileSync(join(realHome, 'INSTRUCTIONS.md'), 'utf8')).toBe(
+      '# user instructions\n\nkeep me.\n',
+    );
+    expect((await readState(paths))).toMatchObject({ items: [], commands: [] });
+  });
+
+  it('rescues a third surface identity before whole-command rollback restores pre-state', async () => {
+    const th = home();
+    const { paths, realHome, env } = scenario(th);
+    const skill = join(realHome, 'skills', 'w-skill');
+
+    await expect(
+      materialiseGlobal({
+        paths,
+        adapters: [makeFixtureAdapter()],
+        envs: ['writing'],
+        env,
+        commandHooks: {
+          afterPublish: async (path) => {
+            if (path !== skill) return;
+            writeFileSync(join(skill, 'SKILL.md'), '# THIRD IDENTITY\n');
+            throw new Error('injected third identity');
+          },
+        },
+      }),
+    ).rejects.toThrow(/injected third identity/);
+
+    const manifest = await readState(paths);
+    expect(existsSync(skill)).toBe(false);
+    expect(manifest.commands).toEqual([]);
+    expect(manifest.quarantine).toHaveLength(1);
+    expect(readFileSync(join(manifest.quarantine[0]!.retainedPath, 'SKILL.md'), 'utf8')).toBe(
+      '# THIRD IDENTITY\n',
+    );
   });
 
   it('skips a user item of the same name and warns (D7)', async () => {

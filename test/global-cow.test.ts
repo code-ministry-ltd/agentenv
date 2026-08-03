@@ -155,6 +155,47 @@ describe('retained global COW integration', () => {
     );
   });
 
+  it('rolls a faulted drop handoff back without invalidating an open writer descriptor', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const realRoot = join(home.home, 'real');
+    const canonical = join(paths.envDir('writing'), 'skills', 'w-skill', 'SKILL.md');
+    mkdirSync(join(canonical, '..'), { recursive: true });
+    writeFileSync(canonical, '# ORIGINAL\n');
+    const env = { ...home.env, [FIXTURE_CONFIG_ENV]: realRoot };
+    const adapter = makeFixtureAdapter();
+
+    await materialiseGlobal({ paths, adapters: [adapter], envs: ['writing'], env });
+    const liveSkill = join(realRoot, 'skills', 'w-skill');
+    const descriptor = openSync(join(liveSkill, 'SKILL.md'), 'r+');
+
+    await expect(
+      dematerialiseGlobal({
+        paths,
+        adapters: [adapter],
+        envs: ['writing'],
+        all: true,
+        env,
+        commandHooks: {
+          afterPublish: async (path) => {
+            if (path === liveSkill) throw new Error('fault after inode handoff');
+          },
+        },
+      }),
+    ).rejects.toThrow(/fault after inode handoff/);
+
+    ftruncateSync(descriptor, 0);
+    writeSync(descriptor, '# STILL LIVE\n', 0, 'utf8');
+    closeSync(descriptor);
+
+    expect(readFileSync(join(liveSkill, 'SKILL.md'), 'utf8')).toBe('# STILL LIVE\n');
+    const manifest = await readState(paths);
+    expect(manifest.commands).toEqual([]);
+    expect(manifest.globalProjections.find((projection) => projection.surfacePath === liveSkill)?.phase)
+      .toBe('active');
+  });
+
   it('rolls an identity projection back when canonical publication faults', async () => {
     const home = makeTempHome();
     homes.push(home);
