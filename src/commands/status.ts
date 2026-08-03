@@ -18,12 +18,55 @@ export const statusCommand: Command = {
   async run(ctx): Promise<RunResult> {
     const lines: string[] = ['agentenv status', ''];
     lines.push(...(await syncSection(ctx)));
+    lines.push(...(await lifecycleSection(ctx)));
     lines.push(...(await sessionSection(ctx)));
     lines.push('');
     lines.push(...(await globalSection(ctx)));
     return { stdout: `${lines.join('\n')}\n`, code: 0 };
   },
 };
+
+async function lifecycleSection(ctx: CommandContext): Promise<string[]> {
+  const manifest = await readState(ctx.paths);
+  const commands = manifest.commands;
+  const generations = manifest.generations.filter((entry) => entry.phase !== 'collected');
+  const projections = manifest.globalProjections.filter((entry) => entry.phase !== 'collected');
+  const rescues = manifest.quarantine.filter((entry) => !entry.resolved);
+  const migration = manifest.migration;
+  if (
+    commands.length === 0 &&
+    generations.length === 0 &&
+    projections.length === 0 &&
+    rescues.length === 0 &&
+    (!migration || migration.phase === 'opened' || migration.phase === 'rolled-back')
+  ) {
+    return [];
+  }
+
+  const lines = ['Lifecycle:'];
+  for (const command of commands) {
+    const git = command.gitRequired ? ', Git required' : '';
+    lines.push(`  command ${command.transactionId}: ${command.phase} (${command.kind}${git})`);
+  }
+  for (const generation of generations) {
+    lines.push(
+      `  generation ${generation.id}: ${generation.phase}; envs [${generation.envs.join(', ')}]; ` +
+        `${generation.reservations.length} reservation(s), ${generation.leases.length} lease(s)`,
+    );
+  }
+  for (const projection of projections) {
+    const owner = projection.ownerEnv ? `; owner ${projection.ownerEnv}` : '';
+    lines.push(`  projection ${projection.id}: ${projection.phase}${owner}`);
+  }
+  for (const rescue of rescues) {
+    lines.push(`  rescue ${rescue.id}: unresolved (${rescue.kind})`);
+  }
+  if (migration && migration.phase !== 'opened' && migration.phase !== 'rolled-back') {
+    lines.push(`  migration ${migration.id}: ${migration.phase}; gate ${migration.gate}`);
+  }
+  lines.push('');
+  return lines;
+}
 
 /**
  * Surface a rebase conflict that is BLOCKING sync (design D9, Task 2.2). Read-only —

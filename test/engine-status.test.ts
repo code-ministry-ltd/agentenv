@@ -4,7 +4,13 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { Adapter, SurfaceDeclaration } from '../src/adapter.js';
 import { cursorAdapter } from '../src/adapters/cursor.js';
 import { run } from '../src/cli.js';
+import { createCommandPlan } from '../src/command-plan.js';
+import { createGlobalProjection } from '../src/global-projection.js';
+import { createMigrationState } from '../src/migration-state.js';
 import { resolvePaths } from '../src/paths.js';
+import { createSyncCandidate } from '../src/sync-candidate.js';
+import { readState, writeState } from '../src/state.js';
+import { createViewGeneration } from '../src/view-generation.js';
 import { FIXTURE_CONFIG_ENV, makeFixtureAdapter } from './fixtures/fixture-adapter.js';
 import { makeTempHome, type TempHome } from './helpers.js';
 
@@ -110,5 +116,63 @@ describe('engine: status', () => {
     const res = await run(['status'], { env: th.env, adapters: [makeFixtureAdapter()] });
     expect(res.code).toBe(0);
     expect(res.stdout).not.toContain('session-unsupported');
+  });
+
+  it('surfaces every unresolved durable lifecycle family without printing stored reasons', async () => {
+    const th = home();
+    const paths = resolvePaths(th.env);
+    const state = await readState(paths);
+    state.commands.push(createCommandPlan({
+      transactionId: 'command-visible',
+      kind: 'filesystem-bundle',
+      operations: [],
+    }));
+    state.generations.push({
+      ...createViewGeneration('generation-visible', ['writing']),
+      phase: 'quarantined',
+      failure: 'DO-NOT-PRINT-GENERATION-REASON',
+    });
+    state.globalProjections.push({
+      ...createGlobalProjection('projection-visible', { kind: 'absent' }),
+      phase: 'quarantined',
+      failure: 'DO-NOT-PRINT-PROJECTION-REASON',
+    });
+    state.candidates.push({
+      ...createSyncCandidate({
+        id: 'candidate-visible',
+        ref: 'refs/agentenv/candidates/visible',
+        worktree: join(paths.live, 'candidates', 'visible'),
+        fetchedAt: 1,
+        touchedCanonicalPaths: [],
+      }),
+      phase: 'rejected',
+      reason: 'DO-NOT-PRINT-CANDIDATE-REASON',
+    });
+    state.quarantine.push({
+      schemaVersion: 2,
+      id: 'rescue-visible',
+      kind: 'third-identity',
+      path: '/surface',
+      retainedPath: join(paths.live, 'quarantine', 'visible'),
+      reason: 'DO-NOT-PRINT-RESCUE-REASON',
+      createdAt: 1,
+      resolved: false,
+    });
+    state.migration = createMigrationState('migration-visible', 'cm-v1');
+    await writeState(paths, state);
+
+    const res = await run(['status'], { env: th.env, adapters: [] });
+
+    for (const id of [
+      'command-visible',
+      'generation-visible',
+      'projection-visible',
+      'candidate-visible',
+      'rescue-visible',
+      'migration-visible',
+    ]) {
+      expect(res.stdout).toContain(id);
+    }
+    expect(res.stdout).not.toContain('DO-NOT-PRINT');
   });
 });
