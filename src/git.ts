@@ -469,6 +469,65 @@ export async function scanStoreForSecrets(paths: Paths): Promise<SecretFinding[]
 }
 
 /**
+ * Scan every text blob newly reachable from a candidate revision, not merely
+ * the candidate's final tree. This catches credentials introduced in one remote
+ * commit and deleted in a later commit: the clean tip must not make leaked
+ * history eligible for promotion.
+ */
+export async function scanRevisionRangeForSecrets(
+  paths: Paths,
+  env: NodeJS.ProcessEnv,
+  baseRevision: string,
+  candidateRevision: string,
+  run?: GitRunner,
+): Promise<SecretFinding[]> {
+  const ctx = gitContext(paths, env, run);
+  const listed = await git(ctx, [
+    'rev-list',
+    '--objects',
+    candidateRevision,
+    `^${baseRevision}`,
+  ]);
+  if (listed.code !== 0) {
+    throw new Error('could not enumerate newly reachable candidate history');
+  }
+
+  const findings: SecretFinding[] = [];
+  const seen = new Set<string>();
+  for (const line of listed.stdout.split('\n')) {
+    const separator = line.indexOf(' ');
+    const objectId = (separator === -1 ? line : line.slice(0, separator)).trim();
+    const objectPath = separator === -1 ? '' : line.slice(separator + 1);
+    if (!/^[0-9a-f]{40,64}$/i.test(objectId) || seen.has(objectId)) continue;
+    seen.add(objectId);
+    const type = await git(ctx, ['cat-file', '-t', objectId]);
+    if (type.code !== 0) throw new Error('could not inspect a newly reachable candidate object');
+    if (type.stdout.trim() !== 'blob') continue;
+    const size = await git(ctx, ['cat-file', '-s', objectId]);
+    const byteLength = Number.parseInt(size.stdout.trim(), 10);
+    if (size.code !== 0 || !Number.isSafeInteger(byteLength) || byteLength < 0) {
+      throw new Error('could not size a newly reachable candidate blob');
+    }
+    // Store content is intentionally small. Skip large/binary blobs while still
+    // scanning extensionless text; NUL is a stronger binary signal than a suffix.
+    if (byteLength > 2 * 1024 * 1024) continue;
+    const blob = await git(ctx, ['cat-file', 'blob', objectId]);
+    if (blob.code !== 0) throw new Error('could not read a newly reachable candidate blob');
+    if (blob.stdout.includes('\0')) continue;
+    const label = objectPath || `<blob-${objectId.slice(0, 12)}>`;
+    for (const hit of scanTextForSecrets(blob.stdout)) {
+      findings.push({
+        file: `history:${label}@${objectId.slice(0, 12)}`,
+        line: hit.line,
+        reason: hit.reason,
+      });
+    }
+  }
+  findings.sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line);
+  return findings;
+}
+
+/**
  * Scan only the STAGED changes for secrets (D6/D9) — the files THIS commit would
  * write, not the whole working tree. So a pre-existing, unrelated flagged file can
  * never block an unrelated commit (it is not in the staged diff), and the gate

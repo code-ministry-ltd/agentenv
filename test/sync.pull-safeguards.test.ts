@@ -164,6 +164,39 @@ describe('sync: post-pull safeguards quarantine a bad pulled tree (D9)', () => {
     expect(res.stderr ?? '').toMatch(/QUARANTINED|malformed/i);
     expect(existsSync(join(realHome, 'skills', 'w-skill'))).toBe(false);
   });
+
+  it('quarantines a clean candidate tip whose newly reachable history contains a secret', async () => {
+    const th = gitHome();
+    const { paths, realHome, env } = localWithWork(th);
+    const opts = { env, adapters: [makeFixtureAdapter()] };
+
+    await run(['init'], { env: th.env });
+    await run(['create', 'work'], opts);
+    await run(['add', 'skill', 'work', 'w-skill'], opts);
+    const remote = makeBareRemote();
+    await run(['remote', remote], { env: th.env });
+
+    const wd = mkdtempSync(join(tmpdir(), 'agentenv-other-history-'));
+    dirs.push(wd);
+    const clone = join(wd, 'clone');
+    quietGit(['clone', remote, clone]);
+    writeFileSync(join(clone, 'temporary-leak.txt'), 'api_key: AKIAZ7Q2W9E4R6T1Y8U3\n');
+    quietGit(['add', '-A'], clone);
+    quietGit(['commit', '-m', 'temporarily add leaked credential', '--no-verify'], clone);
+    rmSync(join(clone, 'temporary-leak.txt'));
+    quietGit(['add', '-A'], clone);
+    quietGit(['commit', '-m', 'remove leaked credential from tip', '--no-verify'], clone);
+    quietGit(['push', 'origin', 'main'], clone);
+
+    const res = await run(['use', 'work', '--global'], opts);
+
+    expect(res.stdout).toContain('Did NOT materialise');
+    expect(res.stderr ?? '').toMatch(/QUARANTINED|newly reachable history/i);
+    expect(existsSync(join(realHome, 'skills', 'w-skill'))).toBe(false);
+    expect((await readState(paths)).candidates).toContainEqual(
+      expect.objectContaining({ phase: 'rejected', reason: expect.stringMatching(/secret/i) }),
+    );
+  });
 });
 
 describe('sync: active global writers defer remotely changed candidates', () => {

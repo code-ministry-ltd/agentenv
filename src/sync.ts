@@ -13,6 +13,7 @@ import {
   pushStore,
   rebaseInProgress,
   reconcileManifest,
+  scanRevisionRangeForSecrets,
   storeIsRepo,
   validatePulledStore,
   writeConflictMarker,
@@ -239,10 +240,19 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
     let candidate = beginCandidateValidation(prepared.candidate);
     await persistCandidate(paths, candidate);
     const validation = await validatePulledStore(candidatePaths(paths, candidate.worktree));
-    if (!validation.ok) {
+    const historyFindings = await scanRevisionRangeForSecrets(
+      paths,
+      env,
+      prepared.expectedHead,
+      prepared.revision,
+      gitRun,
+    );
+    const secretFindings = [...validation.secretFindings, ...historyFindings];
+    if (!validation.ok || historyFindings.length > 0) {
       const reason =
         `post-fetch validation failed (${validation.schemaProblems.length} malformed manifest(s), ` +
-        `${validation.secretFindings.length} suspected secret finding(s))`;
+        `${secretFindings.length} suspected secret finding(s), including ` +
+        `${historyFindings.length} in newly reachable history)`;
       candidate = rejectCandidate(candidate, reason);
       await persistCandidate(paths, candidate);
       const parts: string[] = [];
@@ -251,8 +261,8 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
           `  malformed manifest(s):\n${validation.schemaProblems.map((p) => `    ${p}`).join('\n')}`,
         );
       }
-      if (validation.secretFindings.length > 0) {
-        parts.push(`  suspected secret(s):\n${describeFindings(validation.secretFindings)}`);
+      if (secretFindings.length > 0) {
+        parts.push(`  suspected secret(s):\n${describeFindings(secretFindings)}`);
       }
       onNotice(
         `agentenv: QUARANTINED candidate '${candidate.id}' — remote changes are malformed or ` +
@@ -435,11 +445,22 @@ export async function resolveRetainedCandidate(
   }
 
   const validation = await validatePulledStore(candidatePaths(req.paths, candidate.worktree));
-  if (!validation.ok) {
+  const historyFindings = candidate.expectedCanonicalRevision && candidate.candidateRevision
+    ? await scanRevisionRangeForSecrets(
+        req.paths,
+        req.env,
+        candidate.expectedCanonicalRevision,
+        candidate.candidateRevision,
+        req.gitRun,
+      )
+    : [];
+  const secretFindings = [...validation.secretFindings, ...historyFindings];
+  if (!validation.ok || historyFindings.length > 0) {
     candidate = rejectCandidate(
       candidate,
       `retry validation failed (${validation.schemaProblems.length} malformed manifest(s), ` +
-        `${validation.secretFindings.length} suspected secret finding(s))`,
+        `${secretFindings.length} suspected secret finding(s), including ` +
+        `${historyFindings.length} in newly reachable history)`,
     );
     await persistCandidate(req.paths, candidate);
     return { phase: candidate.phase, blockerCount: 0 };
