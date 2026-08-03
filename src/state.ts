@@ -165,9 +165,15 @@ function coerceItems(raw: unknown, file: string): ManifestItem[] {
   if (!Array.isArray(raw)) {
     throw new StateError(`${file}: 'items' must be an array`, file);
   }
-  for (const entry of raw) {
+  for (const [index, entry] of raw.entries()) {
     if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
       throw new StateError(`${file}: every entry in 'items' must be an object`, file);
+    }
+    const item = entry as Record<string, unknown>;
+    for (const field of ['action', 'surface', 'path', 'ownerEnv']) {
+      if (typeof item[field] !== 'string' || item[field] === '') {
+        throw new StateError(`${file}: items[${index}] requires '${field}'`, file);
+      }
     }
   }
   return raw as ManifestItem[];
@@ -219,6 +225,41 @@ const GLOBAL_PROJECTION_PHASES = new Set(['building', 'active', 'retired', 'reco
 const CANDIDATE_PHASES = new Set(['fetched', 'validating', 'approved', 'deferred', 'rejected', 'promoting', 'promoted', 'abandoned']);
 const MIGRATION_PHASES = new Set(['planned', 'backing-up', 'backed-up', 'importing', 'imported', 'probing', 'opened', 'rolling-back', 'rolled-back']);
 
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isNonEmptyStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string' && entry !== '');
+}
+
+function validatePathIdentity(value: unknown): string | null {
+  if (!isObject(value) || typeof value.kind !== 'string') return 'must be a path identity object';
+  if (value.kind === 'absent') return null;
+  if (value.kind === 'symlink') {
+    return typeof value.target === 'string' ? null : 'symlink target must be a string';
+  }
+  if (value.kind === 'file' || value.kind === 'directory') {
+    if (typeof value.digest !== 'string' || value.digest === '') return 'digest must be a string';
+    if (!Number.isSafeInteger(value.mode) || (value.mode as number) < 0) {
+      return 'mode must be a non-negative integer';
+    }
+    return null;
+  }
+  return `kind '${value.kind}' is invalid`;
+}
+
+function validateBackupRef(value: unknown): string | null {
+  if (!isObject(value) || typeof value.kind !== 'string') return 'must be a backup reference';
+  if (value.kind === 'absent') return null;
+  if (value.kind === 'content') return requireString(value, 'hash', 'content backup');
+  if (value.kind === 'directory') return requireString(value, 'id', 'directory backup');
+  if (value.kind === 'symlink') {
+    return typeof value.target === 'string' ? null : 'symlink backup target must be a string';
+  }
+  return `backup kind '${value.kind}' is invalid`;
+}
+
 function validateCommand(record: Record<string, unknown>, label: string): string | null {
   const required = requireString(record, 'transactionId', label) ?? requireString(record, 'kind', label);
   if (required) return required;
@@ -232,11 +273,28 @@ function validateCommand(record: Record<string, unknown>, label: string): string
   if (typeof record.commitPoint !== 'boolean') return `${label}.commitPoint must be boolean`;
   if (!Array.isArray(record.operations)) return `${label}.operations must be an array`;
   for (const operation of record.operations) {
-    if (!isObject(operation) || typeof operation.id !== 'string' || typeof operation.kind !== 'string') {
+    if (
+      !isObject(operation) ||
+      typeof operation.id !== 'string' ||
+      operation.id === '' ||
+      typeof operation.kind !== 'string' ||
+      operation.kind === ''
+    ) {
       return `${label}.operations contains an invalid operation`;
     }
     if (!OPERATION_STATES.has(operation.state as OperationState)) {
       return `${label}.operations contains an invalid state`;
+    }
+    if (operation.path !== undefined && typeof operation.path !== 'string') {
+      return `${label}.operations contains an invalid path`;
+    }
+    for (const field of ['preIdentity', 'postIdentity'] as const) {
+      if (operation[field] === undefined) continue;
+      const invalid = validatePathIdentity(operation[field]);
+      if (invalid) return `${label}.operations ${field} ${invalid}`;
+    }
+    if (operation.undoRef !== undefined && typeof operation.undoRef !== 'string') {
+      return `${label}.operations contains an invalid undoRef`;
     }
   }
   return null;
@@ -246,8 +304,55 @@ function validateGeneration(record: Record<string, unknown>, label: string): str
   const required = requireString(record, 'id', label);
   if (required) return required;
   if (!GENERATION_PHASES.has(record.phase as string)) return `${label}.phase is invalid`;
-  if (!Array.isArray(record.envs) || !Array.isArray(record.reservations) || !Array.isArray(record.leases)) {
+  if (
+    !isNonEmptyStringArray(record.envs) ||
+    !isNonEmptyStringArray(record.reservations) ||
+    !Array.isArray(record.leases)
+  ) {
     return `${label} requires envs, reservations, and leases arrays`;
+  }
+  if (new Set(record.reservations).size !== record.reservations.length) {
+    return `${label}.reservations contains duplicates`;
+  }
+  const leaseIds = new Set<string>();
+  for (const lease of record.leases) {
+    if (!isObject(lease) || requireString(lease, 'reservationId', `${label}.lease`)) {
+      return `${label}.leases contains an invalid reservationId`;
+    }
+    if (
+      !Number.isSafeInteger(lease.pid) ||
+      (lease.pid as number) <= 0 ||
+      !Number.isSafeInteger(lease.processGroupId) ||
+      (lease.processGroupId as number) <= 0
+    ) {
+      return `${label}.lease pid and processGroupId must be positive integers`;
+    }
+    if (requireString(lease, 'processStart', `${label}.lease`)) {
+      return `${label}.lease processStart is invalid`;
+    }
+    const reservationId = lease.reservationId as string;
+    if (leaseIds.has(reservationId)) return `${label}.leases contains duplicate reservation ids`;
+    leaseIds.add(reservationId);
+  }
+  if (record.inventory !== undefined) {
+    if (!Array.isArray(record.inventory)) return `${label}.inventory must be an array`;
+    for (const entry of record.inventory) {
+      if (!isObject(entry)) return `${label}.inventory contains an invalid entry`;
+      for (const field of ['surfaceId', 'storeKind', 'mechanism', 'path']) {
+        if (requireString(entry, field, `${label}.inventory`)) {
+          return `${label}.inventory requires ${field}`;
+        }
+      }
+      if (
+        typeof entry.baseline !== 'string' &&
+        !isNonEmptyStringArray(entry.baseline)
+      ) {
+        return `${label}.inventory baseline must be a string or string array`;
+      }
+      if (entry.ownerEnv !== null && typeof entry.ownerEnv !== 'string') {
+        return `${label}.inventory ownerEnv must be a string or null`;
+      }
+    }
   }
   return null;
 }
@@ -256,8 +361,13 @@ function validateGlobalProjection(record: Record<string, unknown>, label: string
   const required = requireString(record, 'id', label);
   if (required) return required;
   if (!GLOBAL_PROJECTION_PHASES.has(record.phase as string)) return `${label}.phase is invalid`;
-  if (!isObject(record.baseline) || !isObject(record.observed)) {
-    return `${label} requires baseline and observed identities`;
+  const baseline = validatePathIdentity(record.baseline);
+  if (baseline) return `${label}.baseline ${baseline}`;
+  const observed = validatePathIdentity(record.observed);
+  if (observed) return `${label}.observed ${observed}`;
+  if (record.canonicalBaseline !== undefined) {
+    const canonical = validatePathIdentity(record.canonicalBaseline);
+    if (canonical) return `${label}.canonicalBaseline ${canonical}`;
   }
   return null;
 }
@@ -266,8 +376,14 @@ function validateCandidate(record: Record<string, unknown>, label: string): stri
   const required = requireString(record, 'id', label) ?? requireString(record, 'ref', label) ?? requireString(record, 'worktree', label);
   if (required) return required;
   if (!CANDIDATE_PHASES.has(record.phase as string)) return `${label}.phase is invalid`;
-  if (!Array.isArray(record.blockers) || !Array.isArray(record.touchedCanonicalPaths)) {
+  if (!isNonEmptyStringArray(record.blockers) || !isNonEmptyStringArray(record.touchedCanonicalPaths)) {
     return `${label} requires blockers and touchedCanonicalPaths arrays`;
+  }
+  if (!isFiniteNumber(record.fetchedAt)) return `${label}.fetchedAt must be a number`;
+  for (const field of ['reason', 'promotedRevision', 'expectedCanonicalRevision', 'candidateRevision']) {
+    if (record[field] !== null && typeof record[field] !== 'string') {
+      return `${label}.${field} must be a string or null`;
+    }
   }
   return null;
 }
@@ -281,6 +397,18 @@ function coerceMigration(raw: unknown, file: string): MigrationState | null {
   }
   if (raw.gate !== 'closed' && raw.gate !== 'open') {
     throw new StateError(`${file}: migration.gate is invalid`, file);
+  }
+  if (raw.sourceFormat !== 'cm-v1' && raw.sourceFormat !== 'jj-v1') {
+    throw new StateError(`${file}: migration.sourceFormat is invalid`, file);
+  }
+  if (typeof raw.commitPoint !== 'boolean') {
+    throw new StateError(`${file}: migration.commitPoint must be boolean`, file);
+  }
+  if (raw.backupRef !== null && typeof raw.backupRef !== 'string') {
+    throw new StateError(`${file}: migration.backupRef must be a string or null`, file);
+  }
+  if (raw.failure !== null && typeof raw.failure !== 'string') {
+    throw new StateError(`${file}: migration.failure must be a string or null`, file);
   }
   return raw as unknown as MigrationState;
 }
@@ -313,9 +441,8 @@ function coerceJournal(raw: unknown, file: string): JournalEntry[] | null {
     if (typeof entry.undo.path !== 'string') {
       throw new StateError(`${file}: journal entry 'undo.path' must be a string`, file);
     }
-    if (!isObject(entry.undo.backupRef)) {
-      throw new StateError(`${file}: journal entry 'undo.backupRef' must be an object`, file);
-    }
+    const invalidBackup = validateBackupRef(entry.undo.backupRef);
+    if (invalidBackup) throw new StateError(`${file}: journal entry undo.backupRef ${invalidBackup}`, file);
   }
   return raw as JournalEntry[];
 }
@@ -401,12 +528,18 @@ export async function readState(paths: Paths): Promise<StateManifest> {
     obj.quarantine,
     'quarantine',
     file,
-    (record, label) =>
-      requireString(record, 'id', label) ??
-      requireString(record, 'kind', label) ??
-      requireString(record, 'path', label) ??
-      requireString(record, 'retainedPath', label) ??
-      requireString(record, 'reason', label),
+    (record, label) => {
+      const required =
+        requireString(record, 'id', label) ??
+        requireString(record, 'kind', label) ??
+        requireString(record, 'path', label) ??
+        requireString(record, 'retainedPath', label) ??
+        requireString(record, 'reason', label);
+      if (required) return required;
+      if (!isFiniteNumber(record.createdAt)) return `${label}.createdAt must be a number`;
+      if (typeof record.resolved !== 'boolean') return `${label}.resolved must be boolean`;
+      return null;
+    },
   );
   const migration = coerceMigration(obj.migration, file);
   return {

@@ -280,6 +280,146 @@ describe('state manifest', () => {
 
       await expect(readState(p)).rejects.toThrow(/candidates.*schemaVersion/i);
     });
+
+    it('rejects malformed nested lease and inventory fields', async () => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({
+          version: STATE_SCHEMA_VERSION_STRING,
+          items: [],
+          generations: [{
+            schemaVersion: 2,
+            id: 'generation-1',
+            envs: ['work'],
+            phase: 'published',
+            reservations: [],
+            leases: [{ reservationId: 'lease', pid: 'not-a-pid', processGroupId: 2, processStart: 'x' }],
+            inventory: [{
+              surfaceId: 'skills',
+              storeKind: 'skills',
+              mechanism: 'dir-merge',
+              path: '/view/skills',
+              baseline: ['one'],
+              ownerEnv: 'work',
+            }],
+          }],
+        }),
+      );
+
+      await expect(readState(p)).rejects.toThrow(/generations.*lease.*pid/i);
+    });
+
+    it('rejects malformed nested command identities before WAL recovery', async () => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({
+          version: STATE_SCHEMA_VERSION_STRING,
+          items: [],
+          commands: [{
+            schemaVersion: 2,
+            transactionId: 'tx',
+            kind: 'filesystem-bundle',
+            phase: 'applying',
+            commitPoint: false,
+            operations: [{
+              id: 'effect',
+              kind: 'replace-path',
+              state: 'applied',
+              path: '/target',
+              preIdentity: { kind: 'file', digest: 42, mode: 420 },
+              postIdentity: { kind: 'absent' },
+            }],
+          }],
+        }),
+      );
+
+      await expect(readState(p)).rejects.toThrow(/commands.*preIdentity/i);
+    });
+
+    it('rejects invalid projection identities and non-string candidate blockers', async () => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({
+          version: STATE_SCHEMA_VERSION_STRING,
+          items: [],
+          globalProjections: [{
+            schemaVersion: 2,
+            id: 'projection-1',
+            phase: 'active',
+            baseline: { kind: 'teleported' },
+            observed: { kind: 'absent' },
+          }],
+        }),
+      );
+      await expect(readState(p)).rejects.toThrow(/globalProjections.*baseline/i);
+
+      writeFileSync(
+        p.state,
+        JSON.stringify({
+          version: STATE_SCHEMA_VERSION_STRING,
+          items: [],
+          candidates: [{
+            schemaVersion: 2,
+            id: 'candidate-1',
+            ref: 'refs/candidate',
+            worktree: '/candidate',
+            fetchedAt: 1,
+            touchedCanonicalPaths: ['environments/work/env.yaml'],
+            phase: 'deferred',
+            blockers: [7],
+            reason: null,
+            promotedRevision: null,
+            expectedCanonicalRevision: 'abc',
+            candidateRevision: 'def',
+          }],
+        }),
+      );
+      await expect(readState(p)).rejects.toThrow(/candidates.*blockers/i);
+    });
+
+    it('rejects incomplete quarantine and migration metadata', async () => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({
+          version: STATE_SCHEMA_VERSION_STRING,
+          items: [],
+          quarantine: [{
+            schemaVersion: 2,
+            id: 'rescue',
+            kind: 'third-identity',
+            path: '/surface',
+            retainedPath: '/retained',
+            reason: 'reason',
+            createdAt: 'yesterday',
+            resolved: false,
+          }],
+        }),
+      );
+      await expect(readState(p)).rejects.toThrow(/quarantine.*createdAt/i);
+
+      writeFileSync(
+        p.state,
+        JSON.stringify({
+          version: STATE_SCHEMA_VERSION_STRING,
+          items: [],
+          migration: {
+            schemaVersion: 2,
+            id: 'migration',
+            sourceFormat: 'invented-v1',
+            phase: 'planned',
+            gate: 'closed',
+            commitPoint: false,
+            backupRef: null,
+            failure: null,
+          },
+        }),
+      );
+      await expect(readState(p)).rejects.toThrow(/migration.*sourceFormat/i);
+    });
   });
 
   describe('query + mutation helpers', () => {

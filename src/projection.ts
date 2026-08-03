@@ -81,6 +81,12 @@ export function decideReverseProjection(input: ReverseProjectionInput): ReverseP
 export function validateProjectionRecord(record: ProjectionRecord): string | null {
   if (record.schemaVersion !== 2) return 'projection schema version must be 2';
   if (!record.id) return 'projection id is required';
+  if (!record.canonical || typeof record.canonical !== 'object') {
+    return 'canonical projection pointer is required';
+  }
+  if (!record.rendered || typeof record.rendered !== 'object') {
+    return 'rendered projection pointer is required';
+  }
   if (!record.canonical.path || !record.canonical.pointer) {
     return 'canonical path and pointer are required';
   }
@@ -91,6 +97,7 @@ export function validateProjectionRecord(record: ProjectionRecord): string | nul
   }
   if (!record.rendered.baselineHash) return 'rendered baseline hash is required';
   if (!record.transform) return 'projection transform is required';
+  if (!Array.isArray(record.placeholders)) return 'projection placeholders must be an array';
   for (const placeholder of record.placeholders) {
     if (!placeholder.renderedPointer || !placeholder.template) {
       return 'projection placeholders require a rendered pointer and template';
