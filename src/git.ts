@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { access, cp, mkdir, readFile, readdir, rm } from 'node:fs/promises';
 import { join, relative, sep } from 'node:path';
 import { parseEnvConfig } from './env-config.js';
@@ -477,7 +478,7 @@ export async function scanStoreForSecrets(paths: Paths): Promise<SecretFinding[]
 export async function scanRevisionRangeForSecrets(
   paths: Paths,
   env: NodeJS.ProcessEnv,
-  baseRevision: string,
+  baseRevision: string | null,
   candidateRevision: string,
   run?: GitRunner,
 ): Promise<SecretFinding[]> {
@@ -486,7 +487,7 @@ export async function scanRevisionRangeForSecrets(
     'rev-list',
     '--objects',
     candidateRevision,
-    `^${baseRevision}`,
+    ...(baseRevision ? [`^${baseRevision}`] : []),
   ]);
   if (listed.code !== 0) {
     throw new Error('could not enumerate newly reachable candidate history');
@@ -1381,6 +1382,70 @@ export async function validatePulledStore(paths: Paths): Promise<PulledStoreVali
   }
   const secretFindings = await scanStoreForSecrets(paths);
   return { ok: schemaProblems.length === 0 && secretFindings.length === 0, schemaProblems, secretFindings };
+}
+
+/**
+ * Validate a fetched remote ref in a detached private worktree before remote
+ * bootstrap/replacement can integrate or adopt it. Both its final tree and all
+ * history not already shared with local HEAD are scanned.
+ */
+export async function validateRemoteCandidate(
+  paths: Paths,
+  env: NodeJS.ProcessEnv,
+  candidateRef: string,
+  run?: GitRunner,
+): Promise<PulledStoreValidation> {
+  const ctx = gitContext(paths, env, run);
+  const worktree = join(paths.live, 'remote-candidates', randomUUID());
+  await mkdir(join(paths.live, 'remote-candidates'), { recursive: true });
+  const added = await git(ctx, ['worktree', 'add', '--detach', worktree, candidateRef]);
+  if (added.code !== 0) {
+    return {
+      ok: false,
+      schemaProblems: ['could not construct an isolated remote candidate worktree'],
+      secretFindings: [],
+    };
+  }
+  try {
+    const candidatePaths: Paths = {
+      ...paths,
+      store: worktree,
+      environments: join(worktree, 'environments'),
+      storeReadme: join(worktree, 'README.md'),
+      envDir: (name: string) => join(worktree, 'environments', name),
+      envYaml: (name: string) => join(worktree, 'environments', name, 'env.yaml'),
+    };
+    const tree = await validatePulledStore(candidatePaths);
+    const revisionResult = await git(ctx, ['rev-parse', '--verify', candidateRef]);
+    if (revisionResult.code !== 0 || revisionResult.stdout.trim() === '') {
+      return {
+        ok: false,
+        schemaProblems: [...tree.schemaProblems, 'could not identify the remote candidate revision'],
+        secretFindings: tree.secretFindings,
+      };
+    }
+    const mergeBase = await git(ctx, ['merge-base', 'HEAD', candidateRef]);
+    const base = mergeBase.code === 0 && mergeBase.stdout.trim() !== ''
+      ? mergeBase.stdout.trim()
+      : null;
+    const historyFindings = await scanRevisionRangeForSecrets(
+      paths,
+      env,
+      base,
+      revisionResult.stdout.trim(),
+      run,
+    );
+    const secretFindings = [...tree.secretFindings, ...historyFindings];
+    return {
+      ok: tree.schemaProblems.length === 0 && secretFindings.length === 0,
+      schemaProblems: tree.schemaProblems,
+      secretFindings,
+    };
+  } finally {
+    await git(ctx, ['worktree', 'remove', '--force', worktree]);
+    await rm(worktree, { recursive: true, force: true });
+    await git(ctx, ['worktree', 'prune']);
+  }
 }
 
 /** A manifest-reconcile warning after a pull (D9). */

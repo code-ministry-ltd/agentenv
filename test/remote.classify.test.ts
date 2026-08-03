@@ -289,6 +289,28 @@ describe('remote 2.3: RELATED candidate → integrate then adopt', () => {
     expect(originUrl(paths.store)).toBe(oldRemote.url); // unchanged
     expect(subjects(paths.store)).toEqual(localBefore); // local intact
   });
+
+  it('rejects a related candidate containing a secret before integrating it', async () => {
+    const th = gitHome();
+    const paths = resolvePaths(th.env);
+    const oldRemote = emptyBare();
+    await run(['init'], { env: th.env });
+    await run(['remote', oldRemote.url], { env: th.env });
+    const localBefore = subjects(paths.store);
+    const related = relatedBare(
+      paths.store,
+      'REMOTE.md',
+      'api_key: AKIAZ7Q2W9E4R6T1Y8U3\n',
+    );
+
+    const res = await run(['remote', related.url], { env: th.env });
+
+    expect(res.code).not.toBe(0);
+    expect(res.stderr ?? '').toMatch(/validation|secret/i);
+    expect(originUrl(paths.store)).toBe(oldRemote.url);
+    expect(subjects(paths.store)).toEqual(localBefore);
+    expect(existsSync(join(paths.store, 'REMOTE.md'))).toBe(false);
+  });
 });
 
 describe('remote 2.3: UNRELATED candidate → refuse / cancel / archive-and-adopt', () => {

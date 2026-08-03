@@ -6,6 +6,7 @@ import {
   classifyRemoteHistory,
   cleanupCandidateRefs,
   commitStore,
+  describeFindings,
   ensureStoreRepo,
   getRemoteUrl,
   headCommit,
@@ -17,6 +18,7 @@ import {
   redactRemoteUrl,
   resetHardTo,
   setRemoteUrl,
+  validateRemoteCandidate,
 } from '../git.js';
 import { confirmDefault } from '../prompt.js';
 import { ensureStore } from '../store.js';
@@ -107,10 +109,16 @@ export const remoteCommand: Command = {
           return await unreachableCandidate(ctx, url, existing, classification.detail);
         case 'empty':
           return await adoptEmpty(ctx, url, existing);
-        case 'related':
+        case 'related': {
+          const rejected = await rejectUnsafeCandidate(ctx, classification.candidateRef);
+          if (rejected) return rejected;
           return await integrateRelated(ctx, url, classification.candidateRef, existing);
-        case 'unrelated':
+        }
+        case 'unrelated': {
+          const rejected = await rejectUnsafeCandidate(ctx, classification.candidateRef);
+          if (rejected) return rejected;
           return await adoptUnrelated(ctx, url, classification.candidateRef, existing, false);
+        }
         default:
           return fail('remote: could not classify the candidate remote; nothing was changed.\n');
       }
@@ -120,6 +128,33 @@ export const remoteCommand: Command = {
     }
   },
 };
+
+async function rejectUnsafeCandidate(
+  ctx: CommandContext,
+  candidateRef: string | undefined,
+): Promise<RunResult | null> {
+  if (!candidateRef) return null;
+  const validation = await validateRemoteCandidate(
+    ctx.paths,
+    ctx.env,
+    candidateRef,
+    ctx.options.gitRun,
+  );
+  if (validation.ok) return null;
+  const parts: string[] = [];
+  if (validation.schemaProblems.length > 0) {
+    parts.push(
+      `malformed manifest(s):\n${validation.schemaProblems.map((problem) => `  ${problem}`).join('\n')}`,
+    );
+  }
+  if (validation.secretFindings.length > 0) {
+    parts.push(`suspected secret(s):\n${describeFindings(validation.secretFindings)}`);
+  }
+  return fail(
+    'remote: candidate validation failed in isolation; it was not integrated, adopted, or configured.\n' +
+      `${parts.join('\n')}\n`,
+  );
+}
 
 /**
  * The SAME URL is already configured (design D14): a no-op re-point, then an ordinary
