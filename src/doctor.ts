@@ -423,7 +423,7 @@ async function repairStoreDrift(
  * Rebuild a broken file-block region, by HOW it is broken (Task 5.1):
  *
  * - **conflict** — markers claim this env but do not match the record (duplicated,
- *   relabelled, non-contiguous, CRLF-rewritten, wrapped in merge fences). The
+ *   relabelled, non-contiguous, or wrapped in merge fences). The
  *   mechanisms fail CLOSED on these (they refuse to reclaim a guessed span), so the
  *   only way to remove the mangled text is to go back to the item's preserved
  *   pre-materialise backup — removing the markers as bytes, not by trusting them —

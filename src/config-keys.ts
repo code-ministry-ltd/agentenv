@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { lstat, readFile, rm } from 'node:fs/promises';
 import { applyEdits, modify, parse as parseJsonc } from 'jsonc-parser';
 import type { JSONPath, ParseError } from 'jsonc-parser';
 import { parse as parseToml, stringify as stringifyToml, TomlError } from 'smol-toml';
@@ -108,13 +108,14 @@ export interface ConfigKeysItem extends ManifestItemBase {
    * pruned. Absent (treated as 0) when the inject created no parents, or for TOML (whose
    * marked `[table]` mechanism removes the whole block, orphaning nothing).
    *
-   * SCOPE (F5/10): this covers ancestor KEYS, not the FILE. When the target file did not
-   * exist, the inject creates it and the removal leaves an empty `{}` behind rather than
-   * un-creating it — the cycle is byte-identical only where there were bytes to begin
-   * with. Inert for every current adapter (their config files already exist), and pinned
-   * by a test in `config-keys.test.ts` so the gap stays visible.
+   * `createdFile` separately records original path absence, allowing removal to
+   * restore that absence once the owned key and created parents are gone.
    */
   createdParents?: number;
+  /** The target file itself was absent before this ownership record created it. */
+  createdFile?: boolean;
+  /** array-element only: the array path itself was absent and was created by us. */
+  createdPath?: boolean;
 }
 
 // Register the variant so `ManifestItem` narrows on `surface: 'config-keys'`
@@ -293,9 +294,8 @@ function jsonBaseText(text: string): string {
  * uses jsonc-parser surgical `modify` with no reformatting, so a full
  * inject→remove cycle is byte-identical to the original — verified for JSONC with
  * comments, trailing commas and tab indentation, including through the created-parent
- * prune (which re-parses and re-modifies a second time). The one exception is a target
- * file that did NOT exist: the inject creates it and the removal leaves an empty `{}`
- * rather than un-creating it (F5/10, see {@link ConfigKeysItem.createdParents}). Records
+ * prune (which re-parses and re-modifies a second time). A target file that did
+ * not exist is marked `createdFile` and removed again once empty. Records
  * ownership via the transaction (backup-first, write-ahead journal).
  *
  * Refuses (a {@link ConfigKeysError}) when a NON-owned value already sits at
@@ -312,6 +312,7 @@ export async function injectKeyed(
   tx: Transaction,
   req: InjectKeyedRequest,
 ): Promise<ConfigKeysItem> {
+  const createdFile = !(await pathExists(req.file));
   const text = await readText(req.file);
   assertNoCollision(text, req);
   // Record which ancestor levels we CREATE, so removal can prune exactly them and
@@ -320,7 +321,7 @@ export async function injectKeyed(
     req.format === 'toml'
       ? 0
       : countCreatedParents(parseJsonConfig(jsonBaseText(text), req.file), req.keyPath);
-  const item = makeKeyedItem(req, createdParents);
+  const item = makeKeyedItem(req, createdParents, createdFile);
   const next = writeKeyedValueText(text, item, req.value);
   await applyFileMutation(paths, tx, 'add', item, req.file, next);
   return item;
@@ -385,7 +386,11 @@ function writeKeyedValueText(text: string, item: ConfigKeysItem, value: JsonValu
   return applyEdits(base, modify(base, item.keyPath as JSONPath, value, {}));
 }
 
-function makeKeyedItem(req: InjectKeyedRequest, createdParents: number): ConfigKeysItem {
+function makeKeyedItem(
+  req: InjectKeyedRequest,
+  createdParents: number,
+  createdFile: boolean,
+): ConfigKeysItem {
   const item: ConfigKeysItem = {
     action: 'config-key',
     surface: 'config-keys',
@@ -396,6 +401,7 @@ function makeKeyedItem(req: InjectKeyedRequest, createdParents: number): ConfigK
     format: req.format,
     keyPath: [...req.keyPath],
     hash: hashValue(req.value),
+    ...(createdFile ? { createdFile: true } : {}),
   };
   if (req.secretFields && Object.keys(req.secretFields).length > 0) {
     item.secretFields = { ...req.secretFields };
@@ -422,35 +428,33 @@ function makeKeyedItem(req: InjectKeyedRequest, createdParents: number): ConfigK
  * position-based array-index edits mishandle the last element of an inline array;
  * a whole-array replacement is always well-formed.
  *
- * KNOWN GAP (F5/12): when the value is ALREADY present the file is left untouched but
- * an ownership item is still recorded, so a later removal deletes the USER's identical
- * pre-existing element. This is the same value-identity limitation {@link removeArrayElement}
- * carries (B3) — array-element ownership has no per-entry marker, so our element and an
- * identical one of the user's are indistinguishable. It also means the blanket "an
- * inject→remove cycle is byte-identical" justification does NOT hold for this path.
- * Currently latent: no adapter pairs an array-element surface with a
- * `validateConfigFile` hook, so the engine's rollback never runs over one.
- * Documented rather than fixed — a real fix needs per-item identity in the manifest,
- * which is a frozen-interface change.
+ * When an identical value is already present, this returns `null` and records no
+ * ownership. The value is necessarily indistinguishable from user content, so
+ * claiming it would make a later drop destructive.
  */
 export async function injectArrayElement(
   paths: Paths,
   tx: Transaction,
   req: InjectArrayElementRequest,
-): Promise<ConfigKeysItem> {
+): Promise<ConfigKeysItem | null> {
   if (req.format === 'toml') {
     throw new ConfigKeysError(`${req.file}: array-element injection is JSON/JSONC only`, req.file);
   }
+  const createdFile = !(await pathExists(req.file));
   const text = await readText(req.file);
   const base = jsonBaseText(text);
+  const parsed = parseJsonConfig(base, req.file);
+  const arrayProbe = getAtPath(parsed, req.arrayPath);
   const current = readArray(base, req.arrayPath, req.file);
   const present = current.some((v) => stableStringify(v) === stableStringify(req.value));
+  // An indistinguishable user value is already there. Do not claim it: a later
+  // drop must never remove bytes agentenv did not add.
+  if (present) return null;
 
-  const next = present
-    ? base // already present — idempotent re-injection
-    : applyEdits(base, modify(base, req.arrayPath as JSONPath, [...current, req.value], {}));
-
-  const item = makeArrayElementItem(req);
+  const next = applyEdits(base, modify(base, req.arrayPath as JSONPath, [...current, req.value], {}));
+  const createdPath = !arrayProbe.found;
+  const createdParents = createdPath ? countCreatedParents(parsed, req.arrayPath) : 0;
+  const item = makeArrayElementItem(req, createdFile, createdPath, createdParents);
   await applyFileMutation(paths, tx, 'add', item, req.file, next);
   return item;
 }
@@ -469,7 +473,12 @@ function readArray(text: string, arrayPath: KeyPath, file: string): JsonValue[] 
   return value as JsonValue[];
 }
 
-function makeArrayElementItem(req: InjectArrayElementRequest): ConfigKeysItem {
+function makeArrayElementItem(
+  req: InjectArrayElementRequest,
+  createdFile: boolean,
+  createdPath: boolean,
+  createdParents: number,
+): ConfigKeysItem {
   return {
     action: 'config-key',
     surface: 'config-keys',
@@ -481,6 +490,9 @@ function makeArrayElementItem(req: InjectArrayElementRequest): ConfigKeysItem {
     keyPath: [...req.arrayPath],
     value: req.value,
     hash: hashValue(req.value),
+    ...(createdFile ? { createdFile: true } : {}),
+    ...(createdPath ? { createdPath: true } : {}),
+    ...(createdParents > 0 ? { createdParents } : {}),
   };
 }
 
@@ -520,7 +532,14 @@ export async function removeKey(
     };
   }
   const next = removeKeyedText(text, item);
-  await applyFileMutation(paths, tx, 'remove', item, item.path, next);
+  await applyFileMutation(
+    paths,
+    tx,
+    'remove',
+    item,
+    item.path,
+    item.createdFile && configDocumentEmpty(next, item.format) ? null : next,
+  );
   return { removed: true };
 }
 
@@ -547,25 +566,37 @@ async function removeArrayElement(
       note: `array ${displayPath(item.keyPath)} absent in ${item.path} — nothing to remove`,
     };
   }
-  // NOTE (B3): this filters out EVERY entry equal to our value, so if the user
-  // independently added an identical value we over-remove theirs too. Ownership is
-  // by exact value with no per-entry marker, so the duplicates are indistinguishable;
-  // accepted for the D3 array-element surface (identical-value collisions are rare
-  // and the value is one we injected). No behaviour change.
-  const filtered = (arr as JsonValue[]).filter(
-    (v) => stableStringify(v) !== stableStringify(item.value),
+  const ownedIndex = (arr as JsonValue[]).findIndex(
+    (v) => stableStringify(v) === stableStringify(item.value),
   );
-  if (filtered.length === arr.length) {
+  if (ownedIndex === -1) {
     return {
       removed: false,
       reason: 'absent',
       note: `array element ${item.key ?? ''} already absent — no-op`,
     };
   }
-  // Rewrite the whole array (see injectArrayElement's note on the jsonc-parser
-  // index-edit bug). Matching by value makes this order-independent.
-  const next = applyEdits(base, modify(base, item.keyPath as JSONPath, filtered, {}));
-  await applyFileMutation(paths, tx, 'remove', item, item.path, next);
+  // Remove one owned occurrence only. A user may have added an identical value
+  // after materialisation; identical entries cannot be distinguished, but
+  // retaining all but one preserves the user's contribution.
+  const filtered = [...(arr as JsonValue[])];
+  filtered.splice(ownedIndex, 1);
+  // If agentenv created the array path and its final owned element is gone,
+  // remove that path and any now-empty parents it also created. Otherwise retain
+  // the array (including any user-added siblings).
+  let next =
+    filtered.length === 0 && item.createdPath
+      ? applyEdits(base, modify(base, item.keyPath as JSONPath, undefined, {}))
+      : applyEdits(base, modify(base, item.keyPath as JSONPath, filtered, {}));
+  if (filtered.length === 0 && item.createdPath) next = pruneCreatedParents(next, item);
+  await applyFileMutation(
+    paths,
+    tx,
+    'remove',
+    item,
+    item.path,
+    item.createdFile && configDocumentEmpty(next, item.format) ? null : next,
+  );
   return { removed: true };
 }
 
@@ -935,10 +966,32 @@ async function applyFileMutation(
   op: 'add' | 'remove',
   item: ConfigKeysItem,
   file: string,
-  text: string,
+  text: string | null,
 ): Promise<void> {
   const backupRef = await backup(paths, file);
   await tx.apply({ op, item, undo: { path: file, backupRef } }, async () => {
-    await writeFileAtomic(file, text);
+    if (text === null) await rm(file, { force: true });
+    else await writeFileAtomic(file, text);
   });
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw err;
+  }
+}
+
+function configDocumentEmpty(text: string, format: ConfigFormat): boolean {
+  if (text.trim() === '') return true;
+  const parsed = format === 'toml' ? parseTomlConfig(text, '<created>') : parseJsonConfig(text, '<created>');
+  return (
+    parsed !== null &&
+    typeof parsed === 'object' &&
+    !Array.isArray(parsed) &&
+    Object.keys(parsed as Record<string, unknown>).length === 0
+  );
 }

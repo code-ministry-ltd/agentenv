@@ -63,6 +63,18 @@ describe('file-block surface — materialise', () => {
     expect(after).toContain('<!-- <<< agentenv:writing/base.md <<< -->');
   });
 
+  it('renders structural line breaks as CRLF when the user file is CRLF', async () => {
+    const target = targetPath();
+    writeFileSync(target, 'USER\r\n');
+    const src = store('writing', 'base.md', 'BODY\r\n');
+
+    await materialise(paths(), { target, env: 'writing', mode: 'inline', sources: [src] });
+
+    const after = readFileSync(target, 'utf8');
+    expect(after.replaceAll('\r\n', '')).not.toContain('\n');
+    expect(after).toContain('\r\n<!-- >>> agentenv:writing/base.md');
+  });
+
   it('creates the target file when it does not exist', async () => {
     const target = targetPath('AGENTS.md');
     expect(existsSync(target)).toBe(false);

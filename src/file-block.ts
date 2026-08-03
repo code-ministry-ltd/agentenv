@@ -161,8 +161,13 @@ export function closeMarker(env: string, source: string): string {
 }
 
 /** Render one sub-block: open marker, body, close marker (body may be empty). */
-function renderSubBlock(env: string, source: string, body: string): string {
-  return `${openMarker(env, source)}\n${body}\n${closeMarker(env, source)}`;
+function renderSubBlock(
+  env: string,
+  source: string,
+  body: string,
+  eol: '\n' | '\r\n',
+): string {
+  return openMarker(env, source) + eol + body + eol + closeMarker(env, source);
 }
 
 /**
@@ -170,10 +175,15 @@ function renderSubBlock(env: string, source: string, body: string): string {
  * line. `bodies` maps a source id to its rendered body (an include line for
  * import mode, inlined content for inline mode).
  */
-function renderRegion(env: string, subBlocks: FileSubBlock[], bodies: Map<string, string>): string {
+function renderRegion(
+  env: string,
+  subBlocks: FileSubBlock[],
+  bodies: Map<string, string>,
+  eol: '\n' | '\r\n',
+): string {
   return subBlocks
-    .map((sb) => renderSubBlock(env, sb.source, bodies.get(sb.source) ?? ''))
-    .join('\n\n');
+    .map((sb) => renderSubBlock(env, sb.source, bodies.get(sb.source) ?? '', eol))
+    .join(eol + eol);
 }
 
 /** One marker line located in file text (open or close), with its byte span. */
@@ -217,7 +227,13 @@ function scanMarkers(content: string): MarkerHit[] {
  *   caller must refuse rather than guess a span and eat content.
  */
 type OwnedRegion =
-  | { status: 'clean'; start: number; end: number; bodies: Map<string, string> }
+  | {
+      status: 'clean';
+      start: number;
+      end: number;
+      bodies: Map<string, string>;
+      eol: '\n' | '\r\n';
+    }
   | { status: 'absent' }
   | { status: 'conflict'; detail: string };
 
@@ -249,6 +265,7 @@ function locateOwnedRegion(content: string, env: string, subBlocks: FileSubBlock
   }
 
   const bodies = new Map<string, string>();
+  let structuralEol: '\n' | '\r\n' | null = null;
   for (let i = 0; i < subBlocks.length; i++) {
     const sb = subBlocks[i];
     const openHit = mine[i * 2];
@@ -263,27 +280,65 @@ function locateOwnedRegion(content: string, env: string, subBlocks: FileSubBlock
     if (closeHit.kind !== 'close' || closeHit.label !== want) {
       return { status: 'conflict', detail: `sub-block ${i + 1} close marker does not match manifest (${want})` };
     }
+    const afterOpen = lineBreakAfter(content, openHit.end);
+    const beforeClose = lineBreakBefore(content, closeHit.start);
+    if (!afterOpen || !beforeClose || afterOpen.value !== beforeClose.value) {
+      return { status: 'conflict', detail: `sub-block ${i + 1} has malformed line boundaries` };
+    }
+    structuralEol ??= afterOpen.value;
+    if (afterOpen.value !== structuralEol) {
+      return { status: 'conflict', detail: `mixed structural line endings for env "${env}"` };
+    }
     if (i > 0) {
       const prevClose = mine[(i - 1) * 2 + 1];
-      if (!prevClose || content.slice(prevClose.end, openHit.start) !== '\n\n') {
+      if (
+        !prevClose ||
+        content.slice(prevClose.end, openHit.start) !== structuralEol + structuralEol
+      ) {
         return { status: 'conflict', detail: `unexpected content between managed sub-blocks of env "${env}"` };
       }
     }
-    // Body is exactly what renderSubBlock wrapped: `open\n<body>\nclose`.
-    bodies.set(sb.source, content.slice(openHit.end + 1, closeHit.start - 1));
+    bodies.set(
+      sb.source,
+      content.slice(openHit.end + afterOpen.length, closeHit.start - beforeClose.length),
+    );
   }
 
   const first = mine[0];
   const last = mine[mine.length - 1];
   if (!first || !last) return { status: 'conflict', detail: `malformed marker run for env "${env}"` };
-  return { status: 'clean', start: first.start, end: last.end, bodies };
+  return {
+    status: 'clean',
+    start: first.start,
+    end: last.end,
+    bodies,
+    eol: structuralEol ?? '\n',
+  };
+}
+
+function lineBreakAfter(
+  content: string,
+  index: number,
+): { value: '\n' | '\r\n'; length: 1 | 2 } | null {
+  if (content.startsWith('\r\n', index)) return { value: '\r\n', length: 2 };
+  if (content.startsWith('\n', index)) return { value: '\n', length: 1 };
+  return null;
+}
+
+function lineBreakBefore(
+  content: string,
+  index: number,
+): { value: '\n' | '\r\n'; length: 1 | 2 } | null {
+  if (content.slice(index - 2, index) === '\r\n') return { value: '\r\n', length: 2 };
+  if (content.slice(index - 1, index) === '\n') return { value: '\n', length: 1 };
+  return null;
 }
 
 /**
  * Strip the byte span `[start, end)` from `content`, returning the surrounding
  * user content byte-for-byte. The exact inverse of {@link appendRegion}: the
- * region is always joined with exactly one leading `\n` separator and exactly one
- * trailing `\n`, so one of each is removed here and nothing else. Removing a
+ * region is always joined with exactly one leading line-ending separator and
+ * exactly one trailing line ending, so one of each is removed here and nothing else. Removing a
  * *fixed* one leading newline (never a heuristic count) is what lets a user
  * safely prepend their own content — e.g. `MY NOTES\n` above the region — and
  * keep it: their newline survives because only agentenv's single separator is
@@ -293,21 +348,38 @@ function locateOwnedRegion(content: string, env: string, subBlocks: FileSubBlock
 function stripSpan(content: string, start: number, end: number): string {
   const before = content.slice(0, start);
   const after = content.slice(end);
-  const userHead = before.endsWith('\n') ? before.slice(0, -1) : before;
-  const userTail = after.startsWith('\n') ? after.slice(1) : after;
+  const userHead = before.endsWith('\r\n')
+    ? before.slice(0, -2)
+    : before.endsWith('\n')
+      ? before.slice(0, -1)
+      : before;
+  const userTail = after.startsWith('\r\n')
+    ? after.slice(2)
+    : after.startsWith('\n')
+      ? after.slice(1)
+      : after;
   return userHead + userTail;
 }
 
 /**
  * Append a rendered region to user content, byte-reversibly by
- * {@link stripSpan}: exactly one `\n` always separates the (possibly empty)
- * user content from the region — giving a blank line whenever the content
- * already ends in a newline — and exactly one `\n` terminates the file. The
+ * {@link stripSpan}: exactly one line ending always separates the (possibly
+ * empty) user content from the region — giving a blank line whenever the content
+ * already ends in a newline — and exactly one line ending terminates the file. The
  * separator is inserted unconditionally (even for empty content) so its removal
  * is unambiguous regardless of any user edits made around the region later.
  */
-export function appendRegion(user: string, region: string): string {
-  return `${user}\n${region}\n`;
+export function appendRegion(
+  user: string,
+  region: string,
+  preferredEol?: '\n' | '\r\n',
+): string {
+  const eol = preferredEol ?? detectEol(user);
+  return user + eol + region + eol;
+}
+
+function detectEol(text: string): '\n' | '\r\n' {
+  return text.includes('\r\n') ? '\r\n' : '\n';
 }
 
 // ---------------------------------------------------------------------------
@@ -398,8 +470,9 @@ export async function materialise(paths: Paths, opts: MaterialiseOptions): Promi
       });
     }
 
-    const region = renderRegion(env, subBlocks, bodies);
-    const after = appendRegion(userContent, region);
+    const eol = detectEol(before);
+    const region = renderRegion(env, subBlocks, bodies, eol);
+    const after = appendRegion(userContent, region, eol);
 
     const currentBackup = await backup(paths, target);
     const originalBackup = existing?.backupRef ?? currentBackup;
@@ -570,8 +643,12 @@ export async function syncBack(paths: Paths, opts: FileBlockTargetOptions): Prom
       updatedSubBlocks.push({ ...sb, hash: hashBody(newBody) });
     }
 
-    const region = renderRegion(env, updatedSubBlocks, newBodies);
-    const after = appendRegion(stripSpan(before, owned.start, owned.end), region);
+    const region = renderRegion(env, updatedSubBlocks, newBodies, owned.eol);
+    const after = appendRegion(
+      stripSpan(before, owned.start, owned.end),
+      region,
+      owned.eol,
+    );
     const hashesChanged = updatedSubBlocks.some((sb, i) => sb.hash !== record.subBlocks[i]?.hash);
 
     // Truly nothing to do: no drift, no refresh, no hash change, file unchanged.

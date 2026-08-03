@@ -83,6 +83,16 @@ describe('file-block surface — dematerialise', () => {
     expect(readFileSync(target, 'utf8')).toBe(original);
   });
 
+  it('uses CRLF-safe markers and restores CRLF user bytes exactly', async () => {
+    const original = '# Title\r\n\r\nUser paragraph.\r\n';
+    const target = await roundTrip(original, {
+      env: 'writing',
+      mode: 'inline',
+      sources: [store('writing', 'base.md', 'ENV\r\n')],
+    });
+    expect(readFileSync(target, 'utf8')).toBe(original);
+  });
+
   it('deletes a file agentenv created (absent original), leaving no debris', async () => {
     const target = targetPath();
     expect(existsSync(target)).toBe(false);

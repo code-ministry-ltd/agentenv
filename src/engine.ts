@@ -697,6 +697,17 @@ async function materialiseConfigKeys(
               value: p.injection.value,
               ownerEnv: p.env,
             });
+            if (item === null) {
+              skips.push({
+                adapterId: p.adapterId,
+                surfaceId: p.surface.id,
+                reason: 'user-collision',
+                detail:
+                  "array element from env '" + p.env +
+                  "' already exists as unowned user content; left untouched and unclaimed",
+              });
+              continue;
+            }
             recordWrite(p, item);
             applied += 1;
           } catch (err) {

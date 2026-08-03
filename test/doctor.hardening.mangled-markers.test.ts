@@ -18,8 +18,8 @@ import {
  *
  *  - a git merge conflict that duplicates the whole region between `<<<<<<<`
  *    fences;
- *  - an editor rewriting the file with CRLF line endings, which breaks the exact
- *    `\n\n` separator the mechanism anchors sub-blocks on;
+ *  - an editor rewriting the file with CRLF line endings, which remains a valid
+ *    managed region;
  *  - a truncated close marker (a merge or a chopped last line);
  *  - a harness deleting the managed block outright, AFTER the user has edited the
  *    rest of the file;
@@ -123,7 +123,7 @@ describe('doctor.hardening: mangled markers (editor / merge / harness damage)', 
     expect((await run(['doctor'], { env: th.env })).code).toBe(0);
   });
 
-  it('an editor rewriting the file as CRLF breaks the sub-block anchoring and is repaired', async () => {
+  it('accepts an editor rewriting the complete managed region as CRLF', async () => {
     const th = home();
     const f = seed(th);
     await materialiseRegion(f, 'writing', [
@@ -131,25 +131,20 @@ describe('doctor.hardening: mangled markers (editor / merge / harness damage)', 
       { name: 'codex.md', body: 'codex extras\n' },
     ]);
 
-    // A Windows-y editor round-trips the file: every LF becomes CRLF, so the
-    // exact `\n\n` the mechanism requires between sub-blocks no longer matches.
+    // A Windows-y editor round-trips the complete file. Consistent CRLF marker
+    // boundaries are valid and must not be reported as corruption.
     const lf = readFileSync(f.target, 'utf8');
     writeFileSync(f.target, lf.replace(/\n/g, '\r\n'));
 
     const res = await run(['doctor'], { env: th.env });
-    expect(res.code).not.toBe(0);
-    expect(`${res.stdout}${res.stderr ?? ''}`).toContain('mangled-markers');
+    expect(res.code, `${res.stdout}${res.stderr ?? ''}`).toBe(0);
 
-    const repaired = await run(['doctor', '--repair'], { env: th.env });
-    expect(repaired.code, `${repaired.stdout}${repaired.stderr ?? ''}`).toBe(0);
-
-    const fixed = readFileSync(f.target, 'utf8');
-    expect(fixed).toContain('keep me');
-    expect(openMarkerCount(fixed, 'writing', 'base.md')).toBe(1);
-    expect(openMarkerCount(fixed, 'writing', 'codex.md')).toBe(1);
-    expect(fixed).toContain('codex extras');
-
-    expect((await run(['doctor'], { env: th.env })).code).toBe(0);
+    const intact = readFileSync(f.target, 'utf8');
+    expect(intact).toContain('keep me');
+    expect(openMarkerCount(intact, 'writing', 'base.md')).toBe(1);
+    expect(openMarkerCount(intact, 'writing', 'codex.md')).toBe(1);
+    expect(intact).toContain('codex extras');
+    expect(intact.replaceAll('\r\n', '')).not.toContain('\n');
   });
 
   it('a truncated close marker is repaired to a well-formed region', async () => {

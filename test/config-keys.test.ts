@@ -249,11 +249,7 @@ describe('config-keys', () => {
       expect(readFileSync(f, 'utf8')).toBe(original);
     });
 
-    // F5/10: the byte-identity guarantee is about a file that EXISTS. When the target
-    // file was absent, inject CREATES it and removal cannot un-create it — an empty `{}`
-    // is left where the user had no file. Pinned here so the limitation stays visible
-    // rather than being implied away by the "byte-identical" wording.
-    it('leaves an empty {} behind when the target file did not exist (documented gap)', async () => {
+    it('restores original absence when the target file did not exist', async () => {
       const p = paths();
       const f = file('created-by-us.json');
       expect(existsSync(f)).toBe(false);
@@ -270,11 +266,7 @@ describe('config-keys', () => {
       const removed = await inTx(p, (tx) => removeKey(p, tx, item));
       expect(removed.removed).toBe(true);
 
-      // The file still exists, holding an empty object — NOT the pre-inject state (no
-      // file at all). Harmless for every current adapter (their config files all exist
-      // already), but it is not "byte-identical", and the docstrings must not say so.
-      expect(existsSync(f)).toBe(true);
-      expect(JSON.parse(readFileSync(f, 'utf8'))).toEqual({});
+      expect(existsSync(f)).toBe(false);
     });
 
     it('does NOT prune a parent the user already owned as an empty {}', async () => {
@@ -584,6 +576,7 @@ transport = "stdio"
         }),
       );
       expect(item).toMatchObject({ mode: 'array-element', keyPath: ['instructions'], value: storePath });
+      if (!item) throw new Error('expected an owned array item');
       expect(JSON.parse(readFileSync(f, 'utf8')).instructions).toContain(storePath);
 
       // The harness reorders the array (our value moves to the front).
@@ -611,6 +604,7 @@ transport = "stdio"
         ownerEnv: 'writing',
       };
       const item = await inTx(p, (tx) => injectArrayElement(p, tx, req));
+      if (!item) throw new Error('expected an owned array item');
       // Re-injecting the same value does not duplicate it.
       await inTx(p, (tx) => injectArrayElement(p, tx, req));
       const arr = JSON.parse(readFileSync(f, 'utf8')).instructions;
@@ -623,6 +617,74 @@ transport = "stdio"
       const second = await inTx(p, (tx) => removeKey(p, tx, item));
       expect(second).toMatchObject({ removed: false, reason: 'absent' });
       expect(second.note).toMatch(/absent/);
+    });
+
+    it('does not claim or later remove a user-owned identical array element', async () => {
+      const p = paths();
+      const f = file('opencode-user-identical.json');
+      const original =
+        '{\n  "instructions": [' + JSON.stringify(storePath) + '],\n  "theme": "user"\n}\n';
+      writeFileSync(f, original);
+
+      const item = await inTx(p, (tx) =>
+        injectArrayElement(p, tx, {
+          file: f,
+          format: 'json',
+          arrayPath: ['instructions'],
+          value: storePath,
+          ownerEnv: 'writing',
+        }),
+      );
+
+      expect(item).toBeNull();
+      expect(readFileSync(f, 'utf8')).toBe(original);
+      expect(findOwners(await readState(p), f)).toEqual([]);
+    });
+
+    it('removes only its own occurrence when the user later adds an identical value', async () => {
+      const p = paths();
+      const f = file('opencode-later-identical.json');
+      writeFileSync(f, '{\n  "instructions": ["AGENTS.md"]\n}\n');
+
+      const item = await inTx(p, (tx) =>
+        injectArrayElement(p, tx, {
+          file: f,
+          format: 'json',
+          arrayPath: ['instructions'],
+          value: storePath,
+          ownerEnv: 'writing',
+        }),
+      );
+      if (!item) throw new Error('expected an owned array item');
+
+      const doc = JSON.parse(readFileSync(f, 'utf8'));
+      doc.instructions.push(storePath);
+      writeFileSync(f, JSON.stringify(doc, null, 2) + '\n');
+
+      expect((await inTx(p, (tx) => removeKey(p, tx, item))).removed).toBe(true);
+      expect(JSON.parse(readFileSync(f, 'utf8')).instructions).toEqual([
+        'AGENTS.md',
+        storePath,
+      ]);
+    });
+
+    it('removes a created array path and file when its last owned element is dropped', async () => {
+      const p = paths();
+      const f = file('created-array.json');
+      const item = await inTx(p, (tx) =>
+        injectArrayElement(p, tx, {
+          file: f,
+          format: 'json',
+          arrayPath: ['instructions'],
+          value: storePath,
+          ownerEnv: 'writing',
+        }),
+      );
+      expect(item).not.toBeNull();
+      if (!item) throw new Error('expected an owned array item');
+
+      expect((await inTx(p, (tx) => removeKey(p, tx, item))).removed).toBe(true);
+      expect(existsSync(f)).toBe(false);
     });
   });
 
