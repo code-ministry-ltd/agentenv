@@ -1,14 +1,17 @@
-import { dirname, join } from 'node:path';
-import { mkdir, rename, rm } from 'node:fs/promises';
+import { join } from 'node:path';
 import {
+  beginProjectionReconciliation,
+  completeProjectionReconciliation,
   createGlobalProjection,
+  failProjectionReconciliation,
   observeProjection,
   publishProjection,
   retireProjection,
   type GlobalProjection,
 } from './global-projection.js';
+import { mirrorCowToCanonical } from './cow-files.js';
 import { withLock } from './lock.js';
-import { capturePathIdentity } from './path-identity.js';
+import { capturePathIdentity, identitiesEqual } from './path-identity.js';
 import type { Paths } from './paths.js';
 import { readState, writeState } from './state.js';
 
@@ -17,6 +20,7 @@ export interface BeginGlobalCowRequest {
   surfacePath: string;
   canonicalPath: string;
   ownerEnv: string;
+  transform?: 'identity' | 'command-skill';
   createdAt: number;
 }
 
@@ -57,6 +61,7 @@ export async function beginGlobalCowProjection(
       canonicalPath: req.canonicalPath,
       canonicalBaseline,
       ownerEnv: req.ownerEnv,
+      transform: req.transform ?? 'identity',
       createdAt: req.createdAt,
     });
     manifest.globalProjections.push(projection);
@@ -87,19 +92,6 @@ export async function abandonBuildingGlobalCow(paths: Paths, id: string): Promis
   });
 }
 
-/**
- * Move the live copy—not copy its bytes—so already-open descriptors continue to
- * address the retained inode after the real surface is restored.
- */
-export async function retainGlobalCowBytes(projection: GlobalProjection): Promise<void> {
-  if (!projection.surfacePath || !projection.retainedPath) {
-    throw new Error(`projection '${projection.id}' lacks retained paths`);
-  }
-  await mkdir(dirname(projection.retainedPath), { recursive: true });
-  await rm(projection.retainedPath, { recursive: true, force: true });
-  await rename(projection.surfacePath, projection.retainedPath);
-}
-
 export async function markGlobalCowRetired(
   paths: Paths,
   id: string,
@@ -115,4 +107,71 @@ export async function markGlobalCowRetired(
     ...observeProjection(retireProjection(projection), observed),
     retiredAt: now,
   }));
+}
+
+export interface ReconcileGlobalCowRequest {
+  ids: readonly string[];
+  /** Callers assert every unsupervised writer for these ids is closed. */
+  quiescent: boolean;
+}
+
+export interface ReconcileGlobalCowResult {
+  reconciled: number;
+  quarantined: number;
+}
+
+/** Explicit, three-way reverse projection for retained global writer copies. */
+export async function reconcileRetiredGlobalCows(
+  paths: Paths,
+  req: ReconcileGlobalCowRequest,
+): Promise<ReconcileGlobalCowResult> {
+  if (!req.quiescent) {
+    throw new Error('global COW reconciliation requires an explicit quiescent assertion');
+  }
+  const result: ReconcileGlobalCowResult = { reconciled: 0, quarantined: 0 };
+  for (const id of req.ids) {
+    const manifest = await readState(paths);
+    const current = manifest.globalProjections.find((projection) => projection.id === id);
+    if (!current || current.phase !== 'retired') continue;
+    if (!current.retainedPath || !current.canonicalPath || !current.canonicalBaseline) {
+      await updateProjection(paths, id, (projection) => ({
+        ...projection,
+        phase: 'quarantined',
+        failure: 'projection provenance is incomplete',
+      }));
+      result.quarantined += 1;
+      continue;
+    }
+
+    const observed = await capturePathIdentity(current.retainedPath);
+    const canonicalNow = await capturePathIdentity(current.canonicalPath);
+    await updateProjection(paths, id, (projection) =>
+      beginProjectionReconciliation(observeProjection(projection, observed)),
+    );
+    try {
+      if (
+        !identitiesEqual(observed, current.baseline) &&
+        !identitiesEqual(canonicalNow, current.canonicalBaseline)
+      ) {
+        throw new Error('canonical changed concurrently with retained projection');
+      }
+      if (!identitiesEqual(observed, current.baseline)) {
+        const source = current.transform === 'command-skill'
+          ? join(current.retainedPath, 'SKILL.md')
+          : current.retainedPath;
+        await mirrorCowToCanonical(source, current.canonicalPath);
+      }
+      const revision = JSON.stringify(await capturePathIdentity(current.canonicalPath));
+      await updateProjection(paths, id, (projection) =>
+        completeProjectionReconciliation(projection, revision),
+      );
+      result.reconciled += 1;
+    } catch (err) {
+      await updateProjection(paths, id, (projection) =>
+        failProjectionReconciliation(projection, (err as Error).message),
+      );
+      result.quarantined += 1;
+    }
+  }
+  return result;
 }

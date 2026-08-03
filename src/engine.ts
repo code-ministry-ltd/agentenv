@@ -486,6 +486,8 @@ async function materialiseDirMerge(
       const result = await materialiseGlobalCowItem(paths, {
         ownerEnv: env,
         sourcePath,
+        canonicalPath: canonicalSource,
+        transform: surface.layout === 'command-skill' ? 'command-skill' : 'identity',
         targetDir,
         itemName: name,
         onWarn,
@@ -508,6 +510,8 @@ async function materialiseDirMerge(
 interface GlobalCowItemRequest {
   ownerEnv: string;
   sourcePath: string;
+  canonicalPath?: string;
+  transform?: 'identity' | 'command-skill';
   targetDir: string;
   itemName: string;
   onWarn: (message: string) => void;
@@ -523,8 +527,9 @@ async function materialiseGlobalCowItem(
   await beginGlobalCowProjection(paths, {
     id,
     surfacePath,
-    canonicalPath: req.sourcePath,
+    canonicalPath: req.canonicalPath ?? req.sourcePath,
     ownerEnv: req.ownerEnv,
+    transform: req.transform,
     createdAt: Date.now(),
   });
   try {

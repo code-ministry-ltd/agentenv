@@ -12,7 +12,7 @@ import {
 } from 'node:fs/promises';
 import { basename, join, sep } from 'node:path';
 import { backup, restore, type BackupRef } from './backups.js';
-import { retainGlobalCowBytes } from './global-cow.js';
+import { retainGlobalCowBytes } from './cow-files.js';
 import { observeProjection, retireProjection, type GlobalProjection } from './global-projection.js';
 import { beginTransaction } from './journal.js';
 import { withLock } from './lock.js';

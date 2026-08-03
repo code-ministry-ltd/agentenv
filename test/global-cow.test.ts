@@ -11,6 +11,7 @@ import {
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { dematerialiseGlobal, materialiseGlobal } from '../src/engine.js';
+import { reconcileRetiredGlobalCows } from '../src/global-cow.js';
 import { resolvePaths } from '../src/paths.js';
 import { readState } from '../src/state.js';
 import { FIXTURE_CONFIG_ENV, makeFixtureAdapter } from './fixtures/fixture-adapter.js';
@@ -63,5 +64,29 @@ describe('retained global COW integration', () => {
       '# LATE WRITE\n',
     );
     expect(readFileSync(canonical, 'utf8')).toBe('# ORIGINAL\n');
+
+    const reconciled = await reconcileRetiredGlobalCows(paths, {
+      ids: [projection!.id],
+      quiescent: true,
+    });
+    expect(reconciled).toEqual({ reconciled: 1, quarantined: 0 });
+    expect(readFileSync(canonical, 'utf8')).toBe('# LATE WRITE\n');
+    expect(
+      (await readState(paths)).globalProjections.find(
+        (candidate) => candidate.id === projection!.id,
+      )?.phase,
+    ).toBe('reconciled');
+    expect(readFileSync(join(projection!.retainedPath!, 'SKILL.md'), 'utf8')).toBe(
+      '# LATE WRITE\n',
+    );
+  });
+
+  it('requires an explicit quiescent assertion before reverse projection', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    await expect(
+      reconcileRetiredGlobalCows(paths, { ids: [], quiescent: false }),
+    ).rejects.toThrow(/quiescent/i);
   });
 });
