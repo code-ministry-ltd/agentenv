@@ -13,6 +13,7 @@ import {
 import type { SkillSourceRecord } from '../env-config.js';
 import { parseEnvConfig, upsertEnvSource } from '../env-config.js';
 import { publishStagedBundle } from '../filesystem-bundle.js';
+import { rebaseInProgress } from '../git.js';
 import { confirmDefault, selectSkillsDefault } from '../prompt.js';
 import {
   diffDirs,
@@ -23,7 +24,7 @@ import {
   type ParsedSkillSource,
 } from '../skill-source.js';
 import { environmentExists, readEnvConfig, validateEnvName } from '../store.js';
-import { commitMutation, withNotices, withStoreSync } from './store-sync.js';
+import { commitRequiredMutation, withNotices, withStoreSync } from './store-sync.js';
 
 /** Content kinds `add` understands, in help/usage order. */
 const KINDS = ['skill', 'mcp', 'instructions', 'agent', 'command'] as const;
@@ -85,7 +86,53 @@ async function resolveEnv(
   if (!(await environmentExists(paths, envArg))) {
     return { error: fail(`add ${kind}: environment '${envArg}' does not exist\n`) };
   }
+  try {
+    await readEnvConfig(paths, envArg);
+  } catch (err) {
+    // A deliberately held conflict leaves env.yaml markers on disk. The settled
+    // contract permits local content edits in that window but forbids Git/index
+    // bookkeeping; sync --resolve owns the eventual commit.
+    if (await rebaseInProgress(paths)) return { env: envArg };
+    return {
+      error: fail(`add ${kind}: environment '${envArg}' has an invalid env.yaml (${(err as Error).message})\n`),
+    };
+  }
   return { env: envArg };
+}
+
+async function publishContentMutation(
+  ctx: CommandContext,
+  target: string,
+  populate: (staged: string) => Promise<void>,
+  message: string,
+  notices: string[],
+): Promise<void> {
+  const transactionId = randomUUID();
+  const stagingRoot = join(ctx.paths.live, 'commands', transactionId);
+  const staged = join(stagingRoot, 'content');
+  await mkdir(stagingRoot, { recursive: true });
+  try {
+    await populate(staged);
+    const paused = await rebaseInProgress(ctx.paths);
+    await publishStagedBundle({
+      paths: ctx.paths,
+      transactionId,
+      stagingRoot,
+      entries: [{ id: 'content', target, staged }],
+      ...(!paused
+        ? {
+            gitBookkeeping: () =>
+              commitRequiredMutation(
+                { paths: ctx.paths, env: ctx.env, options: ctx.options },
+                message,
+                notices,
+              ),
+          }
+        : {}),
+    });
+  } finally {
+    await rm(stagingRoot, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -97,7 +144,11 @@ async function resolveEnv(
  * doesn't exist locally: git/`owner/repo` sources are Task 1.10, so it errors.
  * A bare token with no `/` is a NAME to scaffold.
  */
-async function addSkill(rest: readonly string[], ctx: CommandContext): Promise<RunResult> {
+async function addSkill(
+  rest: readonly string[],
+  ctx: CommandContext,
+  notices: string[],
+): Promise<RunResult> {
   const parsed = parseArgs(rest, { booleans: ['force', 'print-path'] });
   if (parsed.unknown.length > 0) {
     return fail(`add skill: unknown option '${parsed.unknown[0]}'\n`);
@@ -138,9 +189,13 @@ async function addSkill(rest: readonly string[], ctx: CommandContext): Promise<R
         `add skill: skill '${result.name}' already exists in '${env}' (${dir}); pass --force to overwrite\n`,
       );
     }
-    if (exists) await rm(dir, { recursive: true, force: true });
-    await mkdir(skillsDir, { recursive: true });
-    await cp(candidate, dir, { recursive: true });
+    await publishContentMutation(
+      ctx,
+      dir,
+      (staged) => cp(candidate, staged, { recursive: true, verbatimSymlinks: true }),
+      `agentenv: add skill ${result.name} → ${env}`,
+      notices,
+    );
     return ok(`Copied skill '${result.name}' into environment '${env}' (from ${candidate}).\n`);
   }
 
@@ -152,7 +207,7 @@ async function addSkill(rest: readonly string[], ctx: CommandContext): Promise<R
           '(the skill name is only known after fetching)\n',
       );
     }
-    return addSkillFromGit(env, target, force, ctx);
+    return addSkillFromGit(env, target, force, ctx, notices);
   }
 
   // NAME: scaffold a fresh SKILL.md whose frontmatter name matches the folder.
@@ -167,9 +222,16 @@ async function addSkill(rest: readonly string[], ctx: CommandContext): Promise<R
       `add skill: skill '${target}' already exists in '${env}' (${dir}); pass --force to overwrite\n`,
     );
   }
-  if (exists) await rm(dir, { recursive: true, force: true });
-  await mkdir(dir, { recursive: true });
-  await writeFile(file, scaffoldSkillMd(target), 'utf8');
+  await publishContentMutation(
+    ctx,
+    dir,
+    async (staged) => {
+      await mkdir(staged, { recursive: true });
+      await writeFile(join(staged, 'SKILL.md'), scaffoldSkillMd(target), 'utf8');
+    },
+    `agentenv: add skill ${target} → ${env}`,
+    notices,
+  );
   return ok(`Added skill '${target}' to environment '${env}'.\n`);
 }
 
@@ -184,12 +246,16 @@ async function copySkillDir(
   env: string,
   name: string,
   sourceDir: string,
+  notices: string[],
 ): Promise<void> {
-  const skillsDir = join(ctx.paths.envDir(env), 'skills');
-  const destDir = join(skillsDir, name);
-  await mkdir(skillsDir, { recursive: true });
-  await rm(destDir, { recursive: true, force: true });
-  await cp(sourceDir, destDir, { recursive: true, verbatimSymlinks: true });
+  const destDir = join(ctx.paths.envDir(env), 'skills', name);
+  await publishContentMutation(
+    ctx,
+    destDir,
+    (staged) => cp(sourceDir, staged, { recursive: true, verbatimSymlinks: true }),
+    `agentenv: add skill ${name} → ${env}`,
+    notices,
+  );
 }
 
 /**
@@ -203,6 +269,7 @@ async function writeVendoredSkill(
   name: string,
   sourceDir: string,
   provenance: SkillSourceRecord,
+  notices: string[],
 ): Promise<void> {
   const yamlPath = ctx.paths.envYaml(env);
   const yamlText = await readFile(yamlPath, 'utf8');
@@ -214,22 +281,37 @@ async function writeVendoredSkill(
   const stagedSkill = join(stagingRoot, 'skill');
   const stagedYaml = join(stagingRoot, 'env.yaml');
   await mkdir(stagingRoot, { recursive: true });
-  await cp(sourceDir, stagedSkill, { recursive: true, verbatimSymlinks: true });
-  await writeFile(stagedYaml, yamlAfter, 'utf8');
+  try {
+    await cp(sourceDir, stagedSkill, { recursive: true, verbatimSymlinks: true });
+    await writeFile(stagedYaml, yamlAfter, 'utf8');
 
-  await publishStagedBundle({
-    paths: ctx.paths,
-    transactionId,
-    stagingRoot,
-    entries: [
-      {
-        id: 'skill-content',
-        target: join(ctx.paths.envDir(env), 'skills', name),
-        staged: stagedSkill,
-      },
-      { id: 'skill-provenance', target: yamlPath, staged: stagedYaml },
-    ],
-  });
+    const paused = await rebaseInProgress(ctx.paths);
+    await publishStagedBundle({
+      paths: ctx.paths,
+      transactionId,
+      stagingRoot,
+      entries: [
+        {
+          id: 'skill-content',
+          target: join(ctx.paths.envDir(env), 'skills', name),
+          staged: stagedSkill,
+        },
+        { id: 'skill-provenance', target: yamlPath, staged: stagedYaml },
+      ],
+      ...(!paused
+        ? {
+            gitBookkeeping: () =>
+              commitRequiredMutation(
+                { paths: ctx.paths, env: ctx.env, options: ctx.options },
+                `agentenv: add skill ${name} → ${env}`,
+                notices,
+              ),
+          }
+        : {}),
+    });
+  } finally {
+    await rm(stagingRoot, { recursive: true, force: true });
+  }
 }
 
 /** The recorded provenance for `name` in `env`, or undefined when there is none. */
@@ -258,6 +340,7 @@ async function addSkillFromGit(
   target: string,
   force: boolean,
   ctx: CommandContext,
+  notices: string[],
 ): Promise<RunResult> {
   const source = await resolveSkillSource(target);
   if ('error' in source) return fail(`add skill: ${source.error}\n`);
@@ -316,7 +399,7 @@ async function addSkillFromGit(
           return ok(`${diff}\n\nLeft skill '${name}' unchanged.\n`);
         }
       }
-      await writeVendoredSkill(ctx, env, name, fetched.scanDir, provenance);
+      await writeVendoredSkill(ctx, env, name, fetched.scanDir, provenance, notices);
       return ok(
         `${diff}\n\nUpdated skill '${name}' in '${env}' ` +
           `(${shortSha(prior.commit)} → ${shortSha(fetched.commit)}).\n`,
@@ -331,7 +414,7 @@ async function addSkillFromGit(
       );
     }
 
-    await writeVendoredSkill(ctx, env, name, fetched.scanDir, provenance);
+    await writeVendoredSkill(ctx, env, name, fetched.scanDir, provenance, notices);
     return ok(
       `Vendored skill '${name}' into '${env}' from ${source.repo} (${shortSha(fetched.commit)}).\n`,
     );
@@ -445,18 +528,11 @@ async function addSkills(
           ref: git.ref,
           commit: git.commit,
           hash,
-        });
+        }, notices);
       } else {
-        await copySkillDir(ctx, env, name, c.dir);
+        await copySkillDir(ctx, env, name, c.dir, notices);
       }
       installed.push(name);
-      // Commit-per-mutation (D9): each installed skill is its own store commit, so a
-      // batch install of N skills yields N commits + the single end-of-invocation push.
-      await commitMutation(
-        { paths: ctx.paths, env: ctx.env, options: ctx.options },
-        `agentenv: add skill ${name} → ${env}`,
-        notices,
-      );
     }
 
     const lines: string[] = [];
@@ -500,7 +576,11 @@ function scaffoldMcpServer(name: string, transport: 'stdio' | 'http'): Record<st
  * Existing servers are preserved; an existing entry of the same name is refused
  * unless `--force`.
  */
-async function addMcp(rest: readonly string[], ctx: CommandContext): Promise<RunResult> {
+async function addMcp(
+  rest: readonly string[],
+  ctx: CommandContext,
+  notices: string[],
+): Promise<RunResult> {
   const parsed = parseArgs(rest, { booleans: ['force', 'print-path'], values: ['transport'] });
   if (parsed.unknown.length > 0) {
     return fail(`add mcp: unknown option '${parsed.unknown[0]}'\n`);
@@ -544,8 +624,13 @@ async function addMcp(rest: readonly string[], ctx: CommandContext): Promise<Run
   }
 
   servers[name] = scaffoldMcpServer(name, transport);
-  await mkdir(join(ctx.paths.envDir(env), 'mcp'), { recursive: true });
-  await writeFile(file, stringifyYaml(servers), 'utf8');
+  await publishContentMutation(
+    ctx,
+    file,
+    (staged) => writeFile(staged, stringifyYaml(servers), 'utf8'),
+    `agentenv: add mcp ${name} → ${env}`,
+    notices,
+  );
   return ok(`Added MCP server '${name}' (${transport}) to environment '${env}'.\n`);
 }
 
@@ -556,7 +641,11 @@ async function addMcp(rest: readonly string[], ctx: CommandContext): Promise<Run
  * `--print-path` prints the target path without writing (the testable "open");
  * an existing file is refused unless `--force`.
  */
-async function addInstructions(rest: readonly string[], ctx: CommandContext): Promise<RunResult> {
+async function addInstructions(
+  rest: readonly string[],
+  ctx: CommandContext,
+  notices: string[],
+): Promise<RunResult> {
   const parsed = parseArgs(rest, { booleans: ['force', 'print-path'], values: ['harness'] });
   if (parsed.unknown.length > 0) {
     return fail(`add instructions: unknown option '${parsed.unknown[0]}'\n`);
@@ -594,8 +683,13 @@ async function addInstructions(rest: readonly string[], ctx: CommandContext): Pr
     '\n' +
     `TODO: write instructions ${label === 'base' ? 'that' : 'the'} ${scope} ` +
     `${label === 'base' ? 'should load' : 'should additionally load'} for this environment.\n`;
-  await mkdir(join(ctx.paths.envDir(env), 'instructions'), { recursive: true });
-  await writeFile(file, body, 'utf8');
+  await publishContentMutation(
+    ctx,
+    file,
+    (staged) => writeFile(staged, body, 'utf8'),
+    `agentenv: add instructions → ${env}`,
+    notices,
+  );
   return ok(`Added ${label} instructions to environment '${env}'.\n`);
 }
 
@@ -632,6 +726,7 @@ async function addMarkdownItem(
   scaffold: (name: string) => string,
   rest: readonly string[],
   ctx: CommandContext,
+  notices: string[],
 ): Promise<RunResult> {
   const parsed = parseArgs(rest, { booleans: ['force', 'print-path'] });
   if (parsed.unknown.length > 0) {
@@ -658,8 +753,13 @@ async function addMarkdownItem(
       `add ${kind}: ${kind} '${name}' already exists in '${env}' (${file}); pass --force to overwrite\n`,
     );
   }
-  await mkdir(join(ctx.paths.envDir(env), subdir), { recursive: true });
-  await writeFile(file, scaffold(name), 'utf8');
+  await publishContentMutation(
+    ctx,
+    file,
+    (staged) => writeFile(staged, scaffold(name), 'utf8'),
+    `agentenv: add ${kind} ${name} → ${env}`,
+    notices,
+  );
   return ok(`Added ${kind} '${name}' to environment '${env}'.\n`);
 }
 
@@ -684,11 +784,16 @@ export const addCommand: Command = {
     // once by the wrapper with a message derived from the positional args.
     const notices: string[] = [];
     let result: RunResult = fail(`add: unknown kind '${kind}'\n${kindsHelp()}`);
-    await withStoreSync({ paths: ctx.paths, env: ctx.env, options: ctx.options }, notices, async () => {
-      result = await dispatchAdd(kind, rest, ctx, notices);
-      if (kind === 'skills' || result.code !== 0) return null; // skills self-commits; errors: no commit
-      return commitMessageFor(kind, rest);
-    });
+    try {
+      await withStoreSync({ paths: ctx.paths, env: ctx.env, options: ctx.options }, notices, async () => {
+        result = await dispatchAdd(kind, rest, ctx, notices);
+        return null;
+      });
+    } catch (err) {
+      result = fail(
+        `add: ${(err as Error).message}; committed filesystem intent was retained for recovery\n`,
+      );
+    }
     return withNotices(result, notices);
   },
 };
@@ -702,31 +807,18 @@ function dispatchAdd(
 ): Promise<RunResult> {
   switch (kind) {
     case 'skill':
-      return addSkill(rest, ctx);
+      return addSkill(rest, ctx, notices);
     case 'skills':
       return addSkills(rest, ctx, notices);
     case 'mcp':
-      return addMcp(rest, ctx);
+      return addMcp(rest, ctx, notices);
     case 'instructions':
-      return addInstructions(rest, ctx);
+      return addInstructions(rest, ctx, notices);
     case 'agent':
-      return addMarkdownItem('agent', 'agents', scaffoldAgentMd, rest, ctx);
+      return addMarkdownItem('agent', 'agents', scaffoldAgentMd, rest, ctx, notices);
     case 'command':
-      return addMarkdownItem('command', 'commands', scaffoldCommandMd, rest, ctx);
+      return addMarkdownItem('command', 'commands', scaffoldCommandMd, rest, ctx, notices);
     default:
       return Promise.resolve(fail(`add: unknown kind '${kind}'\n${kindsHelp()}`));
   }
-}
-
-/**
- * The per-mutation commit message for a single-item `add` (design D9), derived from
- * the positional args (`<env> <name>`). `--print-path` runs leave the tree clean, so
- * the wrapper commit is a no-op there regardless of the message computed here.
- */
-function commitMessageFor(kind: string, rest: readonly string[]): string {
-  const positionals = rest.filter((a) => !a.startsWith('-'));
-  const env = positionals[0] ?? '?';
-  const name = positionals[1];
-  if (kind === 'instructions') return `agentenv: add instructions → ${env}`;
-  return `agentenv: add ${kind} ${name ?? ''}`.trimEnd() + ` → ${env}`;
 }

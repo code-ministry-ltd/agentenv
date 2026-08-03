@@ -3,6 +3,9 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { run } from '../src/cli.js';
 import { SKILL_NAME_RULE, validateSkillDir } from '../src/content-items.js';
+import { defaultGitRunner, type GitRunner } from '../src/git.js';
+import { resolvePaths } from '../src/paths.js';
+import { readState } from '../src/state.js';
 import { expectRealHomeUntouched, makeTempHome, guardRealHome, type TempHome } from './helpers.js';
 
 describe('add skill', () => {
@@ -62,6 +65,44 @@ describe('add skill', () => {
     const result = await run(['add', 'skill', 'ghost', 'sharpen-prose'], { env: tmp.env });
     expect(result.code).not.toBe(0);
     expect(result.stderr).toContain('ghost');
+  });
+
+  it('refuses to mutate an environment whose env.yaml is malformed', async () => {
+    writeFileSync(
+      join(tmp.home, 'store', 'environments', 'writing', 'env.yaml'),
+      'version: [broken\n',
+    );
+
+    const result = await run(['add', 'skill', 'writing', 'sharpen-prose'], { env: tmp.env });
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toMatch(/env\.yaml|malformed|parse/i);
+    expect(existsSync(skillDir('writing', 'sharpen-prose'))).toBe(false);
+  });
+
+  it('retains required Git bookkeeping in the command WAL when the add commit fails', async () => {
+    await run(['init'], { env: tmp.env });
+    const failingCommit: GitRunner = (args, options) =>
+      args.includes('commit')
+        ? Promise.resolve({
+            code: 1,
+            stdout: '',
+            stderr: 'fatal: injected add commit failure',
+            timedOut: false,
+          })
+        : defaultGitRunner(args, options);
+
+    const result = await run(['add', 'skill', 'writing', 'durable-add'], {
+      env: tmp.env,
+      gitRun: failingCommit,
+    });
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toMatch(/commit failure|Git bookkeeping|retained/i);
+    expect(existsSync(join(skillDir('writing', 'durable-add'), 'SKILL.md'))).toBe(true);
+    expect((await readState(resolvePaths(tmp.env))).commands).toMatchObject([
+      { phase: 'git-pending', commitPoint: true, gitRequired: true },
+    ]);
   });
 
   it('copies and validates a local skill directory', async () => {
