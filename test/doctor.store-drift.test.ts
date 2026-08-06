@@ -78,7 +78,7 @@ describe('doctor: store-vs-manifest drift', () => {
     } catch {
       stillLinked = false;
     }
-    expect(stillLinked).toBe(false);
+    expect(stillLinked, repair.stdout).toBe(false);
     expect((await readState(paths)).items).toHaveLength(0);
 
     const rerun = await run(['doctor'], { env: th.env });

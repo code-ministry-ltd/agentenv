@@ -143,7 +143,9 @@ async function rollBackPlan(
       const record = await effect.rescue(decision.observed);
       await withLock(paths, async () => {
         const manifest = await readState(paths);
-        manifest.quarantine.push(record);
+        if (!manifest.quarantine.some((candidate) => candidate.id === record.id)) {
+          manifest.quarantine.push(record);
+        }
         await writeState(paths, manifest);
       });
     }

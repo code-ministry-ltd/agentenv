@@ -86,7 +86,7 @@ describe('doctor: orphaned backups', () => {
     const { orphan, referenced } = await seed(th);
 
     const repair = await run(['doctor', '--repair'], { env: th.env });
-    expect(repair.code).toBe(0);
+    expect(repair.code, `${repair.stdout}${repair.stderr ?? ''}`).toBe(0);
     expect(existsSync(orphan)).toBe(false);
     expect(existsSync(referenced)).toBe(true);
 

@@ -1,6 +1,7 @@
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
-import { diagnose, repair, restoreBackup, type DoctorProblem } from '../doctor.js';
+import { diagnose, type DoctorProblem } from '../doctor.js';
+import { publishDoctorRepair, publishDoctorRestore } from '../doctor-publication.js';
 
 /**
  * `agentenv doctor [--repair] [--restore <backup>]` (design D4, spec criterion 6).
@@ -70,7 +71,7 @@ async function runDiagnose(ctx: CommandContext): Promise<RunResult> {
 
 /** `doctor --repair`: fix what can be fixed, then re-scan; exit 0 once clean. */
 async function runRepair(ctx: CommandContext): Promise<RunResult> {
-  const result = await repair(ctx.paths);
+  const result = await publishDoctorRepair(ctx.paths);
   const lines: string[] = [];
   if (result.actions.length === 0) {
     lines.push('doctor --repair: nothing to repair.');
@@ -92,7 +93,7 @@ async function runRestore(ctx: CommandContext, backupId: string): Promise<RunRes
   if (backupId.trim() === '') {
     return fail('doctor: --restore requires a backup id\n');
   }
-  const res = await restoreBackup(ctx.paths, backupId);
+  const res = await publishDoctorRestore(ctx.paths, backupId);
   if (!res.restored) {
     return { stdout: '', stderr: `doctor --restore: ${res.error}\n`, code: 1 };
   }

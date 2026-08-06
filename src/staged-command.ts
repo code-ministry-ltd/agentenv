@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { cp, lstat, mkdir, readlink, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
@@ -123,8 +124,32 @@ function parseUndo(operation: PlannedOperation): StagedUndo {
   return undo;
 }
 
+async function collectUnreferencedUndoBackups(paths: Paths, plan: CommandPlan): Promise<void> {
+  const manifestText = JSON.stringify(await readState(paths));
+  const names = new Set<string>();
+  for (const operation of plan.operations) {
+    const undo = parseUndo(operation);
+    if (undo.type !== 'replace-path') continue;
+    if (undo.backup.kind === 'content') names.add(undo.backup.hash);
+    if (undo.backup.kind === 'directory') names.add(undo.backup.id);
+  }
+  for (const name of names) {
+    if (!manifestText.includes(JSON.stringify(name))) {
+      await rm(join(paths.backups, name), { recursive: true, force: true });
+    }
+  }
+}
+
 function stateDomains(manifest: StateManifest, keys: readonly string[]): StatePatch {
   return Object.fromEntries(keys.map((key) => [key, clone(manifest[key])]));
+}
+
+function statePatchIdentity(patch: StatePatch): PathIdentity {
+  return {
+    kind: 'file',
+    digest: `state-domain:${createHash('sha256').update(JSON.stringify(patch)).digest('hex')}`,
+    mode: 0,
+  };
 }
 
 async function patchState(paths: Paths, patch: StatePatch): Promise<void> {
@@ -174,18 +199,71 @@ async function retainThirdIdentity(
 function recoveryEffect(paths: Paths, plan: CommandPlan, operation: PlannedOperation): CommandEffect {
   if (!operation.path) throw new Error(`staged operation '${operation.id}' lacks a target path`);
   const undo = parseUndo(operation);
+  let pendingStateRescue: QuarantineRecord | undefined;
   return {
-    observeIdentity: () => capturePathIdentity(operation.path!),
+    observeIdentity: async () => {
+      const observed = await capturePathIdentity(operation.path!);
+      if (undo.type !== 'state-patch' || observed.kind === 'absent') return observed;
+      if (!operation.postIdentity || !identitiesEqual(observed, operation.postIdentity)) return observed;
+      const keys = Object.keys(undo.after);
+      const current = stateDomains(await readState(paths), keys);
+      if (isDeepStrictEqual(current, undo.before) || isDeepStrictEqual(current, undo.after)) {
+        return observed;
+      }
+      return statePatchIdentity(current);
+    },
     apply: async () => {
       throw new Error('staged recovery effects cannot run forward');
     },
-    rescue: (observed) => retainThirdIdentity(paths, plan, operation, observed),
+    rescue: async (observed) => {
+      if (
+        undo.type === 'state-patch' &&
+        observed.kind === 'file' &&
+        observed.digest.startsWith('state-domain:')
+      ) {
+        const id = `command-${plan.transactionId}-${operation.id}-state`;
+        const retainedPath = join(paths.live, 'quarantine', id, 'state.json');
+        const current = stateDomains(await readState(paths), Object.keys(undo.after));
+        if ((await capturePathIdentity(retainedPath)).kind === 'absent') {
+          await mkdir(dirname(retainedPath), { recursive: true });
+          await writeFile(retainedPath, `${JSON.stringify(current, null, 2)}\n`, 'utf8');
+        }
+        pendingStateRescue = {
+          schemaVersion: 2,
+          id,
+          kind: 'whole-command-third-identity',
+          path: paths.state,
+          retainedPath,
+          reason: `staged state operation '${operation.id}' observed an unplanned domain identity during rollback`,
+          createdAt: Date.now(),
+          resolved: false,
+        };
+        return pendingStateRescue;
+      }
+      return retainThirdIdentity(paths, plan, operation, observed);
+    },
     undo: async () => {
       if (undo.type === 'replace-path') {
         await restore(paths, undo.backup, operation.path!);
         return;
       }
-      await patchState(paths, undo.before);
+      const keys = Object.keys(undo.after);
+      const current = stateDomains(await readState(paths), keys);
+      if (!isDeepStrictEqual(current, undo.before)) {
+        if (!isDeepStrictEqual(current, undo.after) && !pendingStateRescue) {
+          throw new Error(`staged state operation '${operation.id}' changed without a retained rescue`);
+        }
+        await patchState(paths, undo.before);
+      }
+      if (pendingStateRescue && keys.includes('quarantine')) {
+        await withLock(paths, async () => {
+          const manifest = await readState(paths);
+          if (!manifest.quarantine.some((record) => record.id === pendingStateRescue!.id)) {
+            manifest.quarantine.push(pendingStateRescue!);
+            await writeState(paths, manifest);
+          }
+        });
+      }
       await rm(undo.marker, { recursive: true, force: true });
     },
   };
@@ -226,6 +304,7 @@ export async function recoverPendingStagedCommands(
       ...(gitBookkeeping ? { gitBookkeeping } : {}),
     });
     if (!(await readState(paths)).commands.some((candidate) => candidate.transactionId === plan.transactionId)) {
+      await collectUnreferencedUndoBackups(paths, plan);
       await rm(join(paths.live, 'commands', plan.transactionId), { recursive: true, force: true });
     }
   }
@@ -365,6 +444,9 @@ export async function publishStagedCommand(req: PublishStagedCommandRequest): Pr
     const retained = (await readState(req.paths)).commands.some(
       (candidate) => candidate.transactionId === req.transactionId,
     );
-    if (!retained) await rm(req.stagingRoot, { recursive: true, force: true });
+    if (!retained) {
+      await collectUnreferencedUndoBackups(req.paths, plan);
+      await rm(req.stagingRoot, { recursive: true, force: true });
+    }
   }
 }

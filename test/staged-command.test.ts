@@ -226,4 +226,39 @@ describe('staged whole-command publication', () => {
     expect((await readState(paths)).inventory).toEqual(['external']);
     expect((await readState(paths)).commands).toEqual([]);
   });
+
+  it('retains a third state-domain identity before restoring pre-state', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const manifest = emptyManifest();
+    (manifest as { inventory?: string[] }).inventory = ['old'];
+    await writeState(paths, manifest);
+    const stagingRoot = join(paths.live, 'commands', 'state-third');
+    mkdirSync(stagingRoot, { recursive: true });
+
+    await expect(publishStagedCommand({
+      paths,
+      transactionId: 'state-third',
+      kind: 'test-maintenance',
+      stagingRoot,
+      allowedRoots: [paths.store],
+      entries: [],
+      statePatch: { inventory: ['planned'] },
+      afterApply: async (id) => {
+        if (id !== 'state') return;
+        const changed = await readState(paths);
+        (changed as { inventory?: string[] }).inventory = ['external'];
+        await writeState(paths, changed);
+        throw new Error('fail after external state replacement');
+      },
+    })).rejects.toThrow(/external state replacement/);
+
+    const after = await readState(paths);
+    expect(after.inventory).toEqual(['old']);
+    expect(after.commands).toEqual([]);
+    expect(after.quarantine).toHaveLength(1);
+    expect(JSON.parse(readFileSync(after.quarantine[0]!.retainedPath, 'utf8')))
+      .toEqual({ inventory: ['external'] });
+  });
 });
