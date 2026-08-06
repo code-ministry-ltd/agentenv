@@ -1,16 +1,19 @@
+import { randomUUID } from 'node:crypto';
 import {
-  adoptItem,
   findAdoptableItem,
   isForeignManagerSymlink,
   itemHasSecret,
+  planAdoptionRecord,
   singular,
   type AdoptSurface,
 } from '../adopt.js';
+import { publishAdoptions } from '../adoption-publication.js';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
 import { confirmDefault } from '../prompt.js';
+import { capturePathIdentity, identitiesEqual } from '../path-identity.js';
 import { environmentExists, validateEnvName } from '../store.js';
-import { closeStoreSync, commitMutation, openStoreSync, withNotices } from './store-sync.js';
+import { closeStoreSync, openStoreSync, withNotices } from './store-sync.js';
 
 /**
  * `agentenv adopt <name> --into <env>` — manually adopt a new unowned item into
@@ -74,6 +77,7 @@ async function adoptInto(ctx: CommandContext, name: string, into: string): Promi
     return { stdout: '', stderr: `adopt: '${name}' is ambiguous — found in more than one surface:\n${where}\n`, code: 1 };
   }
   const { surface, surfacePath } = matches[0]!;
+  const sourceIdentity = await capturePathIdentity(surfacePath);
 
   // Guardrail 1 (foreign manager): NEVER touch a symlink into a non-agentenv root.
   if (await isForeignManagerSymlink(surfacePath, paths.store)) {
@@ -91,6 +95,13 @@ async function adoptInto(ctx: CommandContext, name: string, into: string): Promi
       return { stdout: `Did not adopt '${name}' (declined — it matches a secret pattern).\n`, code: 0 };
     }
   }
+  if (!identitiesEqual(sourceIdentity, await capturePathIdentity(surfacePath))) {
+    return {
+      stdout: '',
+      stderr: `adopt: '${name}' changed while adoption was being confirmed\n`,
+      code: 1,
+    };
+  }
 
   const notices: string[] = [];
   const syncCtx = { paths, env, options };
@@ -102,12 +113,32 @@ async function adoptInto(ctx: CommandContext, name: string, into: string): Promi
     return withNotices({ stdout: `Did NOT adopt '${name}' — pulled store changes were quarantined.\n`, code: 0 }, notices);
   }
 
-  // Place into the CHOSEN env — same surface metadata (scope/realDir), overridden owner.
   const target: AdoptSurface = { ...surface, ownerEnv: into };
-  await adoptItem(paths, target, name);
+  const record = await planAdoptionRecord(paths, target, name, sourceIdentity);
+  if (record.destinationIdentity.kind !== 'absent') {
+    await closeStoreSync(syncCtx, notices);
+    return withNotices({
+      stdout: '',
+      stderr: `adopt: destination already exists for '${name}' in environment '${into}'\n`,
+      code: 1,
+    }, notices);
+  }
   const noun = singular(surface.storeKind);
-  await commitMutation(syncCtx, `agentenv: adopt ${noun} ${name} → ${into}`, notices);
-  await closeStoreSync(syncCtx, notices);
+  const transactionId = `adopt-${name}-${randomUUID()}`;
+  try {
+    const publication = await publishAdoptions({
+      paths,
+      syncCtx,
+      transactionId,
+      kind: 'manual-adopt',
+      records: [record],
+      notices,
+    });
+    if (publication === 'complete') await closeStoreSync(syncCtx, notices);
+  } catch (error) {
+    await closeStoreSync(syncCtx, notices);
+    return withNotices({ stdout: '', stderr: `adopt: ${(error as Error).message}\n`, code: 1 }, notices);
+  }
 
   return withNotices({ stdout: `Adopted ${noun} '${name}' → ${into}.\n`, code: 0 }, notices);
 }

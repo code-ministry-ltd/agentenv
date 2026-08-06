@@ -114,6 +114,7 @@ async function resolveWholeCommand(ctx: CommandContext, id: string, rest: readon
               { paths: ctx.paths, env: ctx.env, options: ctx.options },
               pending.gitSteps!,
               notices,
+              pending.transactionId,
             )
         : undefined;
       await recoverPendingStagedCommands(ctx.paths, gitBookkeeping, id);

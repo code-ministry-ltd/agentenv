@@ -278,6 +278,8 @@ function validateCommand(record: Record<string, unknown>, label: string): string
         requireString(step, 'id', `${label}.gitSteps`) ||
         requireString(step, 'message', `${label}.gitSteps`) ||
         !isNonEmptyStringArray(step.paths) ||
+        (step.status !== undefined && step.status !== 'pending' && step.status !== 'complete') ||
+        (step.commitId !== undefined && typeof step.commitId !== 'string') ||
         stepIds.has(step.id as string)
       ) {
         return `${label}.gitSteps contains an invalid step`;

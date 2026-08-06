@@ -9,7 +9,9 @@ import {
   describeFindings,
 } from '../git.js';
 import { collectLifecycleGarbage } from '../lifecycle-gc.js';
+import { withLock } from '../lock.js';
 import type { Paths } from '../paths.js';
+import { readState, writeState } from '../state.js';
 import { beginStoreSync, endStoreSync, type SyncBeforeResult } from '../sync.js';
 
 /**
@@ -81,8 +83,20 @@ export async function commitRequiredSteps(
   ctx: SyncCtx,
   steps: readonly PlannedGitStep[],
   notices: string[],
+  transactionId?: string,
 ): Promise<void> {
   for (const step of steps) {
+    if (transactionId) {
+      const complete = await withLock(ctx.paths, async () => {
+        const command = (await readState(ctx.paths)).commands.find(
+          (candidate) => candidate.transactionId === transactionId,
+        );
+        const durable = command?.gitSteps?.find((candidate) => candidate.id === step.id);
+        if (!durable) throw new Error(`required Git bookkeeping '${step.id}' is not in the durable plan`);
+        return durable.status === 'complete';
+      });
+      if (complete) continue;
+    }
     const result = await commitStorePaths(
       ctx.paths,
       ctx.env,
@@ -93,6 +107,19 @@ export async function commitRequiredSteps(
     noteBlockedCommit(result, notices);
     if (result.status === 'blocked' || result.status === 'rebase-in-progress') {
       throw new Error(`required Git bookkeeping '${step.id}' is '${result.status}'`);
+    }
+    if (transactionId) {
+      await withLock(ctx.paths, async () => {
+        const manifest = await readState(ctx.paths);
+        const command = manifest.commands.find(
+          (candidate) => candidate.transactionId === transactionId,
+        );
+        const durable = command?.gitSteps?.find((candidate) => candidate.id === step.id);
+        if (!durable) throw new Error(`required Git bookkeeping '${step.id}' disappeared from the durable plan`);
+        durable.status = 'complete';
+        if (result.commitId) durable.commitId = result.commitId;
+        await writeState(ctx.paths, manifest);
+      });
     }
   }
 }

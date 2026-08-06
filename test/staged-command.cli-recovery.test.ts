@@ -3,9 +3,11 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { run } from '../src/cli.js';
+import { defaultGitRunner, type GitRunner } from '../src/git.js';
 import { resolvePaths } from '../src/paths.js';
 import { publishStagedCommand } from '../src/staged-command.js';
 import { readState } from '../src/state.js';
+import { commitRequiredSteps } from '../src/commands/store-sync.js';
 import { makeTempHome, type TempHome } from './helpers.js';
 
 const homes: TempHome[] = [];
@@ -116,5 +118,67 @@ describe('staged command central CLI recovery', () => {
       env: home.env,
       encoding: 'utf8',
     })).toContain('?? unrelated.md');
+  });
+
+  it('persists each completed Git step and resumes at the first unfinished step', async () => {
+    const home = makeTempHome({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' });
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    await run(['init'], { env: home.env });
+    const first = join(paths.store, 'environments', 'work', 'skills', 'first', 'SKILL.md');
+    const second = join(paths.store, 'environments', 'work', 'skills', 'second', 'SKILL.md');
+    const stagingRoot = join(paths.live, 'commands', 'multi-git');
+    const firstStaged = join(stagingRoot, 'first');
+    const secondStaged = join(stagingRoot, 'second');
+    mkdirSync(dirname(firstStaged), { recursive: true });
+    writeFileSync(firstStaged, 'first\n');
+    writeFileSync(secondStaged, 'second\n');
+    const steps = [
+      { id: 'first', message: 'agentenv: adopt skill first → work', paths: [first] },
+      { id: 'second', message: 'agentenv: adopt skill second → work', paths: [second] },
+    ];
+    let commitCount = 0;
+    const failSecondCommit: GitRunner = (args, opts) => {
+      if (args.includes('commit') && ++commitCount === 2) {
+        return Promise.resolve({ code: 1, stdout: '', stderr: 'second commit failed', timedOut: false });
+      }
+      return defaultGitRunner(args, opts);
+    };
+
+    await expect(publishStagedCommand({
+      paths,
+      transactionId: 'multi-git',
+      kind: 'capture',
+      stagingRoot,
+      allowedRoots: [paths.store],
+      entries: [
+        { id: 'first-path', target: first, staged: firstStaged },
+        { id: 'second-path', target: second, staged: secondStaged },
+      ],
+      gitSteps: steps,
+      gitBookkeeping: () => commitRequiredSteps(
+        { paths, env: home.env, options: { gitRun: failSecondCommit } },
+        steps,
+        [],
+        'multi-git',
+      ),
+    })).rejects.toThrow(/second commit failed/);
+
+    expect((await readState(paths)).commands[0]?.gitSteps).toMatchObject([
+      { id: 'first', status: 'complete', commitId: expect.stringMatching(/^[0-9a-f]+$/) },
+      { id: 'second', status: 'pending' },
+    ]);
+
+    const recovered = await run(['shell-init'], { env: home.env });
+    expect(recovered.code).toBe(0);
+    expect((await readState(paths)).commands).toEqual([]);
+    expect(execFileSync('git', ['log', '-2', '--format=%s'], {
+      cwd: paths.store,
+      env: home.env,
+      encoding: 'utf8',
+    }).trim().split('\n')).toEqual([
+      'agentenv: adopt skill second → work',
+      'agentenv: adopt skill first → work',
+    ]);
   });
 });

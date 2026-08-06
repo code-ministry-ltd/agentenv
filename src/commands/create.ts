@@ -117,7 +117,7 @@ export const createCommand: Command = {
         allowedRoots: [paths.store],
         entries,
         gitSteps,
-        gitBookkeeping: () => commitRequiredSteps(syncCtx, gitSteps, notices),
+        gitBookkeeping: () => commitRequiredSteps(syncCtx, gitSteps, notices, transactionId),
       }, notices);
       if (publication === 'complete') await closeStoreSync(syncCtx, notices);
     } catch (error) {

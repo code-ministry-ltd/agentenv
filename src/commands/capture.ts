@@ -1,13 +1,14 @@
+import { randomUUID } from 'node:crypto';
 import {
   adoptSweep,
   singular,
-  type AdoptedRecord,
   type AdoptSweepResult,
 } from '../adopt.js';
+import { publishAdoptions } from '../adoption-publication.js';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
 import { confirmDefault } from '../prompt.js';
-import { closeStoreSync, commitMutation, openStoreSync, withNotices } from './store-sync.js';
+import { closeStoreSync, openStoreSync, withNotices } from './store-sync.js';
 
 /**
  * `agentenv capture [--dry-run]` — run the auto-adopt sweep now (design D10).
@@ -42,7 +43,7 @@ export const captureCommand: Command = {
   },
 };
 
-/** A real sweep: adopt + auto-commit each adoption inside the git-sync lifecycle. */
+/** A real sweep: classify everything first, then publish one local command. */
 async function runCapture(ctx: CommandContext): Promise<RunResult> {
   const { paths, env, options } = ctx;
   const notices: string[] = [];
@@ -61,20 +62,32 @@ async function runCapture(ctx: CommandContext): Promise<RunResult> {
   }
 
   const confirm = options.confirm ?? confirmDefault;
-  const result = await adoptSweep({
+  const planned = await adoptSweep({
     paths,
+    dryRun: true,
     confirm,
     note: (m) => notices.push(m),
-    onAdopt: async (rec: AdoptedRecord) => {
-      await commitMutation(
-        syncCtx,
-        `agentenv: adopt ${singular(rec.storeKind)} ${rec.name} → ${rec.ownerEnv}`,
-        notices,
-      );
-    },
   });
-
-  await closeStoreSync(syncCtx, notices); // one fail-soft push (D9).
+  const result: AdoptSweepResult = { ...planned, dryRun: false };
+  if (planned.adopted.length === 0) {
+    await closeStoreSync(syncCtx, notices);
+    return withNotices({ stdout: renderResult(result), code: 0 }, notices);
+  }
+  const transactionId = `capture-${randomUUID()}`;
+  try {
+    const publication = await publishAdoptions({
+      paths,
+      syncCtx,
+      transactionId,
+      kind: 'capture',
+      records: planned.adopted,
+      notices,
+    });
+    if (publication === 'complete') await closeStoreSync(syncCtx, notices);
+  } catch (error) {
+    await closeStoreSync(syncCtx, notices);
+    return withNotices({ stdout: '', stderr: `capture: ${(error as Error).message}\n`, code: 1 }, notices);
+  }
   return withNotices({ stdout: renderResult(result), code: 0 }, notices);
 }
 

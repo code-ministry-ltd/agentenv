@@ -121,7 +121,7 @@ export const editCommand: Command = {
         allowedRoots: [paths.store],
         entries: [{ id: 'env-yaml', target: file, staged: draft, expectedPreIdentity }],
         gitSteps,
-        gitBookkeeping: () => commitRequiredSteps(ctx, gitSteps, notices),
+        gitBookkeeping: () => commitRequiredSteps(ctx, gitSteps, notices, transactionId),
       }, notices);
       if (publication === 'complete') await closeStoreSync(ctx, notices);
     } catch (error) {

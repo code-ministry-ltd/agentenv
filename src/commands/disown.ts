@@ -1,17 +1,25 @@
+import { randomUUID } from 'node:crypto';
+import { cp, mkdir, rm } from 'node:fs/promises';
 import { basename, dirname } from 'node:path';
 import {
-  disownItem,
   findAdoptedByName,
-  markBaseline,
+  readInventory,
   singular,
   wouldClobberUnownedPath,
   type AdoptedDirMergeItem,
 } from '../adopt.js';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
+import { capturePathIdentity, identitiesEqual } from '../path-identity.js';
 import { confirmDefault } from '../prompt.js';
-import { readState } from '../state.js';
-import { closeStoreSync, commitMutation, openStoreSync, withNotices } from './store-sync.js';
+import { itemIdentity, readState } from '../state.js';
+import { publishWithPendingNotice } from './staged-publication.js';
+import {
+  closeStoreSync,
+  commitRequiredSteps,
+  openStoreSync,
+  withNotices,
+} from './store-sync.js';
 
 /**
  * `agentenv disown <name>` — reverse an adoption (design D10). Semantics depend
@@ -63,6 +71,8 @@ export const disownCommand: Command = {
 
 async function disown(ctx: CommandContext, item: AdoptedDirMergeItem, name: string): Promise<RunResult> {
   const { paths, env, options } = ctx;
+  const surfaceIdentity = await capturePathIdentity(item.path);
+  const storeIdentity = await capturePathIdentity(item.target);
 
   // Decide the destination the store content is restored to.
   let dest: string;
@@ -102,6 +112,10 @@ async function disown(ctx: CommandContext, item: AdoptedDirMergeItem, name: stri
     }
   }
 
+  const destinationIdentity = dest === item.path
+    ? surfaceIdentity
+    : await capturePathIdentity(dest);
+
   const notices: string[] = [];
   const syncCtx = { paths, env, options };
   // `skipAdopt`: disown is the REVERSE of adoption — the lifecycle sweep must not
@@ -112,12 +126,70 @@ async function disown(ctx: CommandContext, item: AdoptedDirMergeItem, name: stri
     return withNotices({ stdout: `Did NOT disown '${name}' — pulled store changes were quarantined.\n`, code: 0 }, notices);
   }
 
-  await disownItem(paths, item, dest);
-  await markBaseline(paths, dirname(dest), name); // don't let the next sweep re-adopt it.
-
   const noun = singular(basename(dirname(item.target)) as 'skills' | 'agents' | 'commands');
-  await commitMutation(syncCtx, `agentenv: disown ${noun} ${name}`, notices);
-  await closeStoreSync(syncCtx, notices);
+  const transactionId = `disown-${name}-${randomUUID()}`;
+  const stagingRoot = `${paths.live}/commands/${transactionId}`;
+  const stagedContent = `${stagingRoot}/content`;
+  await mkdir(stagingRoot, { recursive: true });
+  await cp(item.target, stagedContent, { recursive: true, verbatimSymlinks: true });
+  if (!identitiesEqual(storeIdentity, await capturePathIdentity(item.target))) {
+    await rm(stagingRoot, { recursive: true, force: true });
+    await closeStoreSync(syncCtx, notices);
+    return withNotices({
+      stdout: '',
+      stderr: `disown: '${name}' changed in the store while disown was being planned\n`,
+      code: 1,
+    }, notices);
+  }
+
+  const manifest = await readState(paths);
+  const items = manifest.items.filter((candidate) => itemIdentity(candidate) !== itemIdentity(item));
+  const inventory = structuredClone(readInventory(manifest));
+  for (const surface of inventory) {
+    if (surface.dir === dirname(dest) && !surface.baseline.includes(name)) surface.baseline.push(name);
+  }
+  const entries = [{
+    id: 'destination',
+    target: dest,
+    staged: stagedContent,
+    expectedPreIdentity: destinationIdentity,
+  }];
+  if (item.path !== dest) {
+    entries.push({
+      id: 'surface',
+      target: item.path,
+      staged: `${stagingRoot}/absent-surface`,
+      expectedPreIdentity: surfaceIdentity,
+    });
+  }
+  entries.push({
+    id: 'store',
+    target: item.target,
+    staged: `${stagingRoot}/absent-store`,
+    expectedPreIdentity: storeIdentity,
+  });
+  const gitSteps = [{
+    id: 'disown',
+    message: `agentenv: disown ${noun} ${name}`,
+    paths: [item.target],
+  }];
+  try {
+    const publication = await publishWithPendingNotice({
+      paths,
+      transactionId,
+      kind: 'adoption-disown',
+      stagingRoot,
+      allowedRoots: [paths.store, dirname(item.path), dirname(dest)],
+      entries,
+      statePatch: { items, inventory },
+      gitSteps,
+      gitBookkeeping: () => commitRequiredSteps(syncCtx, gitSteps, notices, transactionId),
+    }, notices);
+    if (publication === 'complete') await closeStoreSync(syncCtx, notices);
+  } catch (error) {
+    await closeStoreSync(syncCtx, notices);
+    return withNotices({ stdout: '', stderr: `disown: ${(error as Error).message}\n`, code: 1 }, notices);
+  }
 
   return withNotices({ stdout: `Disowned ${noun} '${name}' — ${outcome}.\n`, code: 0 }, notices);
 }

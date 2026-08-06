@@ -59,6 +59,33 @@ describe('adopt --into: manual adoption into a chosen env (D10)', () => {
     expect((await lstat(join(surfaceDir, 'chosen'))).isSymbolicLink()).toBe(true);
     expect(subjects(paths.store)[0]).toBe('agentenv: adopt skill chosen → research');
   });
+
+  it('refuses a source that changes during the secret confirmation', async () => {
+    const th = gitHome();
+    const paths = resolvePaths(th.env);
+    await run(['init'], { env: th.env });
+    await run(['create', 'work'], { env: th.env });
+    const surfaceDir = join(th.home, 'surface', 'skills');
+    mkdirSync(surfaceDir, { recursive: true });
+    await snapshotInventory(paths, [
+      { dir: surfaceDir, scope: 'global', storeKind: 'skills', ownerEnv: 'work' } as AdoptSurface,
+    ]);
+    const source = makeSkill(surfaceDir, 'changing');
+    writeFileSync(join(source, 'token.txt'), 'api_key: AKIAZ7Q2W9E4R6T1Y8U3\n');
+
+    const res = await run(['adopt', 'changing', '--into', 'work'], {
+      env: th.env,
+      confirm: async () => {
+        writeFileSync(join(source, 'external.txt'), 'changed during prompt\n');
+        return true;
+      },
+    });
+
+    expect(res.code).toBe(1);
+    expect(res.stderr).toMatch(/changed.*confirmed/i);
+    expect((await lstat(source)).isDirectory()).toBe(true);
+    expect(existsSync(join(paths.envDir('work'), 'skills', 'changing'))).toBe(false);
+  });
 });
 
 describe('disown: reverses a global-mode adoption byte-identically (D10)', () => {

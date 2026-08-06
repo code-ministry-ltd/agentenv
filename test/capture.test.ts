@@ -5,7 +5,9 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { snapshotInventory, type AdoptSurface } from '../src/adopt.js';
 import { run } from '../src/cli.js';
+import { defaultGitRunner, type GitRunner } from '../src/git.js';
 import { resolvePaths } from '../src/paths.js';
+import { readState } from '../src/state.js';
 import { makeTempHome, type TempHome } from './helpers.js';
 
 const homes: TempHome[] = [];
@@ -73,6 +75,62 @@ describe('capture: auto-adopts a new item and commits it (D10)', () => {
     const res = await run(['capture'], { env: th.env });
     expect(res.code).toBe(0);
     expect(res.stdout).toMatch(/nothing to adopt/i);
+  });
+
+  it('obtains every confirmation before applying a multi-item capture', async () => {
+    const { th, paths, surfaceDir } = await setup();
+    for (const name of ['alpha', 'beta']) {
+      const dir = makeSkill(surfaceDir, name);
+      writeFileSync(join(dir, 'creds.txt'), 'api_key: AKIAZ7Q2W9E4R6T1Y8U3\n');
+    }
+    let confirmations = 0;
+    const res = await run(['capture'], {
+      env: th.env,
+      confirm: async () => {
+        confirmations += 1;
+        expect((await lstat(join(surfaceDir, 'alpha'))).isDirectory()).toBe(true);
+        expect((await lstat(join(surfaceDir, 'beta'))).isDirectory()).toBe(true);
+        expect(existsSync(join(paths.envDir('work'), 'skills', 'alpha'))).toBe(false);
+        return true;
+      },
+    });
+
+    expect(res.code).toBe(0);
+    expect(confirmations).toBe(2);
+    expect((await lstat(join(surfaceDir, 'alpha'))).isSymbolicLink()).toBe(true);
+    expect((await lstat(join(surfaceDir, 'beta'))).isSymbolicLink()).toBe(true);
+  });
+
+  it('publishes all items locally and resumes durable per-item commits after Git failure', async () => {
+    const { th, paths, surfaceDir } = await setup();
+    makeSkill(surfaceDir, 'alpha');
+    makeSkill(surfaceDir, 'beta');
+    const failSecondCommit: GitRunner = (args, opts) => {
+      if (args.includes('commit') && args.includes('agentenv: adopt skill beta → work')) {
+        return Promise.resolve({ code: 1, stdout: '', stderr: 'second adoption commit failed', timedOut: false });
+      }
+      return defaultGitRunner(args, opts);
+    };
+
+    const res = await run(['capture'], { env: th.env, gitRun: failSecondCommit });
+    expect(res.code).toBe(0);
+    expect((await lstat(join(surfaceDir, 'alpha'))).isSymbolicLink()).toBe(true);
+    expect((await lstat(join(surfaceDir, 'beta'))).isSymbolicLink()).toBe(true);
+    expect((await readState(paths)).commands[0]).toMatchObject({
+      kind: 'capture',
+      phase: 'git-pending',
+      gitSteps: [
+        { status: 'complete', commitId: expect.stringMatching(/^[0-9a-f]+$/) },
+        { status: 'pending' },
+      ],
+    });
+
+    await run(['shell-init'], { env: th.env });
+    expect((await readState(paths)).commands).toEqual([]);
+    expect(subjects(paths.store).slice(0, 2)).toEqual([
+      'agentenv: adopt skill beta → work',
+      'agentenv: adopt skill alpha → work',
+    ]);
   });
 });
 

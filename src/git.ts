@@ -1120,6 +1120,8 @@ export interface CommitResult {
   status: 'committed' | 'nothing' | 'blocked' | 'no-repo' | 'rebase-in-progress';
   /** Secret findings when `status === 'blocked'`. */
   findings?: SecretFinding[];
+  /** Exact HEAD created or observed for an idempotent scoped step. */
+  commitId?: string;
 }
 
 /**
@@ -1194,7 +1196,13 @@ export async function commitStorePaths(
 
   await git(ctx, ['add', '-A', '--', ...unique]);
   const staged = await git(ctx, ['diff', '--cached', '--name-only', '--', ...unique]);
-  if (staged.stdout.trim() === '') return { status: 'nothing' };
+  if (staged.stdout.trim() === '') {
+    const head = await git(ctx, ['rev-parse', '--verify', 'HEAD']);
+    return {
+      status: 'nothing',
+      ...(head.code === 0 && head.stdout.trim() !== '' ? { commitId: head.stdout.trim() } : {}),
+    };
+  }
 
   const findings = await scanStagedForSecrets(ctx, paths, unique);
   if (findings.length > 0) {
@@ -1216,7 +1224,11 @@ export async function commitStorePaths(
   if (res.code !== 0) {
     throw new Error(`agentenv: git commit failed (${firstLine(res.stderr)})`);
   }
-  return { status: 'committed' };
+  const head = await git(ctx, ['rev-parse', '--verify', 'HEAD']);
+  if (head.code !== 0 || head.stdout.trim() === '') {
+    throw new Error('agentenv: committed scoped paths but could not record the resulting commit identity');
+  }
+  return { status: 'committed', commitId: head.stdout.trim() };
 }
 
 // ---------------------------------------------------------------------------

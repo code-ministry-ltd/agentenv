@@ -29,6 +29,10 @@ export interface PlannedGitStep {
   id: string;
   message: string;
   paths: string[];
+  /** Durable recovery progress; a completed step is never replayed. */
+  status?: 'pending' | 'complete';
+  /** Exact commit created for this step (absent for a no-op/non-repo step). */
+  commitId?: string;
 }
 
 export interface CommandPlan {
@@ -82,7 +86,13 @@ export function createCommandPlan(input: CreateCommandPlanInput): CommandPlan {
     kind: input.kind,
     gitRequired: input.gitRequired ?? false,
     ...(input.gitMessage ? { gitMessage: input.gitMessage } : {}),
-    ...(input.gitSteps ? { gitSteps: input.gitSteps.map((step) => ({ ...step, paths: [...step.paths] })) } : {}),
+    ...(input.gitSteps ? {
+      gitSteps: input.gitSteps.map((step) => ({
+        ...step,
+        paths: [...step.paths],
+        status: step.status ?? 'pending',
+      })),
+    } : {}),
     phase: 'planned',
     commitPoint: false,
     operations: input.operations.map((operation) => ({ ...operation, state: 'pending' })),

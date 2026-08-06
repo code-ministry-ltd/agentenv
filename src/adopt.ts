@@ -6,6 +6,7 @@ import type { DirMergeItem } from './dir-merge.js';
 import { scanTextForSecrets } from './git.js';
 import { beginTransaction, recoverState } from './journal.js';
 import { withLock } from './lock.js';
+import { capturePathIdentity, identitiesEqual, type PathIdentity } from './path-identity.js';
 import type { Paths } from './paths.js';
 import { findOwner, readState, writeState, type ManifestItem, type StateManifest } from './state.js';
 import { environmentExists, readEnvConfig } from './store.js';
@@ -104,6 +105,13 @@ export interface AdoptedRecord {
   storePath: string;
 }
 
+/** Fully classified adoption intent used by the command-level transaction planner. */
+export interface PlannedAdoptedRecord extends AdoptedRecord {
+  surface: AdoptSurface;
+  sourceIdentity: PathIdentity;
+  destinationIdentity: PathIdentity;
+}
+
 /** Why the sweep left a new item alone. */
 export type AdoptSkipReason =
   | 'foreign-symlink'
@@ -124,7 +132,7 @@ export interface AdoptSkip {
 /** Outcome of {@link adoptSweep}. */
 export interface AdoptSweepResult {
   /** Adopted items (in dry-run: the items that WOULD be adopted). */
-  adopted: AdoptedRecord[];
+  adopted: PlannedAdoptedRecord[];
   /** New items left alone, with the reason. */
   skipped: AdoptSkip[];
   /** Whether this was a preview (nothing was moved/owned/committed). */
@@ -297,6 +305,7 @@ export async function adoptSweep(req: AdoptSweepRequest): Promise<AdoptSweepResu
         );
         continue;
       }
+      const sourceIdentity = await capturePathIdentity(surfacePath);
       // Guardrail 2 (secret patterns): prompt before adopting secret-bearing content.
       if (await pathHasSecret(surfacePath)) {
         const ok = req.confirm
@@ -311,7 +320,18 @@ export async function adoptSweep(req: AdoptSweepRequest): Promise<AdoptSweepResu
         }
       }
 
-      const record = describeAdoption(paths, surface, name);
+      if (!identitiesEqual(sourceIdentity, await capturePathIdentity(surfacePath))) {
+        result.skipped.push({ name, surfacePath, reason: 'invalid' });
+        note(`agentenv: skipping '${name}' — it changed while capture was being confirmed.`);
+        continue;
+      }
+
+      const record = await planAdoptionRecord(paths, surface, name, sourceIdentity);
+      if (record.destinationIdentity.kind !== 'absent') {
+        result.skipped.push({ name, surfacePath, reason: 'owned' });
+        note(`agentenv: skipping '${name}' — its store destination already exists.`);
+        continue;
+      }
       if (dryRun) {
         result.adopted.push(record);
         continue;
@@ -335,6 +355,22 @@ function describeAdoption(paths: Paths, surface: AdoptSurface, name: string): Ad
     origin: surface.scope === 'session' ? 'session' : 'global',
     surfacePath: join(surface.dir, name),
     storePath: join(paths.envDir(surface.ownerEnv), surface.storeKind, name),
+  };
+}
+
+/** Attach exact source/destination identities to one already-classified adoption. */
+export async function planAdoptionRecord(
+  paths: Paths,
+  surface: AdoptSurface,
+  name: string,
+  sourceIdentity?: PathIdentity,
+): Promise<PlannedAdoptedRecord> {
+  const record = describeAdoption(paths, surface, name);
+  return {
+    ...record,
+    surface: { ...surface },
+    sourceIdentity: sourceIdentity ?? await capturePathIdentity(record.surfacePath),
+    destinationIdentity: await capturePathIdentity(record.storePath),
   };
 }
 

@@ -124,6 +124,7 @@ export async function run(
               { paths, env, options: { ...options, globals } },
               pendingStaged.gitSteps!,
               recoveryNotices,
+              pendingStaged.transactionId,
             )
           : undefined
         : undefined;
