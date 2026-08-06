@@ -802,6 +802,79 @@ export interface SyncBackResult {
   refreshed: string[];
 }
 
+export interface FileBlockSyncBackPlan extends SyncBackResult {
+  target: string;
+  before: string;
+  after: string;
+  storeWrites: { storePath: string; body: string }[];
+  updatedItem?: FileBlockItem;
+}
+
+/** Discover the complete inline reconciliation without mutating target, store, or state. */
+export async function planSyncBack(
+  paths: Paths,
+  opts: FileBlockTargetOptions,
+  overrides: {
+    manifest?: StateManifest;
+    targetText?: string;
+    storeTexts?: ReadonlyMap<string, string>;
+  } = {},
+): Promise<FileBlockSyncBackPlan> {
+  const { target, env } = opts;
+  const empty: FileBlockSyncBackPlan = {
+    target,
+    before: '',
+    after: '',
+    storeWrites: [],
+    drifted: [],
+    refreshed: [],
+  };
+  const manifest = overrides.manifest ?? await readState(paths);
+  const record = findRecord(manifest, target, env);
+  if (!record || record.mode === 'import') return empty;
+  const before = overrides.targetText ?? await readFileOrEmpty(target);
+  const owned = locateOwnedRegion(before, env, record.subBlocks);
+  if (owned.status === 'conflict') throw new FileBlockConflictError(target, owned.detail);
+  if (owned.status === 'absent') return { ...empty, before, after: before };
+
+  const drifted: string[] = [];
+  const refreshed: string[] = [];
+  const newBodies = new Map<string, string>();
+  const updatedSubBlocks: FileSubBlock[] = [];
+  const storeWrites: { storePath: string; body: string }[] = [];
+  for (const sb of record.subBlocks) {
+    const storeBody = overrides.storeTexts?.get(sb.storePath) ?? await readFileOrEmpty(sb.storePath);
+    const fileBody = owned.bodies.get(sb.source) ?? storeBody;
+    let newBody: string;
+    if (hashBody(fileBody) !== sb.hash) {
+      newBody = fileBody;
+      storeWrites.push({ storePath: sb.storePath, body: newBody });
+      drifted.push(sb.source);
+    } else if (hashBody(storeBody) !== sb.hash) {
+      newBody = storeBody;
+      refreshed.push(sb.source);
+    } else {
+      newBody = fileBody;
+    }
+    newBodies.set(sb.source, newBody);
+    updatedSubBlocks.push({ ...sb, hash: hashBody(newBody) });
+  }
+  const region = renderRegion(env, updatedSubBlocks, newBodies, owned.eol);
+  const after = appendRegion(stripSpan(before, owned.start, owned.end), region, owned.eol);
+  const hashesChanged = updatedSubBlocks.some((sb, index) => sb.hash !== record.subBlocks[index]?.hash);
+  return {
+    target,
+    before,
+    after,
+    storeWrites,
+    drifted,
+    refreshed,
+    ...(storeWrites.length > 0 || after !== before || hashesChanged
+      ? { updatedItem: { ...record, subBlocks: updatedSubBlocks } }
+      : {}),
+  };
+}
+
 /**
  * Reconcile an env's inline sub-blocks with their store files (design D2's drift
  * pass). For each sub-block:
@@ -821,78 +894,23 @@ export interface SyncBackResult {
  * and each written store file are backed up first.
  */
 export async function syncBack(paths: Paths, opts: FileBlockTargetOptions): Promise<SyncBackResult> {
-  const { target, env } = opts;
   return withLock(paths, async () => {
-    const result: SyncBackResult = { drifted: [], refreshed: [] };
-    const manifest = await readState(paths);
-    const record = findRecord(manifest, target, env);
-    // Import mode (or nothing owned) never drifts — the content lives in the store.
-    if (!record || record.mode === 'import') return result;
-
-    const before = await readFileOrEmpty(target);
-    const owned = locateOwnedRegion(before, env, record.subBlocks);
-    // Mangled/hostile markers: refuse rather than treat lookalike-spanned text as
-    // drift and write it (marker lines + user notes) back into the canonical,
-    // git-synced store file. A relabelled sub-block marker is likewise refused,
-    // never silently self-healed from the store (which would drop an in-block edit).
-    if (owned.status === 'conflict') throw new FileBlockConflictError(target, owned.detail);
-    // 'absent' → the managed region is gone from the file; nothing to reconcile.
-    if (owned.status === 'absent') return result;
-    const inFile = owned.bodies;
-
-    const newBodies = new Map<string, string>();
-    const updatedSubBlocks: FileSubBlock[] = [];
-    const storeWrites: { storePath: string; body: string }[] = [];
-
-    for (const sb of record.subBlocks) {
-      const storeBody = await readFileOrEmpty(sb.storePath);
-      // After a clean locate every recorded sub-block is present in the file.
-      const fileBody = inFile.get(sb.source) ?? storeBody;
-      const recorded = sb.hash;
-
-      let newBody: string;
-      if (hashBody(fileBody) !== recorded) {
-        // In-session edit → write drift back to THIS source's store file.
-        newBody = fileBody;
-        storeWrites.push({ storePath: sb.storePath, body: newBody });
-        result.drifted.push(sb.source);
-      } else if (hashBody(storeBody) !== recorded) {
-        // Store changed elsewhere, block untouched → refresh block from store.
-        newBody = storeBody;
-        result.refreshed.push(sb.source);
-      } else {
-        newBody = fileBody; // identical everywhere — no change
-      }
-      newBodies.set(sb.source, newBody);
-      updatedSubBlocks.push({ ...sb, hash: hashBody(newBody) });
-    }
-
-    const region = renderRegion(env, updatedSubBlocks, newBodies, owned.eol);
-    const after = appendRegion(
-      stripSpan(before, owned.start, owned.end),
-      region,
-      owned.eol,
-    );
-    const hashesChanged = updatedSubBlocks.some((sb, i) => sb.hash !== record.subBlocks[i]?.hash);
-
-    // Truly nothing to do: no drift, no refresh, no hash change, file unchanged.
-    if (storeWrites.length === 0 && after === before && !hashesChanged) return result;
-
-    const updatedItem: FileBlockItem = { ...record, subBlocks: updatedSubBlocks };
-    const currentBackup = await backup(paths, target);
-    for (const w of storeWrites) await backup(paths, w.storePath);
+    const plan = await planSyncBack(paths, opts);
+    if (!plan.updatedItem) return { drifted: plan.drifted, refreshed: plan.refreshed };
+    const currentBackup = await backup(paths, plan.target);
+    for (const w of plan.storeWrites) await backup(paths, w.storePath);
 
     const tx = await beginTransaction(paths);
     try {
       await tx.apply(
         {
           op: 'add',
-          item: updatedItem as ManifestItem,
-          undo: { path: target, backupRef: currentBackup },
+          item: plan.updatedItem as ManifestItem,
+          undo: { path: plan.target, backupRef: currentBackup },
         },
         async () => {
-          for (const w of storeWrites) await writeFileAtomic(w.storePath, w.body);
-          if (after !== before) await writeFileAtomic(target, after);
+          for (const w of plan.storeWrites) await writeFileAtomic(w.storePath, w.body);
+          if (plan.after !== plan.before) await writeFileAtomic(plan.target, plan.after);
         },
       );
       await tx.commit();
@@ -900,7 +918,7 @@ export async function syncBack(paths: Paths, opts: FileBlockTargetOptions): Prom
       await tx.rollback();
       throw err;
     }
-    return result;
+    return { drifted: plan.drifted, refreshed: plan.refreshed };
   });
 }
 

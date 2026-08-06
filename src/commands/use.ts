@@ -4,7 +4,6 @@ import { snapshotInventory, type AdoptSurface } from '../adopt.js';
 import { adapters as realAdapters } from '../adapters/index.js';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
-import { driftSweep } from '../drift.js';
 import { materialiseGlobal } from '../engine.js';
 import { setBinding } from '../session/registry.js';
 import { resolveProjectRoot } from '../session/registry.js';
@@ -104,15 +103,12 @@ async function useGlobal(
     return { stdout: '', stderr: `${notices.join('\n')}\nuse --global: no valid environments to activate\n`, code: 1 };
   }
 
-  // Per-invocation drift sweep (D9): capture mid-session edits before mutating.
-  await driftSweep({ paths, adapters, env, onWarn: (m) => notices.push(m) });
-
   // Git sync START (D9): commit the swept drift, pull, then run the post-pull
   // safeguards (schema-validate + secret-scan + manifest-reconcile) BEFORE anything
   // materialises. A malformed / secret-bearing pulled tree is quarantined — NOT
   // materialised — and the invocation ends without touching real surfaces.
   const syncCtx = { paths, env, options };
-  const before = await openStoreSync(syncCtx, notices, { alreadySwept: true });
+  const before = await openStoreSync(syncCtx, notices);
   if (before.quarantined) {
     await closeStoreSync(syncCtx, notices);
     const stderr = notices.length > 0 ? `${notices.join('\n')}\n` : undefined;

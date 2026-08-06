@@ -5,6 +5,7 @@ import {
   commitRequiredMutation,
   commitRequiredSteps,
   openStoreSync,
+  PendingCommandError,
   withNotices,
 } from './commands/store-sync.js';
 import { recoverPendingFilesystemBundles } from './filesystem-bundle.js';
@@ -161,18 +162,23 @@ export async function run(
     readOnlyPersistenceCommands.has(command.name) &&
     !(await migrationGateClosed(paths)) &&
     !(await legacyMigrationRequired(paths));
-  if (servicePersistence) {
-    const notices: string[] = [];
-    const syncCtx = { paths, env, options: context.options };
-    await openStoreSync(syncCtx, notices, { skipFetch: true });
-    try {
+  try {
+    if (servicePersistence) {
+      const notices: string[] = [];
+      const syncCtx = { paths, env, options: context.options };
+      await openStoreSync(syncCtx, notices, { skipFetch: true });
+      try {
+        result = await command.run(context);
+      } finally {
+        await closeStoreSync(syncCtx, notices);
+      }
+      result = withNotices(result, notices);
+    } else {
       result = await command.run(context);
-    } finally {
-      await closeStoreSync(syncCtx, notices);
     }
-    result = withNotices(result, notices);
-  } else {
-    result = await command.run(context);
+  } catch (error) {
+    if (!(error instanceof PendingCommandError)) throw error;
+    result = { stdout: '', stderr: `agentenv: ${error.message}\n`, code: 2 };
   }
   return formatResult(command.name, globals, paths, withNotices(result, recoveryNotices));
 }

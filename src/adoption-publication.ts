@@ -9,7 +9,7 @@ import type { Paths } from './paths.js';
 import { addItem, readState } from './state.js';
 import type { StagedCommandEntry } from './staged-command.js';
 import { publishWithPendingNotice } from './commands/staged-publication.js';
-import { commitRequiredSteps, type SyncCtx } from './commands/store-sync.js';
+import type { PlannedGitStep } from './command-plan.js';
 
 function manifestItem(record: PlannedAdoptedRecord): AdoptedDirMergeItem {
   return {
@@ -30,11 +30,11 @@ function manifestItem(record: PlannedAdoptedRecord): AdoptedDirMergeItem {
 
 export interface PublishAdoptionsRequest {
   paths: Paths;
-  syncCtx: SyncCtx;
   transactionId: string;
   kind: 'capture' | 'manual-adopt';
   records: readonly PlannedAdoptedRecord[];
   notices: string[];
+  gitBookkeeping: (steps: readonly PlannedGitStep[]) => Promise<void>;
 }
 
 /** Stage and publish all approved adoptions as one local command, retaining the
@@ -94,11 +94,6 @@ export async function publishAdoptions(
     entries,
     statePatch: { items: patched.items },
     gitSteps,
-    gitBookkeeping: () => commitRequiredSteps(
-      req.syncCtx,
-      gitSteps,
-      req.notices,
-      req.transactionId,
-    ),
+    gitBookkeeping: () => req.gitBookkeeping(gitSteps),
   }, req.notices);
 }

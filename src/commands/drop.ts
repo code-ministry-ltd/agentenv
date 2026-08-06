@@ -2,7 +2,6 @@ import { adapters as realAdapters } from '../adapters/index.js';
 import { reconcileInventoryOwners } from '../adopt.js';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
-import { driftSweep } from '../drift.js';
 import { dematerialiseGlobal } from '../engine.js';
 import {
   findBinding,
@@ -81,15 +80,11 @@ async function dropGlobal(
   const adapters = options.adapters ?? realAdapters;
 
   const notices: string[] = [];
-  // Drift sweep BEFORE removal (D9): reconcile config-key hashes so removal is not
-  // blocked by drift, and preserve mid-session edits to the store first.
-  await driftSweep({ paths, adapters, env, onWarn: (m) => notices.push(m) });
-
   // Git sync START (D9): commit the swept drift, pull, run the post-pull safeguards.
   // Removal is manifest-driven and safe even on a quarantined pull, so drop proceeds
   // regardless — the reconcile warning still surfaces a remotely-deleted active env.
   const syncCtx = { paths, env, options };
-  await openStoreSync(syncCtx, notices, { alreadySwept: true });
+  await openStoreSync(syncCtx, notices);
 
   const result = await dematerialiseGlobal({
     paths,

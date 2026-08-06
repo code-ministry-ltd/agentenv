@@ -206,6 +206,11 @@ export interface SyncBackResult {
   note?: string;
 }
 
+export interface ConfigKeysSyncBackPlan extends SyncBackResult {
+  before: string;
+  after?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Path / value helpers
 // ---------------------------------------------------------------------------
@@ -678,7 +683,19 @@ export async function syncBack(
   tx: Transaction,
   item: ConfigKeysItem,
 ): Promise<SyncBackResult> {
-  const text = await readText(item.path);
+  const plan = await planSyncBack(item);
+  if (plan.drifted && plan.after !== undefined) {
+    await applyFileMutation(paths, tx, 'add', plan.item, item.path, plan.after);
+  }
+  return plan;
+}
+
+/** Discover secret-safe config-key reconciliation without mutating the file or manifest. */
+export async function planSyncBack(
+  item: ConfigKeysItem,
+  textOverride?: string,
+): Promise<ConfigKeysSyncBackPlan> {
+  const text = textOverride ?? await readText(item.path);
 
   if (item.mode === 'array-element') {
     const { found, value } = getAtPath(parseConfig(text, item), item.keyPath);
@@ -687,8 +704,8 @@ export async function syncBack(
       Array.isArray(value) &&
       value.some((v) => stableStringify(v) === stableStringify(item.value));
     return present
-      ? { drifted: false, item }
-      : { drifted: false, item, note: `array element ${item.key ?? ''} absent — nothing to sync` };
+      ? { drifted: false, item, before: text }
+      : { drifted: false, item, before: text, note: `array element ${item.key ?? ''} absent — nothing to sync` };
   }
 
   const { found, value } = readKeyed(text, item);
@@ -696,13 +713,14 @@ export async function syncBack(
     return {
       drifted: false,
       item,
+      before: text,
       note: `config key ${item.key ?? displayPath(item.keyPath)} vanished from ${item.path}`,
     };
   }
 
   const current = value as JsonValue;
   if (hashValue(current) === item.hash) {
-    return { drifted: false, item };
+    return { drifted: false, item, before: text };
   }
 
   // Drift: restore secret-flagged subfields to placeholders, then write back and
@@ -710,8 +728,14 @@ export async function syncBack(
   const canonical = restoreSecrets(current, item.secretFields);
   const updated: ConfigKeysItem = { ...item, hash: hashValue(canonical) };
   const next = writeKeyedValueText(text, item, canonical);
-  await applyFileMutation(paths, tx, 'add', updated, item.path, next);
-  return { drifted: true, currentValue: current, canonicalValue: canonical, item: updated };
+  return {
+    drifted: true,
+    currentValue: current,
+    canonicalValue: canonical,
+    item: updated,
+    before: text,
+    after: next,
+  };
 }
 
 /** Inspect one owned entry in a detached file without mutating it or state. */

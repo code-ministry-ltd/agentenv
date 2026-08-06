@@ -86,6 +86,8 @@ export interface SyncBeforeResult {
    * contains a suspected secret. Destructive store commands must stop before
    * applying their own effects so they cannot erase the only local copy. */
   driftCommitBlocked?: boolean;
+  /** A whole-command local commit is waiting for required Git bookkeeping. */
+  pendingCommand?: string;
 }
 
 export interface SyncBeforeRequest {
@@ -115,6 +117,16 @@ export interface SyncBeforeRequest {
   offline?: boolean;
   /** Service local persistence but defer fetch; the caller may still push afterward. */
   skipFetch?: boolean;
+  /** Command-layer whole-sweep publisher, injected to avoid low-level CLI coupling. */
+  publishDrift?: () => Promise<{
+    publication: 'no-change' | 'complete' | 'git-pending';
+    transactionId?: string;
+  }>;
+  /** Command-layer atomic automatic-adoption publisher. */
+  publishAdoptions?: () => Promise<{
+    publication: 'no-change' | 'complete' | 'git-pending';
+    transactionId?: string;
+  }>;
 }
 
 /**
@@ -124,9 +136,7 @@ export interface SyncBeforeRequest {
  */
 export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBeforeResult> {
   const { paths, env, adapters, onNotice, gitRun } = req;
-  if (!(await storeIsRepo(paths))) {
-    return { synced: false, pulled: false, quarantined: false, conflicted: false, paused: false };
-  }
+  const repo = await storeIsRepo(paths);
 
   // A HELD rebase (a `sync --resolve` two-step in progress) must never be disturbed by
   // another store-touching command (D9, Task 2.2, criterion 11). Do NOT drift-commit /
@@ -135,7 +145,7 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
   // conflict marker set, flag the result `paused`, and let the caller's OWN local
   // mutation still land on disk — only the git index/commit/pull/push is skipped. Only
   // `sync --resolve` / `--abort` may ever advance a held rebase.
-  if (await rebaseInProgress(paths)) {
+  if (repo && await rebaseInProgress(paths)) {
     onNotice(
       'agentenv: sync paused mid-conflict — a `agentenv sync --resolve` is in progress. ' +
         'Finish it with `agentenv sync --resolve`, or cancel with `agentenv sync --abort`. ' +
@@ -144,18 +154,40 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
     return { synced: true, pulled: false, quarantined: false, conflicted: true, paused: true };
   }
 
+  if (!req.alreadySwept && req.publishDrift) {
+    const published = await req.publishDrift();
+    if (published.publication === 'git-pending') {
+      return {
+        synced: repo,
+        pulled: false,
+        quarantined: false,
+        conflicted: false,
+        paused: false,
+        driftCommitBlocked: true,
+        ...(published.transactionId ? { pendingCommand: published.transactionId } : {}),
+      };
+    }
+  }
+  if (!repo) {
+    return { synced: false, pulled: false, quarantined: false, conflicted: false, paused: false };
+  }
+
   let driftCommitBlocked = false;
   try {
     // 1. Sweep mid-session drift into the store working tree (D9), unless the
     //    caller already swept. The sweep writes back inline-block / config-key /
     //    session-view edits; symlink write-throughs are already on disk.
     if (!req.alreadySwept) {
-      await driftSweep({ paths, adapters, env, onWarn: onNotice });
+      if (!req.publishDrift) {
+        await driftSweep({ paths, adapters, env, onWarn: onNotice });
+      }
     }
 
     // 2. Commit ALL uncommitted store drift as one `agentenv: sync drift`, BEFORE
     //    pulling, so every mid-session change type is committed within one command.
-    const drift = await commitStore(paths, env, 'agentenv: sync drift', gitRun);
+    const drift = req.publishDrift && !req.alreadySwept
+      ? { status: 'nothing' as const }
+      : await commitStore(paths, env, 'agentenv: sync drift', gitRun);
     if (drift.status === 'blocked') {
       driftCommitBlocked = true;
       onNotice(
@@ -176,29 +208,43 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
     //     interactive path. Suppressed for commands that adopt themselves.
     if (!req.skipAdopt) {
       try {
-        await adoptSweep({
-          paths,
-          note: onNotice,
-          onAdopt: async (rec) => {
-            try {
-              const c = await commitStore(
-                paths,
-                env,
-                `agentenv: adopt ${singular(rec.storeKind)} ${rec.name} → ${rec.ownerEnv}`,
-                gitRun,
-              );
-              if (c.status === 'blocked') {
+        if (req.publishAdoptions) {
+          const published = await req.publishAdoptions();
+          if (published.publication === 'git-pending') {
+            return {
+              synced: true,
+              pulled: false,
+              quarantined: false,
+              conflicted: false,
+              paused: false,
+              ...(published.transactionId ? { pendingCommand: published.transactionId } : {}),
+            };
+          }
+        } else {
+          await adoptSweep({
+            paths,
+            note: onNotice,
+            onAdopt: async (rec) => {
+              try {
+                const c = await commitStore(
+                  paths,
+                  env,
+                  `agentenv: adopt ${singular(rec.storeKind)} ${rec.name} → ${rec.ownerEnv}`,
+                  gitRun,
+                );
+                if (c.status === 'blocked') {
+                  onNotice(
+                    `agentenv: adoption of '${rec.name}' NOT committed — a suspected secret is present:\n${describeFindings(c.findings ?? [])}`,
+                  );
+                }
+              } catch (err) {
                 onNotice(
-                  `agentenv: adoption of '${rec.name}' NOT committed — a suspected secret is present:\n${describeFindings(c.findings ?? [])}`,
+                  `agentenv: adopted '${rec.name}' locally but the commit was skipped — ${(err as Error).message}`,
                 );
               }
-            } catch (err) {
-              onNotice(
-                `agentenv: adopted '${rec.name}' locally but the commit was skipped — ${(err as Error).message}`,
-              );
-            }
-          },
-        });
+            },
+          });
+        }
       } catch (err) {
         onNotice(`agentenv: auto-adopt sweep skipped — ${(err as Error).message}`);
       }

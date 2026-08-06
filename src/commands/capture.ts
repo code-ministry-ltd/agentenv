@@ -8,7 +8,7 @@ import { publishAdoptions } from '../adoption-publication.js';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
 import { confirmDefault } from '../prompt.js';
-import { closeStoreSync, openStoreSync, withNotices } from './store-sync.js';
+import { closeStoreSync, commitRequiredSteps, openStoreSync, withNotices } from './store-sync.js';
 
 /**
  * `agentenv capture [--dry-run]` — run the auto-adopt sweep now (design D10).
@@ -77,11 +77,12 @@ async function runCapture(ctx: CommandContext): Promise<RunResult> {
   try {
     const publication = await publishAdoptions({
       paths,
-      syncCtx,
       transactionId,
       kind: 'capture',
       records: planned.adopted,
       notices,
+      gitBookkeeping: (steps) =>
+        commitRequiredSteps(syncCtx, steps, notices, transactionId),
     });
     if (publication === 'complete') await closeStoreSync(syncCtx, notices);
   } catch (error) {

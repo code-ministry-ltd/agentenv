@@ -1,5 +1,8 @@
+import { randomUUID } from 'node:crypto';
 import { adapters as realAdapters } from '../adapters/index.js';
 import type { Adapter } from '../adapter.js';
+import { adoptSweep } from '../adopt.js';
+import { publishAdoptions } from '../adoption-publication.js';
 import type { PlannedGitStep } from '../command-plan.js';
 import type { RunOptions, RunResult } from '../command.js';
 import {
@@ -9,6 +12,7 @@ import {
   describeFindings,
 } from '../git.js';
 import { collectLifecycleGarbage } from '../lifecycle-gc.js';
+import { publishDriftSweep } from '../drift-publication.js';
 import { withLock } from '../lock.js';
 import type { Paths } from '../paths.js';
 import { readState, writeState } from '../state.js';
@@ -32,6 +36,16 @@ export interface SyncCtx {
   paths: Paths;
   env: NodeJS.ProcessEnv;
   options: RunOptions;
+}
+
+export class PendingCommandError extends Error {
+  constructor(readonly transactionId: string) {
+    super(
+      `required Git bookkeeping is still pending for command '${transactionId}'; ` +
+        `run \`agentenv resolve command ${transactionId} --retry\` before another mutation`,
+    );
+    this.name = 'PendingCommandError';
+  }
 }
 
 /** Push a loud notice when an auto-commit was BLOCKED by the pre-commit secret scan (D9). */
@@ -131,7 +145,7 @@ export async function openStoreSync(
   opts: { alreadySwept?: boolean; skipAdopt?: boolean; skipFetch?: boolean } = {},
 ): Promise<SyncBeforeResult> {
   const { paths, env, options } = ctx;
-  return beginStoreSync({
+  const result = await beginStoreSync({
     paths,
     env,
     adapters: inScopeAdapters(options),
@@ -141,7 +155,47 @@ export async function openStoreSync(
     ...(opts.alreadySwept ? { alreadySwept: true } : {}),
     ...(opts.skipAdopt ? { skipAdopt: true } : {}),
     ...(opts.skipFetch ? { skipFetch: true } : {}),
+    ...(!opts.alreadySwept ? {
+      publishDrift: async () => {
+        const published = await publishDriftSweep({
+          paths,
+          adapters: inScopeAdapters(options),
+          env,
+          notices,
+          onWarn: (notice) => notices.push(notice),
+          gitBookkeeping: (steps, transactionId) =>
+            commitRequiredSteps(ctx, steps, notices, transactionId),
+        });
+        return {
+          publication: published.publication,
+          ...(published.transactionId ? { transactionId: published.transactionId } : {}),
+        };
+      },
+    } : {}),
+    ...(!opts.skipAdopt ? {
+      publishAdoptions: async () => {
+        const planned = await adoptSweep({
+          paths,
+          dryRun: true,
+          note: (notice) => notices.push(notice),
+        });
+        if (planned.adopted.length === 0) return { publication: 'no-change' as const };
+        const transactionId = `auto-capture-${randomUUID()}`;
+        const publication = await publishAdoptions({
+          paths,
+          transactionId,
+          kind: 'capture',
+          records: planned.adopted,
+          notices,
+          gitBookkeeping: (steps) =>
+            commitRequiredSteps(ctx, steps, notices, transactionId),
+        });
+        return { publication, transactionId };
+      },
+    } : {}),
   });
+  if (result.pendingCommand) throw new PendingCommandError(result.pendingCommand);
+  return result;
 }
 
 /** END the sync lifecycle: the single fail-soft push (design D9). Returns the push

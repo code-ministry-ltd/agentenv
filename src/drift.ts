@@ -1,19 +1,26 @@
-import { readdir, readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { cp, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { resolveGlobalSurfaceDestination } from './adapter-v2.js';
 import type { Adapter, ConfigKeysDriftReport, ConfigKeysSurface } from './adapter.js';
 import {
+  planSyncBack as planCfgSyncBack,
   syncBack as cfgSyncBack,
   type ConfigKeysItem,
   type JsonValue,
 } from './config-keys.js';
 import { syncBack as dmSyncBack, type DirMergeItem } from './dir-merge.js';
-import { syncBack as fbSyncBack, type FileBlockItem } from './file-block.js';
+import {
+  planSyncBack as planFbSyncBack,
+  syncBack as fbSyncBack,
+  type FileBlockItem,
+} from './file-block.js';
 import { writeFileAtomic } from './fs-atomic.js';
 import { beginTransaction, recoverState } from './journal.js';
 import { withLock } from './lock.js';
+import { capturePathIdentity, identitiesEqual } from './path-identity.js';
 import type { Paths } from './paths.js';
-import { readState, type StateManifest } from './state.js';
+import { itemIdentity, readState, type StateManifest } from './state.js';
+import type { StagedCommandEntry } from './staged-command.js';
 
 /**
  * The per-invocation drift sweep (design D9). At the start of every mutating
@@ -74,6 +81,129 @@ export interface DriftSweepResult {
    * NO git — it only surfaces the paths so 2.1 can wire commit/push on top.
    */
   storePathsChanged: string[];
+}
+
+export interface PlannedDriftSweep {
+  result: DriftSweepResult;
+  entries: StagedCommandEntry[];
+  statePatch?: { items: StateManifest['items'] };
+  allowedRoots: string[];
+  gitPaths: string[];
+}
+
+/** Discover and render a whole drift sweep entirely into private staging. */
+export async function planDriftSweep(
+  req: DriftSweepRequest,
+  stagingRoot: string,
+): Promise<PlannedDriftSweep> {
+  const onWarn = req.onWarn ?? ((message: string) => console.warn(message));
+  const result: DriftSweepResult = {
+    dirMergeSynced: 0,
+    fileBlockDrifted: [],
+    configKeysDrifted: 0,
+    configKeysDriftReports: [],
+    sessionInstructionsSynced: 0,
+    storePathsChanged: [],
+  };
+  const manifest = structuredClone(await readState(req.paths));
+  const entries = new Map<string, StagedCommandEntry>();
+  const stagedTexts = new Map<string, string>();
+  let stateChanged = false;
+  let sequence = 0;
+
+  const stageText = async (target: string, text: string): Promise<void> => {
+    const existing = entries.get(target);
+    const staged = existing?.staged ?? join(stagingRoot, 'effects', String(sequence++));
+    await mkdir(dirname(staged), { recursive: true });
+    await writeFile(staged, text, 'utf8');
+    stagedTexts.set(target, text);
+    if (!existing) {
+      entries.set(target, {
+        id: `effect-${entries.size}`,
+        target,
+        staged,
+        expectedPreIdentity: await capturePathIdentity(target),
+      });
+    }
+  };
+  const replaceManifestItem = (updated: StateManifest['items'][number]): void => {
+    const index = manifest.items.findIndex((item) => itemIdentity(item) === itemIdentity(updated));
+    if (index >= 0) manifest.items[index] = updated;
+    else manifest.items.push(updated);
+    stateChanged = true;
+  };
+
+  for (const item of manifest.items) {
+    if (item.surface !== 'dir-merge' || (item as DirMergeItem).action === 'symlink') continue;
+    const sourceIdentity = await capturePathIdentity(item.path);
+    const targetIdentity = await capturePathIdentity((item as DirMergeItem).target);
+    if (identitiesEqual(sourceIdentity, targetIdentity)) continue;
+    const staged = join(stagingRoot, 'effects', String(sequence++));
+    await mkdir(dirname(staged), { recursive: true });
+    await cp(item.path, staged, { recursive: true, verbatimSymlinks: true });
+    if (!identitiesEqual(sourceIdentity, await capturePathIdentity(item.path))) {
+      throw new Error(`dir-merge source changed while planning drift: ${item.path}`);
+    }
+    entries.set((item as DirMergeItem).target, {
+      id: `effect-${entries.size}`,
+      target: (item as DirMergeItem).target,
+      staged,
+      expectedPreIdentity: targetIdentity,
+    });
+    result.dirMergeSynced += 1;
+    result.storePathsChanged.push((item as DirMergeItem).target);
+  }
+
+  const seenFileBlocks = new Set<string>();
+  for (const item of [...manifest.items]) {
+    if (item.surface !== 'file-block') continue;
+    const fb = item as FileBlockItem;
+    const id = `${fb.path} ${fb.ownerEnv}`;
+    if (seenFileBlocks.has(id)) continue;
+    seenFileBlocks.add(id);
+    try {
+      const plan = await planFbSyncBack(
+        req.paths,
+        { target: fb.path, env: fb.ownerEnv },
+        { manifest, targetText: stagedTexts.get(fb.path), storeTexts: stagedTexts },
+      );
+      for (const write of plan.storeWrites) {
+        await stageText(write.storePath, write.body);
+        result.storePathsChanged.push(write.storePath);
+      }
+      if (plan.after !== plan.before) await stageText(plan.target, plan.after);
+      if (plan.updatedItem) replaceManifestItem(plan.updatedItem);
+      result.fileBlockDrifted.push(...plan.drifted);
+    } catch (error) {
+      onWarn(`agentenv: drift sweep skipped ${fb.path} (${(error as Error).message})`);
+    }
+  }
+
+  for (const item of [...manifest.items]) {
+    if (item.surface !== 'config-keys') continue;
+    const plan = await planCfgSyncBack(item as ConfigKeysItem, stagedTexts.get(item.path));
+    if (!plan.drifted || plan.after === undefined) continue;
+    await stageText(item.path, plan.after);
+    replaceManifestItem(plan.item);
+    result.configKeysDrifted += 1;
+    await reportConfigKeysDrift(req, item as ConfigKeysItem, plan.canonicalValue, result, onWarn);
+  }
+
+  for (const write of await discoverSessionInstructionDrift(req, manifest)) {
+    await stageText(write.path, write.text);
+    result.sessionInstructionsSynced += 1;
+    result.storePathsChanged.push(write.path);
+  }
+
+  const values = [...entries.values()];
+  const gitPaths = [...new Set(result.storePathsChanged)];
+  return {
+    result: { ...result, storePathsChanged: gitPaths },
+    entries: values,
+    ...(stateChanged ? { statePatch: { items: manifest.items } } : {}),
+    allowedRoots: [...new Set([req.paths.store, ...values.map((entry) => dirname(entry.target))])],
+    gitPaths,
+  };
 }
 
 /**
