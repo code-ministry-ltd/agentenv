@@ -3,6 +3,10 @@ import type { ConflictedFile, GitRunner } from './git.js';
 import type { Paths } from './paths.js';
 import type { CaptureFn, ExecHarness } from './session/exec.js';
 import type { MigrationRequest } from './migration.js';
+import type {
+  StartUiServerOptions,
+  UiServerHandle,
+} from './ui/server.js';
 
 /** Outcome of a CLI invocation: text to print and a process exit code. */
 export interface RunResult {
@@ -69,6 +73,10 @@ export interface RunOptions {
    * failing or unreachable remote deterministically, with no network.
    */
   gitRun?: GitRunner;
+  /** UI server seam for command tests; defaults to the guarded loopback server. */
+  startUiServer?: (options: StartUiServerOptions) => Promise<UiServerHandle>;
+  /** Browser opener seam for command tests; defaults to the platform opener. */
+  openUiUrl?: (url: string) => Promise<void>;
   /**
    * Resolve a rebase conflict during `agentenv sync --resolve` (Task 2.2). This is
    * the "user resolved the files on disk" step, injected so the walkthrough is

@@ -79,13 +79,18 @@ Add the hidden-until-complete `ui` command, Node HTTP lifecycle, one-time launch
 credential, process session, Host/Origin/CSRF checks, body limits, security
 headers, safe errors, and graceful shutdown. Test the real listener with `fetch`.
 
-- [ ] The server binds only `127.0.0.1`, chooses or validates its port, prints no
-  secret, and closes cleanly on normal and signal-driven shutdown.
-- [ ] Foreign Host/Origin, missing session/CSRF, malformed or oversized bodies,
+- [x] The server binds only `127.0.0.1`, chooses or validates its port, emits the
+  credential only in the user-facing fragment URL, and closes cleanly on normal
+  and signal-driven shutdown.
+- [x] Foreign Host/Origin, missing session/CSRF, malformed or oversized bodies,
   unsupported content types, and unsupported methods return the specified errors.
-- [ ] Read-only asset/API requests never alter a temporary agentenv home.
+- [x] Read-only asset/API requests never alter a temporary agentenv home.
 
 Verification: `npx vitest run test/ui-server.test.ts test/ui-command.test.ts`
+
+Verified 2026-08-06: focused HTTP/command tests (10/10), compiled process launch/
+fetch/SIGTERM smoke, lint, typecheck, build, and full regression suite (150 files,
+1,111 tests) passed.
 
 Dependencies: Tasks 1–2
 

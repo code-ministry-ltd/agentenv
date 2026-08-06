@@ -20,6 +20,7 @@ import { shimCommand } from './shim.js';
 import { showCommand } from './show.js';
 import { statusCommand } from './status.js';
 import { syncCommand } from './sync.js';
+import { uiCommand } from './ui.js';
 import { useCommand } from './use.js';
 
 /**
@@ -43,6 +44,7 @@ export const commands: readonly Command[] = [
   adoptCommand,
   disownCommand,
   statusCommand,
+  uiCommand,
   remoteCommand,
   syncCommand,
   resolveCommand,
