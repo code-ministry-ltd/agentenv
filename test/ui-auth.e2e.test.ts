@@ -24,7 +24,9 @@ test('authenticates the local UI and keeps the credential ephemeral', async ({
   await expect.poll(async () => await page.evaluate(() => location.hash === '')).toBe(true);
   expect(await page.evaluate(() => location.origin + location.pathname)).toBe(`${origin}/`);
   await expect(page.getByRole('heading', { level: 1, name: 'Your agent environments' })).toBeVisible();
-  await expect(page.getByRole('status')).toContainText('Secure local session established');
+  await expect(
+    page.getByRole('status').filter({ hasText: 'Secure local session established' }),
+  ).toBeVisible();
   await expect(page.locator('html')).toHaveAttribute('data-session', 'ready');
   expect(verificationRequest).toBeDefined();
   await expect(verificationRequest!.headerValue('x-agentenv-csrf')).resolves.toMatch(
@@ -46,7 +48,9 @@ test('authenticates the local UI and keeps the credential ephemeral', async ({
   expect(refreshSession.status()).toBe(200);
 
   await page.reload();
-  await expect(page.getByRole('status')).toContainText('Secure local session established');
+  await expect(
+    page.getByRole('status').filter({ hasText: 'Secure local session established' }),
+  ).toBeVisible();
   await expect(page.getByRole('heading', { level: 1 })).toHaveCount(1);
 
   for (const viewport of [

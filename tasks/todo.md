@@ -144,10 +144,17 @@ Build the read-only catalogue summary operation, authenticated paginated route,
 and environment list UI with active state, description, stable ordering, counts,
 and safe opaque revisions.
 
-- [ ] The list reports every environment once in stable order with accurate
+- [x] The list reports every environment once in stable order with accurate
   active state, description, and five-kind counts.
-- [ ] Pagination and query bounds reject malformed input and never expose paths.
-- [ ] The browser renders loading, populated, empty, and request-error outcomes.
+- [x] Pagination and query bounds reject malformed input and never expose paths.
+- [x] The browser renders loading, populated, empty, and request-error outcomes.
+
+Verified 2026-08-07: catalogue/API tests (3/3) and production CLI Playwright
+flows (3/3) passed with real two-page, empty, and malformed temporary homes;
+read-only identity checks passed. Lint, all three typechecks, build, UI tests
+(19/19), all production-browser tests (4/4), and the full regression suite
+(151 files, 1,114 tests) passed. The full suite used a process-local Git signing
+override because this machine requests GPG signing but has no `gpg` executable.
 
 Verification: `npx vitest run test/ui-catalog.test.ts && npm run test:ui:e2e -- --grep "browses environment summaries"`
 

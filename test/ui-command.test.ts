@@ -51,7 +51,12 @@ describe('agentenv ui command', () => {
       code: 0,
       stdout: 'agentenv UI: http://127.0.0.1:43210/#launch=secret\n',
     });
-    expect(starts).toEqual([{ port: 43210 }]);
+    expect(starts).toEqual([
+      {
+        port: 43210,
+        paths: expect.objectContaining({ base: temp.home }),
+      },
+    ]);
     expect(opened).toEqual([]);
   });
 

@@ -66,14 +66,14 @@ export const uiCommand: Command = {
   summary: 'Browse and edit environments in a local web app',
   hidden: false,
 
-  async run({ args, options }) {
+  async run({ args, options, paths }) {
     const parsed = parseUiArguments(args);
     if ('code' in parsed) return parsed;
 
     const start = options.startUiServer ?? startUiServer;
     let server;
     try {
-      server = await start({ port: parsed.port });
+      server = await start({ port: parsed.port, paths });
     } catch {
       return {
         stdout: '',

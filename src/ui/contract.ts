@@ -79,6 +79,24 @@ export interface PageResponse<Item> {
   page: PageInfo;
 }
 
+export interface ContentCounts {
+  skill: number;
+  instruction: number;
+  mcp: number;
+  agent: number;
+  command: number;
+}
+
+export interface EnvironmentSummary {
+  name: EnvironmentName;
+  description: string;
+  active: boolean;
+  counts: ContentCounts;
+  revision: Revision;
+}
+
+export type EnvironmentCatalogPage = PageResponse<EnvironmentSummary>;
+
 export const API_ERROR_STATUS = {
   MALFORMED_REQUEST: 400,
   UNAUTHENTICATED: 401,

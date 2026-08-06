@@ -3,6 +3,8 @@ import {
   type ApiErrorCode,
   type ApiErrorResponse,
   type ApiSuccessResponse,
+  type EnvironmentCatalogPage,
+  type EnvironmentSummary,
 } from '../../src/ui/contract.js';
 
 interface SessionData {
@@ -99,4 +101,16 @@ export async function apiRequest<Data>(
     cache: 'no-store',
   });
   return await responseBody<Data>(response);
+}
+
+export async function listEnvironmentSummaries(): Promise<readonly EnvironmentSummary[]> {
+  const first = await apiRequest<EnvironmentCatalogPage>('/api/environments?page=1&pageSize=100');
+  const items = [...first.items];
+  for (let page = 2; page <= first.page.totalPages; page += 1) {
+    const next = await apiRequest<EnvironmentCatalogPage>(
+      `/api/environments?page=${page}&pageSize=100`,
+    );
+    items.push(...next.items);
+  }
+  return items;
 }

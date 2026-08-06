@@ -131,9 +131,138 @@ button:hover {
 }
 
 .connection-panel {
-  width: min(100%, 48rem);
+  width: 100%;
   padding: clamp(1.5rem, 5vw, 3.5rem) 0;
   border-top: 4px solid var(--ink);
+}
+
+.catalog-panel {
+  margin-top: clamp(2.5rem, 7vw, 5rem);
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--line);
+}
+
+.catalog-heading,
+.environment-card-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.catalog-heading .eyebrow {
+  margin-bottom: 0.45rem;
+}
+
+h2,
+h3,
+.environment-counts,
+.environment-revision {
+  margin: 0;
+}
+
+h2 {
+  font-size: clamp(1.8rem, 4vw, 2.75rem);
+  letter-spacing: -0.04em;
+}
+
+h3 {
+  font-size: 1.15rem;
+  letter-spacing: -0.025em;
+}
+
+.catalog-total,
+.activity,
+.environment-revision {
+  color: var(--ink-muted);
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 0.72rem;
+}
+
+.catalog-message {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.8rem;
+  margin-top: 1.5rem;
+  padding: 1.25rem;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink-muted);
+}
+
+.catalog-message strong,
+.catalog-message span {
+  display: block;
+}
+
+.catalog-message strong {
+  margin-bottom: 0.25rem;
+  color: var(--ink);
+}
+
+.catalog-error {
+  justify-content: space-between;
+  border-color: var(--danger);
+}
+
+.catalog-empty {
+  border-style: dashed;
+}
+
+.environment-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr));
+  gap: 1rem;
+  margin: 1.5rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.environment-card {
+  height: 100%;
+  padding: 1.15rem;
+  border: 1px solid var(--line);
+  background: var(--surface-raised);
+}
+
+.activity {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.activity-dot {
+  width: 0.55rem;
+  height: 0.55rem;
+  border: 1px solid currentcolor;
+  border-radius: 50%;
+  background: transparent;
+}
+
+.activity.active {
+  color: var(--accent-strong);
+}
+
+.activity.active .activity-dot {
+  background: var(--accent);
+}
+
+.environment-description {
+  min-height: 3em;
+  margin: 1rem 0;
+  color: var(--ink-muted);
+  line-height: 1.5;
+}
+
+.environment-counts {
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--line);
+  font-size: 0.82rem;
+  line-height: 1.6;
+}
+
+.environment-revision {
+  margin-top: 0.7rem;
 }
 
 .eyebrow {
@@ -260,6 +389,13 @@ code {
 
   .footer-note {
     text-align: left;
+  }
+
+  .catalog-heading,
+  .catalog-error,
+  .environment-card-heading {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
 

@@ -2,7 +2,9 @@ import { readFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolvePaths, type Paths } from '../paths.js';
 import { API_ERROR_STATUS, type ApiErrorCode } from './contract.js';
+import { handleUiRoute } from './routes.js';
 import {
   applyBrowserSecurityHeaders,
   createUiSecurityState,
@@ -17,6 +19,7 @@ export interface StartUiServerOptions {
   port?: number;
   assetsDir?: string;
   installSignalHandlers?: boolean;
+  paths?: Paths;
 }
 
 export interface UiServerHandle {
@@ -150,6 +153,7 @@ async function handleApi(
   origin: string,
   expectedHost: string,
   security: UiSecurityState,
+  paths: Paths,
 ): Promise<void> {
   if (!hasExpectedHost(request, expectedHost)) {
     sendError(response, 'FORBIDDEN', 'The request host is not allowed.');
@@ -209,6 +213,15 @@ async function handleApi(
     sendJson(response, 200, { data: { ready: true } });
     return;
   }
+  const route = await handleUiRoute(
+    request,
+    new URL(request.url ?? '/', origin),
+    paths,
+  );
+  if (route !== undefined) {
+    sendJson(response, route.status, route.body);
+    return;
+  }
   sendError(response, 'NOT_FOUND', 'The requested API resource was not found.');
 }
 
@@ -226,6 +239,7 @@ export async function startUiServer(
   }
 
   const assetsDir = options.assetsDir ?? DEFAULT_ASSETS_DIR;
+  const paths = options.paths ?? resolvePaths();
   const security = createUiSecurityState();
   let origin = '';
   let expectedHost = '';
@@ -241,7 +255,7 @@ export async function startUiServer(
       }
 
       if (pathname === '/api' || pathname.startsWith('/api/')) {
-        await handleApi(request, response, pathname, origin, expectedHost, security);
+        await handleApi(request, response, pathname, origin, expectedHost, security, paths);
       } else {
         await serveAsset(request, response, pathname, assetsDir);
       }

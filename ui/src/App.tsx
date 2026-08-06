@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { initializeSession, UiApiError } from './api.js';
+import { EnvironmentList } from './EnvironmentList.js';
 import './styles.css';
 
 type ConnectionState =
@@ -59,13 +60,16 @@ export function App(): React.JSX.Element {
           ) : null}
 
           {connection.status === 'ready' ? (
-            <div className="session-state session-state-ready" role="status">
-              <span aria-hidden="true" className="status-check">✓</span>
-              <span>
-                <strong>Secure local session established.</strong>
-                Your environment data stays on this computer.
-              </span>
-            </div>
+            <>
+              <div className="session-state session-state-ready" role="status">
+                <span aria-hidden="true" className="status-check">✓</span>
+                <span>
+                  <strong>Secure local session established.</strong>
+                  Your environment data stays on this computer.
+                </span>
+              </div>
+              <EnvironmentList />
+            </>
           ) : null}
 
           {connection.status === 'error' ? (
