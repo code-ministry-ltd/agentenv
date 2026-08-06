@@ -3,9 +3,11 @@ type: specification
 project: agentenv
 change: complete-command-transaction-boundaries
 created: 2026-08-03
-status: ready-for-review
+status: implemented
 depends_on: docs/MERGE_STATUS.md
 frozen_code_revision: 3813baa
+implementation_revision: e70feff
+verified: 2026-08-06
 governing_requirements: MR-003 through MR-006 from the reviewed merge specification
 ---
 
