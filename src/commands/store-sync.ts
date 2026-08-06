@@ -163,6 +163,7 @@ export async function openStoreSync(
           env,
           notices,
           onWarn: (notice) => notices.push(notice),
+          ...(options.gitRun ? { gitRun: options.gitRun } : {}),
           gitBookkeeping: (steps, transactionId) =>
             commitRequiredSteps(ctx, steps, notices, transactionId),
         });

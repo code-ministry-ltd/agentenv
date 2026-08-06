@@ -174,6 +174,35 @@ export function storeIsRepo(paths: Paths): Promise<boolean> {
   return isGitRepo(paths.store);
 }
 
+function nulSeparatedPaths(stdout: string): string[] {
+  return stdout.split('\0').filter((path) => path !== '');
+}
+
+/**
+ * List every dirty canonical store path without touching the index. The drift
+ * publisher uses this to include changes made directly inside the store (including
+ * untracked files) in the same required, secret-scanned commit as projected drift.
+ */
+export async function listStoreDirtyPaths(
+  paths: Paths,
+  env: NodeJS.ProcessEnv,
+  run?: GitRunner,
+): Promise<string[]> {
+  if (!(await storeIsRepo(paths))) return [];
+  const ctx = gitContext(paths, env, run);
+  const results = await Promise.all([
+    git(ctx, ['diff', '--name-only', '-z', '--']),
+    git(ctx, ['diff', '--cached', '--name-only', '-z', '--']),
+    git(ctx, ['ls-files', '--others', '--exclude-standard', '-z', '--']),
+  ]);
+  const failed = results.find((result) => result.code !== 0);
+  if (failed) {
+    throw new Error(`agentenv: could not inspect store drift (${firstLine(failed.stderr)})`);
+  }
+  return [...new Set(results.flatMap((result) => nulSeparatedPaths(result.stdout)))]
+    .map((path) => resolve(paths.store, path));
+}
+
 /** The current branch (works even on an unborn branch with no commits). */
 async function currentBranch(ctx: GitContext): Promise<string> {
   const res = await git(ctx, ['branch', '--show-current']);

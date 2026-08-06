@@ -10,6 +10,7 @@ import {
 } from './commands/store-sync.js';
 import { recoverPendingFilesystemBundles } from './filesystem-bundle.js';
 import { recoverPendingGlobalCommands } from './global-command.js';
+import { rebaseInProgress } from './git.js';
 import { resolvePaths } from './paths.js';
 import { recoverPendingStagedCommands } from './staged-command.js';
 import { getVersion } from './version.js';
@@ -92,6 +93,9 @@ export async function run(
 
   const paths = resolvePaths(env);
   const recoveryCommands = new Set(['__shim', 'doctor', 'migrate', 'resolve', 'status']);
+  const resolvingHeldSyncConflict = command.name === 'sync' &&
+    (rest[1] === '--resolve' || rest[1] === '--abort') &&
+    await rebaseInProgress(paths);
   const recoveryNotices: string[] = [];
   if (!recoveryCommands.has(command.name)) {
     if (await migrationGateClosed(paths)) {
@@ -112,40 +116,45 @@ export async function run(
     // any normal invocation can settle it before doing unrelated work. `status`
     // and `doctor` remain observational/explicit recovery surfaces and therefore
     // intentionally report the pending intent instead.
-    await recoverPendingRemoteReplacements(paths, env, options.gitRun);
-    await recoverPendingGlobalCommands(paths);
-    let manifest = await readState(paths);
-    const pendingStaged = manifest.commands.find(
-      (plan) => (plan as typeof plan & { executor?: unknown }).executor === 'staged-command',
-    );
-    if (pendingStaged) {
-      const gitBookkeeping = pendingStaged.commitPoint && pendingStaged.gitRequired
-        ? pendingStaged.gitSteps && pendingStaged.gitSteps.length > 0
-          ? () => commitRequiredSteps(
-              { paths, env, options: { ...options, globals } },
-              pendingStaged.gitSteps!,
-              recoveryNotices,
-              pendingStaged.transactionId,
-            )
-          : undefined
-        : undefined;
-      await recoverPendingStagedCommands(paths, gitBookkeeping, pendingStaged.transactionId);
-      manifest = await readState(paths);
-    }
-    const pendingBundle = manifest.commands.find(
-      (plan) => plan.kind === 'filesystem-bundle',
-    );
-    if (pendingBundle) {
-      const gitBookkeeping = pendingBundle.commitPoint
-        ? pendingBundle.gitRequired && pendingBundle.gitMessage
-          ? () => commitRequiredMutation(
-              { paths, env, options: { ...options, globals } },
-              pendingBundle.gitMessage!,
-              recoveryNotices,
-            )
-          : undefined
-        : undefined;
-      await recoverPendingFilesystemBundles(paths, gitBookkeeping, pendingBundle.transactionId);
+    // A held rebase must be resolved or aborted before post-commit WAL recovery
+    // can touch Git. Let those two explicit sync modes through; the pending command
+    // remains durable and is resumed by the next ordinary invocation.
+    if (!resolvingHeldSyncConflict) {
+      await recoverPendingRemoteReplacements(paths, env, options.gitRun);
+      await recoverPendingGlobalCommands(paths);
+      let manifest = await readState(paths);
+      const pendingStaged = manifest.commands.find(
+        (plan) => (plan as typeof plan & { executor?: unknown }).executor === 'staged-command',
+      );
+      if (pendingStaged) {
+        const gitBookkeeping = pendingStaged.commitPoint && pendingStaged.gitRequired
+          ? pendingStaged.gitSteps && pendingStaged.gitSteps.length > 0
+            ? () => commitRequiredSteps(
+                { paths, env, options: { ...options, globals } },
+                pendingStaged.gitSteps!,
+                recoveryNotices,
+                pendingStaged.transactionId,
+              )
+            : undefined
+          : undefined;
+        await recoverPendingStagedCommands(paths, gitBookkeeping, pendingStaged.transactionId);
+        manifest = await readState(paths);
+      }
+      const pendingBundle = manifest.commands.find(
+        (plan) => plan.kind === 'filesystem-bundle',
+      );
+      if (pendingBundle) {
+        const gitBookkeeping = pendingBundle.commitPoint
+          ? pendingBundle.gitRequired && pendingBundle.gitMessage
+            ? () => commitRequiredMutation(
+                { paths, env, options: { ...options, globals } },
+                pendingBundle.gitMessage!,
+                recoveryNotices,
+              )
+            : undefined
+          : undefined;
+        await recoverPendingFilesystemBundles(paths, gitBookkeeping, pendingBundle.transactionId);
+      }
     }
   }
 
@@ -158,8 +167,11 @@ export async function run(
   };
   let result: RunResult;
   const readOnlyPersistenceCommands = new Set(['list', 'show', 'status']);
+  const pendingCommandForObservation = command.name === 'status' &&
+    (await readState(paths)).commands.length > 0;
   const servicePersistence =
     readOnlyPersistenceCommands.has(command.name) &&
+    !pendingCommandForObservation &&
     !(await migrationGateClosed(paths)) &&
     !(await legacyMigrationRequired(paths));
   try {

@@ -14,6 +14,7 @@ import {
   closeStoreSync,
   commitRequiredSteps,
   openStoreSync,
+  PendingCommandError,
   withNotices,
 } from './store-sync.js';
 
@@ -80,7 +81,17 @@ export const rmCommand: Command = {
     // make the subsequent deletion-only commit look safe while losing those bytes.
     const notices: string[] = [];
     const syncCtx = { paths, env, options };
-    const before = await openStoreSync(syncCtx, notices);
+    let before;
+    try {
+      before = await openStoreSync(syncCtx, notices);
+    } catch (error) {
+      if (!(error instanceof PendingCommandError)) throw error;
+      return withNotices({
+        stdout: '',
+        stderr: `rm: refusing to remove '${name}' while store drift remains uncommitted\n`,
+        code: 1,
+      }, notices);
+    }
     if (before.driftCommitBlocked) {
       return withNotices({
         stdout: '',

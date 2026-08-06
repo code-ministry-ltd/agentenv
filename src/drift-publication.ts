@@ -3,12 +3,14 @@ import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { PlannedGitStep } from './command-plan.js';
 import { planDriftSweep, type DriftSweepRequest, type DriftSweepResult } from './drift.js';
+import { listStoreDirtyPaths, type GitRunner } from './git.js';
 import { recoverState } from './journal.js';
 import { withLock } from './lock.js';
 import { publishWithPendingNotice } from './commands/staged-publication.js';
 
 export interface PublishDriftSweepRequest extends DriftSweepRequest {
   notices: string[];
+  gitRun?: GitRunner;
   gitBookkeeping?: (
     steps: readonly PlannedGitStep[],
     transactionId: string,
@@ -32,15 +34,19 @@ export async function publishDriftSweep(
   const transactionId = `drift-${randomUUID()}`;
   const stagingRoot = join(req.paths.live, 'commands', transactionId);
   const planned = await planDriftSweep(req, stagingRoot);
-  if (planned.entries.length === 0 && !planned.statePatch) {
+  const gitPaths = [...new Set([
+    ...planned.gitPaths,
+    ...await listStoreDirtyPaths(req.paths, req.env, req.gitRun),
+  ])];
+  if (planned.entries.length === 0 && !planned.statePatch && gitPaths.length === 0) {
     await rm(stagingRoot, { recursive: true, force: true });
     return { result: planned.result, publication: 'no-change' };
   }
-  const gitSteps = planned.gitPaths.length > 0
+  const gitSteps = gitPaths.length > 0
     ? [{
         id: 'sync-drift',
         message: 'agentenv: sync drift',
-        paths: planned.gitPaths,
+        paths: gitPaths,
       }]
     : [];
   const publication = await publishWithPendingNotice({
