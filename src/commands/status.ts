@@ -119,6 +119,19 @@ async function lifecycleSection(ctx: CommandContext): Promise<string[]> {
   for (const command of commands) {
     const git = command.gitRequired ? ', Git required' : '';
     lines.push(`  command ${command.transactionId}: ${command.phase} (${command.kind}${git})`);
+    const affected = [...new Set(command.operations.map((operation) => operation.path).filter(
+      (path): path is string => typeof path === 'string',
+    ))];
+    for (const path of affected) lines.push(`    affects: ${path}`);
+    for (const step of command.gitSteps ?? []) {
+      lines.push(
+        `    Git ${step.id}: ${step.status ?? 'pending'}` +
+          (step.commitId ? ` (${step.commitId.slice(0, 12)})` : ''),
+      );
+    }
+    lines.push(
+      `    next: agentenv resolve command ${command.transactionId} --retry`,
+    );
   }
   for (const generation of generations) {
     lines.push(

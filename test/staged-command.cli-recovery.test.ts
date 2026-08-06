@@ -103,6 +103,12 @@ describe('staged command central CLI recovery', () => {
       },
     })).rejects.toThrow(/Git failure/);
 
+    const status = await run(['status'], { env: home.env });
+    expect(status.stdout).toContain('resolve-edit');
+    expect(status.stdout).toContain(target);
+    expect(status.stdout).toContain('Git edit: pending');
+    expect(status.stdout).toContain('agentenv resolve command resolve-edit --retry');
+
     const result = await run(['resolve', 'command', 'resolve-edit', '--retry'], { env: home.env });
     expect(result.code, `${result.stdout}${result.stderr ?? ''}`).toBe(0);
     expect(result.stdout).toContain("Completed retained command 'resolve-edit'");
