@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { access, cp, mkdir, readFile, readdir, rm } from 'node:fs/promises';
-import { dirname, join, relative, sep } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { parseEnvConfig } from './env-config.js';
 import { writeFileAtomic } from './fs-atomic.js';
 import type { Paths } from './paths.js';
@@ -546,8 +546,18 @@ export async function scanRevisionRangeForSecrets(
  * validatePulledStore} / {@link scanStoreForSecrets}) — a pulled remote tree is
  * shared input, so every file of it is suspect.
  */
-async function scanStagedForSecrets(ctx: GitContext, paths: Paths): Promise<SecretFinding[]> {
-  const listed = await git(ctx, ['diff', '--cached', '--name-only', '-z']);
+async function scanStagedForSecrets(
+  ctx: GitContext,
+  paths: Paths,
+  relativePathspecs: readonly string[] = [],
+): Promise<SecretFinding[]> {
+  const listed = await git(ctx, [
+    'diff',
+    '--cached',
+    '--name-only',
+    '-z',
+    ...(relativePathspecs.length > 0 ? ['--', ...relativePathspecs] : []),
+  ]);
   const names = listed.stdout.split('\0').filter((n) => n !== '');
   const findings: SecretFinding[] = [];
   for (const rel of names) {
@@ -1152,6 +1162,57 @@ export async function commitStore(
 
   const identity = await resolveGitIdentity(ctx);
   const res = await git(ctx, [...commitArgs(identity), 'commit', '-m', message, '--no-verify']);
+  if (res.code !== 0) {
+    throw new Error(`agentenv: git commit failed (${firstLine(res.stderr)})`);
+  }
+  return { status: 'committed' };
+}
+
+/** Commit exactly the declared store paths while preserving unrelated dirty or
+ * staged content. Repeating the same completed step is a `nothing` no-op, which
+ * makes post-commit command-WAL recovery idempotent. */
+export async function commitStorePaths(
+  paths: Paths,
+  env: NodeJS.ProcessEnv,
+  message: string,
+  absolutePaths: readonly string[],
+  run?: GitRunner,
+): Promise<CommitResult> {
+  if (!(await storeIsRepo(paths))) return { status: 'no-repo' };
+  if (await rebaseInProgress(paths)) return { status: 'rebase-in-progress' };
+  const store = resolve(paths.store);
+  const relativePaths = absolutePaths.map((path) => {
+    const rel = relative(store, resolve(path));
+    if (rel === '' || rel === '..' || rel.startsWith(`..${sep}`) || rel.startsWith(sep)) {
+      throw new Error(`declared Git path is outside the canonical store: ${path}`);
+    }
+    return rel.split(sep).join('/');
+  });
+  if (relativePaths.length === 0) throw new Error('at least one scoped Git path is required');
+  const unique = [...new Set(relativePaths)];
+  const ctx = gitContext(paths, env, run);
+
+  await git(ctx, ['add', '-A', '--', ...unique]);
+  const staged = await git(ctx, ['diff', '--cached', '--name-only', '--', ...unique]);
+  if (staged.stdout.trim() === '') return { status: 'nothing' };
+
+  const findings = await scanStagedForSecrets(ctx, paths, unique);
+  if (findings.length > 0) {
+    await git(ctx, ['reset', '--', ...unique]);
+    return { status: 'blocked', findings };
+  }
+
+  const identity = await resolveGitIdentity(ctx);
+  const res = await git(ctx, [
+    ...commitArgs(identity),
+    'commit',
+    '--only',
+    '-m',
+    message,
+    '--no-verify',
+    '--',
+    ...unique,
+  ]);
   if (res.code !== 0) {
     throw new Error(`agentenv: git commit failed (${firstLine(res.stderr)})`);
   }

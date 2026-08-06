@@ -58,4 +58,22 @@ describe('whole-command plan automaton', () => {
     expect(() => advanceOperation(value, 'write', 'applied')).toThrow(/pending.*applied/i);
     expect(() => advanceOperation(value, 'missing', 'applying')).toThrow(/unknown operation/i);
   });
+
+  it('rejects ambiguous or incomplete durable Git steps', () => {
+    expect(() => createCommandPlan({
+      transactionId: 'bad-git',
+      kind: 'test',
+      gitSteps: [
+        { id: 'same', message: 'first', paths: ['/store/first'] },
+        { id: 'same', message: 'second', paths: ['/store/second'] },
+      ],
+      operations: [],
+    })).toThrow(/Git step ids.*unique/i);
+    expect(() => createCommandPlan({
+      transactionId: 'bad-paths',
+      kind: 'test',
+      gitSteps: [{ id: 'empty', message: 'message', paths: [] }],
+      operations: [],
+    })).toThrow(/Git step.*path/i);
+  });
 });

@@ -4,12 +4,14 @@ import type { Command, CommandContext, RunResult } from '../command.js';
 import { reconcileRetiredGlobalCows } from '../global-cow.js';
 import { recoverPendingFilesystemBundles } from '../filesystem-bundle.js';
 import { withLock } from '../lock.js';
+import { recoverPendingStagedCommands } from '../staged-command.js';
 import { resolveRetainedCandidate } from '../sync.js';
 import { resumeSessionGenerationSweep } from '../session/generations.js';
 import { readState, writeState } from '../state.js';
 import {
   closeStoreSync,
   commitRequiredMutation,
+  commitRequiredSteps,
   inScopeAdapters,
   withNotices,
 } from './store-sync.js';
@@ -90,23 +92,43 @@ async function resolveWholeCommand(ctx: CommandContext, id: string, rest: readon
     (command) => command.transactionId === id,
   );
   if (!pending) return fail(`resolve command: unknown command '${id}'\n`);
-  if (pending.kind !== 'filesystem-bundle' || !pending.gitRequired || !pending.gitMessage) {
+  const executor = (pending as typeof pending & { executor?: unknown }).executor;
+  const staged = executor === 'staged-command';
+  const legacyBundle = pending.kind === 'filesystem-bundle';
+  if (!staged && (!legacyBundle || !pending.gitRequired || !pending.gitMessage)) {
     return fail(
       `resolve command: '${id}' requires its domain-specific resolver; retained intent was unchanged\n`,
     );
   }
+  if (staged && pending.commitPoint && pending.gitRequired && !pending.gitSteps?.length) {
+    return fail(
+      `resolve command: '${id}' has no persisted Git steps; retained intent was unchanged\n`,
+    );
+  }
   const notices: string[] = [];
   try {
-    await recoverPendingFilesystemBundles(
-      ctx.paths,
-      () =>
-        commitRequiredMutation(
-          { paths: ctx.paths, env: ctx.env, options: ctx.options },
-          pending.gitMessage!,
-          notices,
-        ),
-      id,
-    );
+    if (staged) {
+      const gitBookkeeping = pending.commitPoint && pending.gitRequired
+        ? () =>
+            commitRequiredSteps(
+              { paths: ctx.paths, env: ctx.env, options: ctx.options },
+              pending.gitSteps!,
+              notices,
+            )
+        : undefined;
+      await recoverPendingStagedCommands(ctx.paths, gitBookkeeping, id);
+    } else {
+      await recoverPendingFilesystemBundles(
+        ctx.paths,
+        () =>
+          commitRequiredMutation(
+            { paths: ctx.paths, env: ctx.env, options: ctx.options },
+            pending.gitMessage!,
+            notices,
+          ),
+        id,
+      );
+    }
   } catch (error) {
     return fail(`resolve command: ${(error as Error).message}; retained intent remains\n`);
   }

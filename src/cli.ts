@@ -3,12 +3,14 @@ import { commands, findCommand } from './commands/index.js';
 import {
   closeStoreSync,
   commitRequiredMutation,
+  commitRequiredSteps,
   openStoreSync,
   withNotices,
 } from './commands/store-sync.js';
 import { recoverPendingFilesystemBundles } from './filesystem-bundle.js';
 import { recoverPendingGlobalCommands } from './global-command.js';
 import { resolvePaths } from './paths.js';
+import { recoverPendingStagedCommands } from './staged-command.js';
 import { getVersion } from './version.js';
 import { legacyMigrationRequired, migrationGateClosed } from './migration.js';
 import { recoverPendingRemoteReplacements } from './remote-transaction.js';
@@ -111,7 +113,24 @@ export async function run(
     // intentionally report the pending intent instead.
     await recoverPendingRemoteReplacements(paths, env, options.gitRun);
     await recoverPendingGlobalCommands(paths);
-    const pendingBundle = (await readState(paths)).commands.find(
+    let manifest = await readState(paths);
+    const pendingStaged = manifest.commands.find(
+      (plan) => (plan as typeof plan & { executor?: unknown }).executor === 'staged-command',
+    );
+    if (pendingStaged) {
+      const gitBookkeeping = pendingStaged.commitPoint && pendingStaged.gitRequired
+        ? pendingStaged.gitSteps && pendingStaged.gitSteps.length > 0
+          ? () => commitRequiredSteps(
+              { paths, env, options: { ...options, globals } },
+              pendingStaged.gitSteps!,
+              recoveryNotices,
+            )
+          : undefined
+        : undefined;
+      await recoverPendingStagedCommands(paths, gitBookkeeping, pendingStaged.transactionId);
+      manifest = await readState(paths);
+    }
+    const pendingBundle = manifest.commands.find(
       (plan) => plan.kind === 'filesystem-bundle',
     );
     if (pendingBundle) {

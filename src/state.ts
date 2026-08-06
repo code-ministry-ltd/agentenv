@@ -269,6 +269,22 @@ function validateCommand(record: Record<string, unknown>, label: string): string
   if (record.gitMessage !== undefined && typeof record.gitMessage !== 'string') {
     return `${label}.gitMessage must be string`;
   }
+  if (record.gitSteps !== undefined) {
+    if (!Array.isArray(record.gitSteps)) return `${label}.gitSteps must be an array`;
+    const stepIds = new Set<string>();
+    for (const step of record.gitSteps) {
+      if (
+        !isObject(step) ||
+        requireString(step, 'id', `${label}.gitSteps`) ||
+        requireString(step, 'message', `${label}.gitSteps`) ||
+        !isNonEmptyStringArray(step.paths) ||
+        stepIds.has(step.id as string)
+      ) {
+        return `${label}.gitSteps contains an invalid step`;
+      }
+      stepIds.add(step.id as string);
+    }
+  }
   if (!COMMAND_PHASES.has(record.phase as string)) return `${label}.phase is invalid`;
   if (typeof record.commitPoint !== 'boolean') return `${label}.commitPoint must be boolean`;
   if (!Array.isArray(record.operations)) return `${label}.operations must be an array`;

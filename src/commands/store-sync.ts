@@ -1,7 +1,13 @@
 import { adapters as realAdapters } from '../adapters/index.js';
 import type { Adapter } from '../adapter.js';
+import type { PlannedGitStep } from '../command-plan.js';
 import type { RunOptions, RunResult } from '../command.js';
-import { type CommitResult, commitStore, describeFindings } from '../git.js';
+import {
+  type CommitResult,
+  commitStore,
+  commitStorePaths,
+  describeFindings,
+} from '../git.js';
 import { collectLifecycleGarbage } from '../lifecycle-gc.js';
 import type { Paths } from '../paths.js';
 import { beginStoreSync, endStoreSync, type SyncBeforeResult } from '../sync.js';
@@ -67,6 +73,27 @@ export async function commitRequiredMutation(
   noteBlockedCommit(result, notices);
   if (result.status === 'blocked' || result.status === 'rebase-in-progress') {
     throw new Error(`required Git bookkeeping is '${result.status}'`);
+  }
+}
+
+/** Execute persisted, ordered, path-scoped commits for command-WAL recovery. */
+export async function commitRequiredSteps(
+  ctx: SyncCtx,
+  steps: readonly PlannedGitStep[],
+  notices: string[],
+): Promise<void> {
+  for (const step of steps) {
+    const result = await commitStorePaths(
+      ctx.paths,
+      ctx.env,
+      step.message,
+      step.paths,
+      ctx.options.gitRun,
+    );
+    noteBlockedCommit(result, notices);
+    if (result.status === 'blocked' || result.status === 'rebase-in-progress') {
+      throw new Error(`required Git bookkeeping '${step.id}' is '${result.status}'`);
+    }
   }
 }
 

@@ -24,6 +24,13 @@ export interface PlannedOperation extends PlannedOperationInput {
   state: OperationState;
 }
 
+/** One idempotent path-scoped Git commit required after the local commit point. */
+export interface PlannedGitStep {
+  id: string;
+  message: string;
+  paths: string[];
+}
+
 export interface CommandPlan {
   schemaVersion: 2;
   transactionId: string;
@@ -32,6 +39,8 @@ export interface CommandPlan {
   gitRequired: boolean;
   /** Exact local commit subject for generic retryable content mutations. */
   gitMessage?: string;
+  /** Ordered path-scoped commits; Git/worktree state makes completed steps idempotent. */
+  gitSteps?: PlannedGitStep[];
   phase: CommandPhase;
   commitPoint: boolean;
   operations: PlannedOperation[];
@@ -42,6 +51,7 @@ export interface CreateCommandPlanInput {
   kind: string;
   gitRequired?: boolean;
   gitMessage?: string;
+  gitSteps?: readonly PlannedGitStep[];
   operations: PlannedOperationInput[];
 }
 
@@ -55,12 +65,24 @@ export function createCommandPlan(input: CreateCommandPlanInput): CommandPlan {
     }
     ids.add(operation.id);
   }
+  const gitStepIds = new Set<string>();
+  for (const step of input.gitSteps ?? []) {
+    if (!step.id || gitStepIds.has(step.id)) {
+      throw new Error(`Git step ids must be non-empty and unique: '${step.id}'`);
+    }
+    if (!step.message.trim()) throw new Error(`Git step '${step.id}' requires a commit message`);
+    if (step.paths.length === 0 || step.paths.some((path) => !path)) {
+      throw new Error(`Git step '${step.id}' requires at least one non-empty path`);
+    }
+    gitStepIds.add(step.id);
+  }
   return {
     schemaVersion: 2,
     transactionId: input.transactionId,
     kind: input.kind,
     gitRequired: input.gitRequired ?? false,
     ...(input.gitMessage ? { gitMessage: input.gitMessage } : {}),
+    ...(input.gitSteps ? { gitSteps: input.gitSteps.map((step) => ({ ...step, paths: [...step.paths] })) } : {}),
     phase: 'planned',
     commitPoint: false,
     operations: input.operations.map((operation) => ({ ...operation, state: 'pending' })),
