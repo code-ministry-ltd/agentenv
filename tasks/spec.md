@@ -1,261 +1,269 @@
 ---
 type: specification
 project: agentenv
-change: complete-command-transaction-boundaries
-created: 2026-08-03
-status: implemented
-depends_on: docs/MERGE_STATUS.md
-frozen_code_revision: 3813baa
-implementation_revision: e70feff
-verified: 2026-08-06
-governing_requirements: MR-003 through MR-006 from the reviewed merge specification
+change: local-environment-ui-v1
+created: 2026-08-06
+status: approved
+approved: 2026-08-06
+project_facts: docs/DEVELOPMENT.md
+depends_on: tasks/archive/complete-command-transaction-boundaries.md
 ---
 
-# Complete the remaining command transaction boundaries
+# Local environment browser and skill editor — version one
 
-## Assumptions
+## Approved assumptions
 
-1. Work continues from frozen code revision `3813baa` on
-   `merge/agentenv-v2`; this specification does not reopen the base or donor
-   decision.
-2. The original merge specification remains authoritative. This document narrows
-   the remaining work needed for MR-003 through MR-006 and their crash-matrix
-   success criteria; it does not relax them.
-3. Existing CLI syntax, prompts, output, adoption commit-message granularity,
-   offline behaviour, and no-clobber semantics remain user contracts.
-4. The schema-2 command WAL, typed backups, path identities, quarantine records,
-   and local-commit-before-Git ordering are the foundation to extend, not replace.
-5. A legacy focused journal may be used to render a private staged result or to
-   recover an old interrupted operation. It may not be the durability boundary
-   for a new in-scope command on actual store, state, or harness paths.
-6. Planning may create private staging data, typed backups, and durable intent.
-   It may not change a canonical store path, owned harness surface, machine state
-   domain record, Git index/ref, or project file before the complete plan exists.
-7. No new runtime dependency, daemon, or background service is required.
+1. The product is a single-user local web application launched by `agentenv ui`,
+   not Electron, a hosted service, or a remotely accessible server.
+2. It binds only to loopback, uses per-launch request authentication plus
+   origin/CSRF defenses, and opens the user's default browser unless told not to.
+3. The web and CLI surfaces share one application layer. The UI never writes the
+   store directly or reimplements transaction, validation, Git, or recovery rules.
+4. All five content kinds are browsable and transferable: skills, instructions,
+   MCP servers, agents, and commands. Only `SKILL.md` has a rich editor in v1.
+5. Copy and move operate on one named element at a time and transfer the complete
+   element atomically. Collisions require explicit cancel or overwrite; there is
+   no merge mode.
+6. Skill Git provenance is preserved by copy and move. Resulting copies update
+   independently from the same recorded source.
+7. Users can create, clone, and delete environments. Existing active-environment
+   deletion refusals remain authoritative.
+8. Git import accepts the source formats and configured Git authentication already
+   supported by agentenv. It browses skills inside a supplied repository; it is
+   not GitHub-wide search, OAuth, or a public catalogue.
+9. External changes are detected at publication time and shown as conflicts.
+   Filesystem watching and collaborative multi-tab editing are out of scope.
+10. The approved UI stack is React 19, TypeScript, Vite 8, and CodeMirror 6,
+    bundled into the npm-format artifact and served by the Node process. Playwright
+    1.61 is the browser-test target. Exact packages are lockfile-pinned.
+
+Project-wide runtime, structure, command, style, and testing conventions are in
+[`docs/DEVELOPMENT.md`](../docs/DEVELOPMENT.md).
 
 ## Objective
 
-Make every remaining maintenance and environment-content workflow atomic at the
-user-command boundary. Before its first real effect, a command must durably name
-all affected paths and state changes, their expected pre/post identities, undo or
-rescue material, and required Git bookkeeping. A crash must then either restore
-the exact pre-command state or finish an already committed command without losing
-or overwriting a third identity.
+Give a local agentenv user a safe, approachable way to browse and organise their
+environments without requiring routine shell or filesystem work. Version one
+must make the common content-management loop complete: launch the UI; understand
+what each environment contains; create, clone, or delete environments; copy or
+move content between them; edit and validate skill Markdown; and discover and
+import selected skills from a Git source.
 
-This closes the known release blocker recorded in
-[`docs/MERGE_STATUS.md`](../docs/MERGE_STATUS.md). It is for users who expect
-agentenv to preserve concurrent harness writes and unowned configuration even
-when the CLI, host, or Git process dies at the worst possible boundary.
+The UI is an additional interface to agentenv, not a second implementation. Every
+mutation must retain the command-level atomicity, no-clobber guarantees, Git
+provenance, secret protections, and recovery behavior already provided by the CLI.
 
-## Required behaviour
+## Required behavior
 
-### CT-001 — One reusable actual-path transaction boundary
+### UI-001 — Local launch and security boundary
 
-- Extend the schema-2 command plan so every in-scope mutation is reconstructible
-  from durable data in a fresh process; recovery must not depend on closures or
-  re-running discovery against changed inputs.
-- A plan records a stable transaction ID and kind plus an ordered operation for
-  every store, surface, state-domain, inventory, retained-data, and Git effect.
-- Every filesystem operation records path, typed pre/post identity, undo reference,
-  and the existing `pending → applying → applied → undoing → undone` states.
-- State-domain application must preserve the command record that is driving it;
-  replacing `state.json` wholesale and thereby deleting the WAL is forbidden.
-- The command-level commit point occurs only after every local filesystem/state
-  effect is applied. Required Git bookkeeping follows it durably; fail-soft push
-  remains last and outside the local atomicity boundary.
-- Central CLI recovery recognizes every new command kind before unrelated mutation.
-  `status`, `doctor`, and `resolve` report or resolve pending commands without
-  disguising them as legacy journals.
+- Add `agentenv ui [--no-open] [--port <port>]`. The default port is allocated by
+  the operating system; `--port` accepts an available non-privileged port for
+  development and automation.
+- Bind to `127.0.0.1` only. Print the URL and open it in the default browser unless
+  `--no-open` is present. Startup failure returns a non-zero result without
+  leaving a listener or temporary credential behind.
+- Generate an unguessable credential for each server lifetime. State-changing API
+  requests require that credential and a valid same-origin request. Reject invalid
+  `Host` and `Origin` headers, unauthenticated requests, unsupported methods, and
+  oversized or malformed bodies with one safe, consistent error shape.
+- Serve only bundled assets and same-origin API responses. Apply a restrictive
+  Content Security Policy and related browser headers; do not use a CDN, execute
+  skill HTML/scripts, expose absolute private paths unnecessarily, or place the
+  launch credential in logs, referrers, or persisted browser storage.
+- SIGINT/SIGTERM and normal shutdown close the listener and clean ephemeral Git/UI
+  state. Read-only HTTP requests never service persistence or mutate agentenv.
 
-### CT-002 — Inert discovery and staging
+### UI-010 — Browse environments and content
 
-- Each workflow separates discovery/classification from application. Discovery
-  produces a complete deterministic post-state in private staging.
-- All prompts, secret classification, format validation, collision checks, and
-  destination selection finish before durable apply begins.
-- Immediately before each destructive effect, revalidate the current identity
-  against the planned pre-identity. A mismatch is a third identity: retain it and
-  stop/roll back according to the command phase; never overwrite it.
-- Staging is retained while a command is recoverable and collected only after the
-  command and required Git bookkeeping complete.
+- Show all environments with description, active/inactive state, and content
+  counts. Selecting one shows named skills, instructions, MCP servers, agents, and
+  commands in separate groups.
+- Each element shows its kind and user-relevant metadata. Git-sourced skills also
+  show repository, repository path, ref, and short commit without exposing
+  credentials embedded in remote configuration.
+- Provide filtering within the selected environment, explicit refresh, and
+  complete loading, empty, stale, unavailable, and error states. Successful
+  mutations refresh the affected views without a full browser reload.
+- On a deterministic fixture containing 100 environments and 1,000 elements, the
+  environment list becomes usable within one second on the supported Node floor.
 
-### CT-010 — Drift write-back
+### UI-020 — Create, clone, and delete environments
 
-- One drift sweep plans all attributable changes across dir-merge copies,
-  file-block sources/refreshes, config-key reconciliation, retained global COW
-  projections, and immutable session generations before changing any actual path.
-- The plan includes canonical writes, safe rendered-surface refreshes, manifest
-  hash/provenance changes, and quarantine outcomes. Ambiguous or concurrently
-  changed projections remain recoverable and uncommitted.
-- Secret placeholders and provenance survive reverse projection; no resolved value
-  may enter staging metadata, WAL data, diagnostics, a diff, or Git history.
-- All canonical drift from the sweep is included in the required local Git
-  bookkeeping. A blocked or failed commit leaves the command `git-pending` and
-  retryable; it does not clear the WAL or silently continue to fetch/promotion.
-- The no-change path creates no command plan, backup, Git commit, or state churn.
+- Create validates a new environment name and optional description and publishes
+  the same valid scaffold as the CLI.
+- Clone requires a source and new name, copies the complete environment including
+  skill provenance, validates the staged result, and publishes it as one
+  recoverable command.
+- Delete names the target prominently, requires the user to type its exact name,
+  and delegates to the existing inactive-environment and retained-data safeguards.
+  Refusal leaves the environment byte-identical and explains how to proceed.
+- A stale identity, validation failure, pending recovery operation, or Git failure
+  is reported without a partial environment or false success indication.
 
-### CT-020 — Capture, adopt, and disown
+### UI-030 — Copy and move content between environments
 
-- Automatic capture classifies the complete inventory and obtains every required
-  confirmation before applying the first adoption. Skipped candidates remain
-  untouched with their existing reason.
-- One capture plan contains every approved source-to-store publication, replacement
-  symlink, ownership record, and inventory update. Manual `adopt` uses the same
-  planner for its selected item.
-- Source and destination identities are checked both during planning and at apply.
-  Foreign-manager symlinks, project paths, `capture.ignore`, invalid shapes,
-  secret-declined content, and unowned destination collisions retain current
-  behaviour.
-- Preserve the existing per-adoption Git history contract. Ordered path-scoped
-  Git steps and their progress must be durable and idempotent so a crash between
-  commits cannot duplicate a commit or absorb unrelated dirty store paths.
-- `disown` plans removal of the managed link/store owner, restoration or explicit
-  placement of content, baseline update, and required Git bookkeeping together.
-  A destination that changes after the prompt is rescued, never overwritten.
+- A user can select one skill, instruction, MCP server, agent, or command and copy
+  or move it to another existing environment.
+- Copy preserves the source and publishes a complete destination. Move publishes
+  destination creation and source removal as one command boundary; a crash cannot
+  leave duplicates or lose the only copy.
+- Skill transfers include the whole skill directory and adjust `env.yaml` source
+  provenance consistently. Copy retains provenance in both environments; move
+  transfers it from source to destination.
+- If the destination name exists, present cancel and overwrite choices with the
+  affected kind, environment, and name. Overwrite is explicit and transactional;
+  no automatic content merge is performed.
+- Revalidate source and destination identities immediately before publication.
+  Concurrent bytes are retained or rejected through existing recovery semantics,
+  never silently overwritten.
 
-### CT-030 — Doctor repair and restore
+### UI-040 — Edit and preview skill Markdown
 
-- `doctor` without a mutation flag remains read-only.
-- `doctor --repair` diagnoses a stable snapshot and builds one plan for every
-  deterministic repair it can safely perform. A problem that cannot be bounded
-  exactly remains reported/quarantined and does not cause a guessed repair.
-- The plan covers dangling-link repair, sourceless ownership removal, bounded
-  marker repair, missing marker reinsertion, config-key reconciliation, rescue
-  records, state changes, and orphaned-backup retirement.
-- Current bytes are retained before every repair that displaces them. Repair must
-  patch only the manifest-owned item/region/key and must never restore an old
-  whole file over unrelated edits.
-- Orphaned backups are moved into recoverable retirement before commit and are
-  collected only after the command is complete; a crash cannot make a still-needed
-  undo reference disappear.
-- `doctor --restore <backup>` is its own one-plan operation. It revalidates the
-  recorded target, retains any current identity, restores the typed backup, and
-  records the rescue/repair outcome atomically.
-- Recovery of an existing legacy journal is a prerequisite operation before new
-  planning. The new doctor command must not open additional focused journals on
-  actual paths.
+- Open a skill's `SKILL.md` in a keyboard-accessible CodeMirror editor with a
+  rendered Markdown preview. Provide source, preview, and split-view modes plus
+  conventional save shortcuts.
+- Validate required frontmatter, skill name/folder agreement, and the existing
+  skill rules while editing. The server repeats authoritative validation before
+  publication. Invalid content remains in the browser as a draft and never
+  changes the canonical skill.
+- Save through a staged, identity-checked command and create the same scoped local
+  Git history as an equivalent CLI content edit. If the file changed since load,
+  refuse the save and offer reload or draft copy; do not overwrite either version.
+- Warn before navigation, environment change, browser refresh, or close when the
+  buffer differs from the loaded identity. A failed request retains the draft and
+  presents a retryable, non-secret error.
+- Markdown preview treats raw HTML as text, cannot execute scripts, uses no remote
+  plugins, and opens permitted links without granting opener access.
 
-### CT-040 — Environment content publication
+### UI-050 — Browse and import skills from Git
 
-- `create` renders or copies the new environment into private staging, validates
-  the complete environment, and publishes it plus required Git bookkeeping through
-  one command plan.
-- Interactive `edit` gives the editor a private staged copy. On successful editor
-  exit, validate the result and publish it through one command plan; on failure or
-  invalid content, leave the canonical file unchanged and retain/report the staged
-  draft when useful for recovery.
-- `rm` publishes a planned absence for the inactive environment. Its pre-command
-  bytes remain available to rollback until the local commit and required Git
-  bookkeeping complete; no direct recursive deletion is allowed.
-- Existing active-environment refusal, confirmations, validation, output, offline
-  behaviour, and commit messages remain unchanged.
-- Existing staged `add` workflows stay on their current whole-command boundary,
-  but their recovery is included in the common startup/status/resolve audit so
-  all content command kinds behave consistently.
+- Accept the existing `owner/repo[/path][@ref]`, Git URL, `file://`, and local
+  repository forms. Under `--offline`, refuse network sources while continuing to
+  support allowed local sources.
+- Fetch into private temporary storage, show immediate progress, discover valid
+  `SKILL.md` directories, and return filterable candidates with name, description,
+  repository path, ref, and commit. Fetch/parse failure changes no environment.
+- Let the user select one or more candidates and import them into one environment.
+  Validate each exact fetched candidate, record current provenance, and use the
+  existing staged publication and per-skill Git history contracts.
+- Existing destinations are unselected by default and require an explicit
+  overwrite decision. Report each installed, skipped, or failed skill accurately;
+  never claim the whole selection succeeded after a partial outcome.
+- Candidate identifiers are opaque and server-issued. Browser requests cannot
+  nominate arbitrary clone paths or substitute content after discovery. Temporary
+  clones expire on completion, server shutdown, or a bounded idle timeout.
 
-### CT-050 — Git and sync ordering
+### UI-060 — Shared application and HTTP contracts
 
-- A required commit stages only the paths declared by the durable plan. Unrelated
-  dirty store content is neither committed nor discarded.
-- The durable plan records enough Git intent and progress to retry after process
-  death without duplicate commits. An already-created intended commit is detected
-  by durable identity, not guessed from a subject line alone.
-- Fetch/candidate integration occurs only after pre-existing drift/adoption has
-  reached its required local Git state. A `git-pending` command blocks unrelated
-  store mutation and gives actionable recovery instructions.
-- Push is attempted once after local completion and remains fail-soft/queued. No
-  harness launch waits for a network pull.
+- Extract or extend reusable application operations for environment inventory,
+  environment lifecycle, element transfer, skill load/save, Git discovery, and
+  Git import. CLI behavior continues to call the same lower-level rules or is
+  migrated to the shared operation where doing so removes duplication without
+  changing output.
+- Define typed request, success, progress, conflict, validation, pending-recovery,
+  and failure shapes. Validate every browser field at the HTTP boundary and every
+  filesystem/Git identity again at the domain boundary.
+- Long Git work must not block browsing or editing. The client displays its phase
+  and ignores stale responses after navigation. Only one mutation affecting the
+  same environment paths may publish at a time; existing locks/WAL remain the
+  source of truth.
+- The UI surfaces safe next actions for pending commands and conflicts but does not
+  implement general `doctor`, `status`, or `resolve` administration in v1.
+
+### UI-070 — Packaging, accessibility, and compatibility
+
+- Vite emits hashed static assets into an isolated directory included by the
+  existing build and package allowlist. Production uses those assets, never the
+  Vite development server. Source maps and development-only files are not shipped
+  unless the release policy explicitly permits them.
+- The installed artifact can run `agentenv ui --no-open`, authenticate a browser,
+  complete the core workflow against a temporary home, and shut down cleanly on
+  macOS and Linux with Node 22.12 or newer.
+- Environment and content navigation, dialogs, Git selection, collision choices,
+  editor controls, validation, and notifications are operable by keyboard, expose
+  programmatic names, preserve visible focus, and do not rely on color alone.
+- Existing CLI commands, JSON output, offline behavior, migration, transactional
+  recovery, adapter behavior, and packed restore smoke remain compatible.
 
 ## Success criteria
 
-All criteria are release blockers for this follow-up.
-
-1. **Plan-before-effect:** instrumentation proves every in-scope command persists
-   its complete ordered plan before the first actual-path, state-domain, or Git
-   mutation. Planning failures leave those domains byte-identical.
-2. **Forward crash matrix:** subprocess tests kill before and after every forward
-   operation transition for drift, multi-item capture, manual adopt, disown,
-   doctor repair/restore, create, edit publication, and rm. Fresh-process recovery
-   restores exact pre-command state before commit or completes after commit.
-3. **Rollback crash matrix:** the same tests kill before and after every undo
-   transition. Recovery is idempotent across repeated deaths and eventually
-   reaches exact pre-state without deleting retained data.
-4. **Third identity:** each workflow is faulted after an external replacement of
-   every destructive target. The replacement bytes/type are present in quarantine
-   or rescue, the command does not clobber them, and diagnostics reveal no secret.
-5. **Whole-sweep drift:** simultaneous drift in all supported mechanisms yields
-   either one locally committed sweep or a complete rollback; no subset reaches
-   canonical state or Git alone.
-6. **Multi-item capture:** two or more approved items adopt as one local command;
-   failures at each item boundary restore all surface/store/state/inventory data.
-   Successful Git history retains the existing per-item commit contract without
-   including unrelated dirty files.
-7. **Doctor:** a fixture containing multiple independently repairable problems is
-   repaired all-or-nothing. Concurrent/unbounded damage is retained and remains
-   actionable. Orphaned backup cleanup cannot break rollback.
-8. **Content:** create, editor success/failure/invalid output, and rm pass staged
-   publication and Git-failure tests. The canonical environment is never partially
-   written or deleted.
-9. **Recovery UX:** `status`, `doctor`, and `resolve` identify every pending new
-   command kind, phase, affected non-secret paths, Git state, and safe next action.
-10. **Compatibility:** all existing CLI golden tests, adapter tests, migration
-    fixtures, candidate tests, global COW late-writer tests, and packed smoke tests
-    remain green without weakening assertions or reclassifying required tests.
-11. **Release matrix:** from a clean checkout on Node >=22.12,
-    `GIT_CONFIG_GLOBAL=/dev/null npm run ci`, `npm run test:offline`,
-    `npm run test:migration`, `npm run smoke:install`,
-    `npm run test:restore:container`, and the documented five-harness
-    `AGENTENV_LIVE=1 npm run test:live` checkpoint are green.
+1. From a packed clean install, `agentenv ui --no-open` prints a loopback URL,
+   rejects unauthenticated/foreign-origin requests, serves the production UI after
+   authentication, and exits cleanly without touching the real home.
+2. A browser test loads 100 environments/1,000 elements within the stated target,
+   filters them, and renders every content kind plus Git provenance correctly.
+3. Browser tests create, clone, and delete an inactive environment; active deletion,
+   invalid names, stale input, and cancelled confirmation change no canonical data.
+4. For each of the five content kinds, copy produces an exact independent
+   destination and move atomically transfers it. Collision cancellation,
+   overwrite, injected failure, and concurrent replacement preserve all bytes.
+5. A skill edit previews safely, validates locally and authoritatively, saves by
+   expected identity, creates scoped Git history, retains invalid/failed drafts,
+   and refuses a stale save without clobbering either version.
+6. Against a local multi-skill Git fixture, the UI discovers candidates, filters
+   and selects several, imports exact validated content with provenance, handles
+   collisions, and reports mixed outcomes truthfully. An unreachable or hostile
+   source changes nothing and leaks no credential or private path.
+7. HTTP contract tests cover auth, Host/Origin/CSRF, body limits, malformed input,
+   method restrictions, path containment, safe error serialization, security
+   headers, and ephemeral candidate expiry.
+8. `npm run lint`, `npm run typecheck`, `npm run test:ui`,
+   `npm run test:ui:e2e`, the full hermetic suite, `npm run smoke:install`, and
+   `npm run test:restore:container` are green from a clean checkout.
 
 ## Boundaries
 
 ### Always
 
-- Write the failing crash/no-clobber test before converting each workflow.
-- Keep each implementation slice independently buildable, testable, and
-  recoverable from both its predecessor and successor states.
-- Reuse typed backup, identity, quarantine, projection, and command-WAL primitives;
-  centralize extensions needed by more than one workflow.
-- Preserve unowned bytes, symlink targets, directory structure, modes, secret
-  placeholders, and unrelated Git changes.
-- Update this specification before implementing a changed decision.
+- Write a failing domain or browser test before implementing each behavior.
+- Keep the HTTP server and React client thin over typed shared operations.
+- Stage, validate, identity-check, and transactionally publish every mutation.
+- Preserve provenance, placeholders, modes, unrelated Git changes, recovery data,
+  and existing CLI behavior.
+- Use temporary homes and local repositories in automated tests; make browser
+  tests deterministic and independent of installed harnesses or hosted services.
+- Keep all production UI assets local, enforce the loopback/authentication boundary,
+  sanitize user-visible errors, and render Markdown without executable HTML.
 
 ### Ask first
 
-- Change any command, option, prompt, output/exit-code contract, commit-message or
-  per-adoption commit granularity.
-- Add a runtime dependency, daemon, network service, schema-major bump, or new
-  release platform claim.
-- Make a currently required persistence path report-only or relax a crash/release
-  criterion.
-- Delete rescue/quarantine/staged recovery data without a proven successor.
+- Add remote/LAN access, user accounts, cloud storage, telemetry, or analytics.
+- Add GitHub OAuth/API integration, repository-wide search, registries, or a public
+  skill catalogue.
+- Change a state/env schema major, CLI output contract, Git commit granularity,
+  deletion safeguard, overwrite policy, or recovery behavior.
+- Add editors for non-skill content, bulk transfer, filesystem watching, merge
+  tools, upstream bulk update, or activation/sync/doctor controls.
+- Add production or browser-test dependencies beyond the approved React 19,
+  Vite 8, CodeMirror 6, safe Markdown renderer, and Playwright stack.
 
 ### Never
 
-- Mutate an actual destination, canonical source, state domain, Git index, or ref
-  while still discovering the command plan.
-- Launch the user's editor against the canonical store file.
-- Clear a plan before required Git bookkeeping succeeds, or continue fetch/promotion
-  past an unresolved `git-pending` command.
-- Use an unscoped `git add -A` to implement path-specific durable bookkeeping.
-- Re-run discovery during rollback, infer ownership from marker-shaped text, restore
-  over a third identity, or force-push.
-- Persist or log a resolved secret in WAL, staging metadata, rescue metadata, Git,
-  status, doctor output, or tests.
+- Trust a browser-supplied absolute path, clone path, object identity, provenance,
+  or authorization decision.
+- Write canonical content directly from an HTTP handler or React component.
+- Bypass a pending WAL, active-environment refusal, secret scan, validation,
+  identity check, backup, quarantine, or path-scoped Git requirement.
+- Execute Markdown HTML/scripts, interpolate Git input into a shell, expose the UI
+  beyond loopback, or persist/log credentials, resolved secrets, launch tokens, or
+  sensitive filesystem paths.
+- Weaken, skip, or delete existing tests to make the UI build pass.
 
 ## Out of scope
 
-- Replacing the already-compliant activation/drop, migration, remote replacement,
-  candidate promotion, global COW, generation publication, or staged `add`
-  architecture except for small shared recovery integrations.
-- Changing adapter behaviour or adding harnesses.
-- New CLI features, secret-management commands, first-class Windows parity, npm
-  publication, or a release tag.
-- Removing legacy state readers or legacy-journal recovery needed by migrations or
-  installations interrupted before this conversion.
+- Remote hosting, multi-user collaboration, mobile-native or Electron packaging.
+- Environment activation/drop/run, sync and remote administration, doctor,
+  recovery resolution, migration, secret management, and harness configuration.
+- Rich editing of instructions, MCP servers, agents, commands, or skill assets.
+- Bulk copy/move, content merging, live filesystem watching, and multi-tab editing.
+- GitHub-wide discovery, OAuth, hosted catalogues, ratings, publishing, pull
+  requests, and automatic upstream-update sweeps.
 
 ## Open questions
 
-There are no blocking product questions. Exact internal module boundaries and the
-schema-2 minor extension used for durable Git-step progress are implementation
-decisions, provided all compatibility and recovery criteria above remain true.
+There are no blocking product questions. The implementation plan must choose the
+internal application-operation boundary, HTTP route layout, launch-token exchange,
+styling approach, and candidate-expiry mechanism within the requirements above.
+Any choice that changes an approved assumption or boundary requires this
+specification to be updated and re-approved before implementation.
