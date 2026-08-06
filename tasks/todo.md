@@ -54,13 +54,17 @@ Install the approved, exact UI/test dependencies and configure TypeScript/Vite s
 browser assets are hashed into `dist/ui-assets/` without clearing Node output.
 Assert package/build behavior before adding product UI behavior.
 
-- [ ] `npm run build` compiles Node and React production outputs in the required
+- [x] `npm run build` compiles Node and React production outputs in the required
   order without source maps or a runtime Vite dependency.
-- [ ] The tarball allowlist includes the generated assets and excludes UI source,
+- [x] The tarball allowlist includes the generated assets and excludes UI source,
   fixtures, and development-only files.
-- [ ] Existing CLI build and typecheck behavior remains green.
+- [x] Existing CLI build and typecheck behavior remains green.
 
 Verification: `npm run build && npm pack --dry-run`
+
+Verified 2026-08-06: focused test (2/2), exact Vite 8.2.1 build, tarball
+contents, zero-vulnerability npm audit, lint, typecheck, and full regression suite
+(148 files, 1,101 tests) passed.
 
 Dependencies: Task 1
 
