@@ -52,9 +52,12 @@ describe('git runner: a black-holing remote is bounded by the timeout (F1)', () 
       join(bin, 'git'),
       [
         '#!/bin/sh',
+        // Emit readiness before starting the background children: under a heavily
+        // parallel suite, spawning the first `sleep` can otherwise delay the shell
+        // before it reaches `echo`.
+        'echo hanging',
         'sleep 30 &',
         'echo "$!" >> "$AGENTENV_TEST_PIDFILE"',
-        'echo hanging',
         'sleep 30 &',
         'echo "$!" >> "$AGENTENV_TEST_PIDFILE"',
         'wait',
@@ -72,7 +75,10 @@ describe('git runner: a black-holing remote is bounded by the timeout (F1)', () 
     const started = Date.now();
     const d = deadline(5_000);
     const race = await Promise.race([
-      defaultGitRunner(['fetch', 'origin'], { cwd: work, env, timeoutMs: 500 }),
+      // Leave enough startup budget for this subprocess to be scheduled while the
+      // full Vitest suite is running in parallel. The independent <3 s assertion
+      // below still proves the runner's hard bound.
+      defaultGitRunner(['fetch', 'origin'], { cwd: work, env, timeoutMs: 1_500 }),
       d.promise,
     ]);
     d.cancel();
