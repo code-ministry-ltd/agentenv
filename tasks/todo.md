@@ -31,13 +31,16 @@ Define browser-neutral branded IDs, discriminated content/operation/result types
 bounded pagination primitives, opaque revisions, and the single error envelope.
 Start with contract tests for JSON shape and exhaustive union handling.
 
-- [ ] Contract types import no Node-only module and distinguish every identifier
+- [x] Contract types import no Node-only module and distinguish every identifier
   and content kind at compile time.
-- [ ] Error, pagination, progress, conflict, and validation results have stable,
+- [x] Error, pagination, progress, conflict, and validation results have stable,
   serializable shapes matching UI-060.
-- [ ] Contract tests fail before the definitions exist and pass afterward.
+- [x] Contract tests fail before the definitions exist and pass afterward.
 
 Verification: `npx vitest run test/ui-contract.test.ts`
+
+Verified 2026-08-06: focused test (4/4), typecheck, lint, build, and full
+regression suite (147 files, 1,099 tests) passed.
 
 Dependencies: none
 
