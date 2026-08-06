@@ -205,6 +205,10 @@ async function handleApi(
       return;
     }
   }
+  if (pathname === '/api/session/verify' && request.method === 'POST') {
+    sendJson(response, 200, { data: { ready: true } });
+    return;
+  }
   sendError(response, 'NOT_FOUND', 'The requested API resource was not found.');
 }
 

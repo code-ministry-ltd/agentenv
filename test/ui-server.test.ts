@@ -100,6 +100,17 @@ describe('local UI server', () => {
     });
     expect(missingCsrf.status).toBe(403);
 
+    const verified = await fetch(`${server.origin}/api/session/verify`, {
+      method: 'POST',
+      headers: {
+        cookie: cookie!,
+        origin: server.origin,
+        'x-agentenv-csrf': payload.data.csrfToken,
+      },
+    });
+    expect(verified.status).toBe(200);
+    expect(await verified.json()).toEqual({ data: { ready: true } });
+
     const authenticated = await fetch(`${server.origin}/api/not-yet-implemented`, {
       method: 'POST',
       headers: {

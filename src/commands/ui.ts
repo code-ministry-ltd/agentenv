@@ -64,7 +64,7 @@ export const uiCommand: Command = {
   name: 'ui',
   usage: '[--no-open] [--port <port>]',
   summary: 'Browse and edit environments in a local web app',
-  hidden: true,
+  hidden: false,
 
   async run({ args, options }) {
     const parsed = parseUiArguments(args);

@@ -105,14 +105,21 @@ Implement fragment credential exchange, immediate fragment removal, in-memory
 CSRF handling, session refresh, the initial accessible React shell, safe fetch
 adapter, and the Playwright production-server harness.
 
-- [ ] The page exchanges the fragment once, removes it, and makes subsequent API
+- [x] The page exchanges the fragment once, removes it, and makes subsequent API
   calls with the session cookie and mutation CSRF header.
-- [ ] Refresh works through the authenticated session and invalid/expired launch
+- [x] Refresh works through the authenticated session and invalid/expired launch
   credentials reveal no application data.
-- [ ] Playwright launches the production build and proves authentication, shell
+- [x] Playwright launches the production build and proves authentication, shell
   rendering, security headers, and clean shutdown.
 
 Verification: `npm run test:ui:e2e -- --grep "authenticates the local UI"`
+
+Verified 2026-08-06: Playwright 1.61.1 production CLI flow passed in Chromium,
+including fragment removal, HttpOnly/in-memory credential containment, session
+refresh, CSRF mutation, replay refusal, keyboard focus, zero console problems,
+and 320/768/1024/1440 layouts. Focused UI tests (16/16), lint, all three
+typechecks, build, zero-vulnerability npm audit, packed isolated launch, and full
+regression suite (150 files, 1,111 tests) passed.
 
 Dependencies: Task 3
 
@@ -123,9 +130,11 @@ Size: M
 
 ### Checkpoint A — Secure packaged foundation
 
-- [ ] `npm run lint && npm run typecheck && npm run build && npm test`
-- [ ] `npm run test:ui:e2e -- --grep "authenticates the local UI"`
-- [ ] A packed isolated install starts and stops without reading the real home.
+- [x] `npm run lint && npm run typecheck && npm run build && npm test`
+- [x] `npm run test:ui:e2e -- --grep "authenticates the local UI"`
+- [x] A packed isolated install starts and stops without reading the real home.
+
+Checkpoint A passed 2026-08-06.
 
 ## Phase 2 — Browse environments and content
 

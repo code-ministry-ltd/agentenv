@@ -37,11 +37,11 @@ describe('agentenv ui command', () => {
     };
   }
 
-  it('registers the command but hides it until browser authentication is complete', async () => {
+  it('advertises the command after browser authentication is complete', async () => {
     const result = await run(['--help'], { env: temp.env });
 
-    expect(findCommand('ui')).toMatchObject({ name: 'ui', hidden: true });
-    expect(result.stdout).not.toContain('ui [--no-open] [--port <port>]');
+    expect(findCommand('ui')).toMatchObject({ name: 'ui', hidden: false });
+    expect(result.stdout).toContain('ui [--no-open] [--port <port>]');
   });
 
   it('starts on the requested non-privileged port without opening when asked', async () => {

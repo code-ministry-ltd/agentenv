@@ -6,5 +6,6 @@
     "declarationMap": false,
     "rootDir": "."
   },
-  "include": ["src", "test"]
+  "include": ["src", "test"],
+  "exclude": ["test/*.e2e.test.ts", "test/ui-global-setup.ts"]
 }
