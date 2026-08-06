@@ -1,9 +1,22 @@
-import { cp, mkdir, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { access, cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { parseArgs } from '../args.js';
 import type { Command, RunResult } from '../command.js';
-import { scaffoldEnvYaml } from '../env-config.js';
-import { ensureStore, environmentExists, validateEnvName } from '../store.js';
-import { withNotices, withStoreSync } from './store-sync.js';
+import { parseEnvConfig, scaffoldEnvYaml } from '../env-config.js';
+import { capturePathIdentity, identitiesEqual } from '../path-identity.js';
+import { environmentExists, STORE_README, validateEnvName } from '../store.js';
+import { commandIsPending, publishWithPendingNotice } from './staged-publication.js';
+import {
+  closeStoreSync,
+  commitRequiredSteps,
+  openStoreSync,
+  withNotices,
+} from './store-sync.js';
+
+async function exists(path: string): Promise<boolean> {
+  return access(path).then(() => true, () => false);
+}
 
 export const createCommand: Command = {
   name: 'create',
@@ -32,8 +45,6 @@ export const createCommand: Command = {
       return { stdout: '', stderr: `create: ${nameError}\n`, code: 1 };
     }
 
-    await ensureStore(paths);
-
     if (await environmentExists(paths, name)) {
       return { stdout: '', stderr: `create: environment '${name}' already exists\n`, code: 1 };
     }
@@ -49,17 +60,73 @@ export const createCommand: Command = {
       }
     }
 
-    // Store mutation inside the git-sync lifecycle (pull → create → commit → push).
     const notices: string[] = [];
-    await withStoreSync({ paths, env, options }, notices, async () => {
+    const syncCtx = { paths, env, options };
+    await openStoreSync(syncCtx, notices);
+    if (await environmentExists(paths, name)) {
+      await closeStoreSync(syncCtx, notices);
+      return withNotices(
+        { stdout: '', stderr: `create: environment '${name}' already exists\n`, code: 1 },
+        notices,
+      );
+    }
+
+    const transactionId = `create-${name}-${randomUUID()}`;
+    const stagingRoot = join(paths.live, 'commands', transactionId);
+    const stagedEnv = join(stagingRoot, 'environment');
+    const targetIdentity = await capturePathIdentity(paths.envDir(name));
+    try {
       if (from !== undefined) {
-        await cp(paths.envDir(from), paths.envDir(name), { recursive: true });
-        return `agentenv: create env ${name} (from ${from})`;
+        const sourceBefore = await capturePathIdentity(paths.envDir(from));
+        await cp(paths.envDir(from), stagedEnv, { recursive: true });
+        const sourceAfter = await capturePathIdentity(paths.envDir(from));
+        if (!identitiesEqual(sourceBefore, sourceAfter)) {
+          throw new Error(`source environment '${from}' changed while being copied`);
+        }
+      } else {
+        await mkdir(stagedEnv, { recursive: true });
+        await writeFile(join(stagedEnv, 'env.yaml'), scaffoldEnvYaml({ description: '' }), 'utf8');
       }
-      await mkdir(paths.envDir(name), { recursive: true });
-      await writeFile(paths.envYaml(name), scaffoldEnvYaml({ description: '' }), 'utf8');
-      return `agentenv: create env ${name}`;
-    });
+      parseEnvConfig(await readFile(join(stagedEnv, 'env.yaml'), 'utf8'), join(stagedEnv, 'env.yaml'));
+
+      const entries = [{
+        id: 'environment',
+        target: paths.envDir(name),
+        staged: stagedEnv,
+        expectedPreIdentity: targetIdentity,
+      }];
+      if (!(await exists(paths.storeReadme))) {
+        const stagedReadme = join(stagingRoot, 'README.md');
+        await writeFile(stagedReadme, STORE_README, 'utf8');
+        entries.push({
+          id: 'store-readme',
+          target: paths.storeReadme,
+          staged: stagedReadme,
+          expectedPreIdentity: { kind: 'absent' },
+        });
+      }
+      const message = from !== undefined
+        ? `agentenv: create env ${name} (from ${from})`
+        : `agentenv: create env ${name}`;
+      const gitSteps = [{ id: 'create-environment', message, paths: entries.map((entry) => entry.target) }];
+      const publication = await publishWithPendingNotice({
+        paths,
+        transactionId,
+        kind: 'environment-create',
+        stagingRoot,
+        allowedRoots: [paths.store],
+        entries,
+        gitSteps,
+        gitBookkeeping: () => commitRequiredSteps(syncCtx, gitSteps, notices),
+      }, notices);
+      if (publication === 'complete') await closeStoreSync(syncCtx, notices);
+    } catch (error) {
+      if (!(await commandIsPending(paths, transactionId))) {
+        await rm(stagingRoot, { recursive: true, force: true });
+      }
+      await closeStoreSync(syncCtx, notices);
+      return withNotices({ stdout: '', stderr: `create: ${(error as Error).message}\n`, code: 1 }, notices);
+    }
 
     const stdout =
       from !== undefined

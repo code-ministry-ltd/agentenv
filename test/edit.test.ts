@@ -31,7 +31,7 @@ describe('edit', () => {
     expect(launched).toBe(false);
   });
 
-  it('launches $EDITOR against the env.yaml path', async () => {
+  it('launches $EDITOR against a private staged env.yaml path', async () => {
     await run(['create', 'writing'], { env: tmp.env });
     let call: { command: string; args: readonly string[] } | undefined;
     const result = await run(['edit', 'writing'], {
@@ -43,7 +43,8 @@ describe('edit', () => {
     });
     expect(result.code).toBe(0);
     expect(call?.command).toBe('nano');
-    expect(call?.args).toContain(envYaml('writing'));
+    expect(call?.args).not.toContain(envYaml('writing'));
+    expect(call?.args.at(-1)).toContain(join(tmp.home, 'live', 'commands'));
   });
 
   it('prefers $VISUAL over $EDITOR and passes editor flags through', async () => {
@@ -57,7 +58,8 @@ describe('edit', () => {
       },
     });
     expect(call?.command).toBe('code');
-    expect(call?.args).toEqual(['-w', envYaml('writing')]);
+    expect(call?.args[0]).toBe('-w');
+    expect(call?.args[1]).toContain(join(tmp.home, 'live', 'commands'));
   });
 
   it('prints the path and a hint when no editor is configured', async () => {

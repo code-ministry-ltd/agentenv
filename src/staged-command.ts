@@ -19,6 +19,8 @@ export interface StagedCommandEntry {
   id: string;
   target: string;
   staged: string;
+  /** Identity observed during discovery, before prompts or private editing. */
+  expectedPreIdentity?: PathIdentity;
 }
 
 export interface PublishStagedCommandRequest {
@@ -246,6 +248,9 @@ export async function publishStagedCommand(req: PublishStagedCommandRequest): Pr
   }> = [];
   for (const entry of req.entries) {
     const beforeBackup = await capturePathIdentity(entry.target);
+    if (entry.expectedPreIdentity && !identitiesEqual(beforeBackup, entry.expectedPreIdentity)) {
+      throw new Error(`staged command target changed since planning: ${entry.target}`);
+    }
     const undo = await backup(req.paths, entry.target);
     const pre = await capturePathIdentity(entry.target);
     if (!identitiesEqual(beforeBackup, pre)) {

@@ -1,12 +1,21 @@
-import { rm as removeDir } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, rm } from 'node:fs/promises';
+import { join } from 'node:path';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext } from '../command.js';
 import { readGlobalStack } from '../engine.js';
 import { confirmDefault } from '../prompt.js';
 import { readSessionRegistry } from '../session/registry.js';
+import { capturePathIdentity } from '../path-identity.js';
 import { readState } from '../state.js';
 import { environmentExists, validateEnvName } from '../store.js';
-import { closeStoreSync, commitMutation, openStoreSync, withNotices } from './store-sync.js';
+import { commandIsPending, publishWithPendingNotice } from './staged-publication.js';
+import {
+  closeStoreSync,
+  commitRequiredSteps,
+  openStoreSync,
+  withNotices,
+} from './store-sync.js';
 
 export const rmCommand: Command = {
   name: 'rm',
@@ -57,6 +66,7 @@ export const rmCommand: Command = {
     }
 
     const confirm = ctx.options.confirm ?? confirmDefault;
+    const expectedPreIdentity = await capturePathIdentity(paths.envDir(name));
     const confirmed = await confirm(`Remove environment '${name}'? This cannot be undone. [y/N] `);
     if (!confirmed) {
       return {
@@ -78,9 +88,43 @@ export const rmCommand: Command = {
         code: 1,
       }, notices);
     }
-    await removeDir(paths.envDir(name), { recursive: true, force: true });
-    await commitMutation(syncCtx, `agentenv: remove env ${name}`, notices);
-    await closeStoreSync(syncCtx, notices);
+    const transactionId = `remove-${name}-${randomUUID()}`;
+    const stagingRoot = join(paths.live, 'commands', transactionId);
+    await mkdir(stagingRoot, { recursive: true });
+    const missingStagedPath = join(stagingRoot, 'absent');
+    const gitSteps = [{
+      id: 'remove-environment',
+      message: `agentenv: remove env ${name}`,
+      paths: [paths.envDir(name)],
+    }];
+    try {
+      const publication = await publishWithPendingNotice({
+        paths,
+        transactionId,
+        kind: 'environment-remove',
+        stagingRoot,
+        allowedRoots: [paths.store],
+        entries: [{
+          id: 'environment',
+          target: paths.envDir(name),
+          staged: missingStagedPath,
+          expectedPreIdentity,
+        }],
+        gitSteps,
+        gitBookkeeping: () => commitRequiredSteps(syncCtx, gitSteps, notices),
+      }, notices);
+      if (publication === 'complete') await closeStoreSync(syncCtx, notices);
+    } catch (error) {
+      if (!(await commandIsPending(paths, transactionId))) {
+        await rm(stagingRoot, { recursive: true, force: true });
+      }
+      await closeStoreSync(syncCtx, notices);
+      return withNotices({
+        stdout: '',
+        stderr: `rm: ${(error as Error).message}\n`,
+        code: 1,
+      }, notices);
+    }
     return withNotices({ stdout: `Removed environment '${name}'.\n`, code: 0 }, notices);
   },
 };

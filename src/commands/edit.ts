@@ -1,8 +1,19 @@
+import { randomUUID } from 'node:crypto';
+import { cp, mkdir, readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { parseArgs } from '../args.js';
 import type { Command, RunResult } from '../command.js';
 import { launchEditorDefault } from '../editor.js';
+import { parseEnvConfig } from '../env-config.js';
+import { capturePathIdentity } from '../path-identity.js';
 import { environmentExists, validateEnvName } from '../store.js';
-import { closeStoreSync, commitMutation, openStoreSync, withNotices } from './store-sync.js';
+import { publishWithPendingNotice } from './staged-publication.js';
+import {
+  closeStoreSync,
+  commitRequiredSteps,
+  openStoreSync,
+  withNotices,
+} from './store-sync.js';
 
 function configuredEditor(env: NodeJS.ProcessEnv): string | undefined {
   const visual = env.VISUAL?.trim();
@@ -57,22 +68,70 @@ export const editCommand: Command = {
       };
     }
 
-    // Pull-on-invoke BEFORE the editor runs, so the user edits the freshest store;
-    // the editor's change is then committed under its own message (not swept as
-    // drift), and one push runs at the end.
     const notices: string[] = [];
     const ctx = { paths, env, options };
     await openStoreSync(ctx, notices);
+    if (!(await environmentExists(paths, name))) {
+      await closeStoreSync(ctx, notices);
+      return withNotices(
+        { stdout: '', stderr: `edit: environment '${name}' does not exist\n`, code: 1 },
+        notices,
+      );
+    }
+    const expectedPreIdentity = await capturePathIdentity(file);
+    const transactionId = `edit-${name}-${randomUUID()}`;
+    const stagingRoot = join(paths.live, 'commands', transactionId);
+    const draft = join(stagingRoot, 'env.yaml');
+    await mkdir(stagingRoot, { recursive: true });
+    await cp(file, draft);
 
     const launch = options.launchEditor ?? launchEditorDefault;
-    const exitCode = await launch(command, [...editorArgs, file]);
+    const exitCode = await launch(command, [...editorArgs, draft]);
     if (exitCode !== 0) {
       await closeStoreSync(ctx, notices);
-      return withNotices({ stdout: '', stderr: `edit: editor exited with code ${exitCode}\n`, code: exitCode }, notices);
+      return withNotices({
+        stdout: '',
+        stderr: `edit: editor exited with code ${exitCode}; draft retained at ${draft}\n`,
+        code: exitCode,
+      }, notices);
     }
 
-    await commitMutation(ctx, `agentenv: edit env ${name}`, notices);
-    await closeStoreSync(ctx, notices);
+    try {
+      parseEnvConfig(await readFile(draft, 'utf8'), draft);
+    } catch (error) {
+      await closeStoreSync(ctx, notices);
+      return withNotices({
+        stdout: '',
+        stderr: `edit: ${(error as Error).message}; draft retained at ${draft}\n`,
+        code: 1,
+      }, notices);
+    }
+
+    const gitSteps = [{
+      id: 'edit-environment',
+      message: `agentenv: edit env ${name}`,
+      paths: [file],
+    }];
+    try {
+      const publication = await publishWithPendingNotice({
+        paths,
+        transactionId,
+        kind: 'environment-edit',
+        stagingRoot,
+        allowedRoots: [paths.store],
+        entries: [{ id: 'env-yaml', target: file, staged: draft, expectedPreIdentity }],
+        gitSteps,
+        gitBookkeeping: () => commitRequiredSteps(ctx, gitSteps, notices),
+      }, notices);
+      if (publication === 'complete') await closeStoreSync(ctx, notices);
+    } catch (error) {
+      await closeStoreSync(ctx, notices);
+      return withNotices({
+        stdout: '',
+        stderr: `edit: ${(error as Error).message}; draft retained at ${draft}\n`,
+        code: 1,
+      }, notices);
+    }
     return withNotices({ stdout: '', code: 0 }, notices);
   },
 };
