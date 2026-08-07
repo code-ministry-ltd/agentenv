@@ -9,6 +9,8 @@ import type { ContentTransferRuntime } from '../application/content-transfer-run
 import {
   readSkillDocument,
   type ReadSkillDocumentResult,
+  saveSkillDocument,
+  type SaveSkillDocumentResult,
 } from '../application/skill-document.js';
 import {
   cloneEnvironment,
@@ -51,6 +53,8 @@ import {
   type EnvironmentLifecycleSuccess,
   type EnvironmentName,
   type Revision,
+  type SaveSkillDocumentRequest,
+  type SaveSkillDocumentSuccess,
 } from './contract.js';
 import { UI_CONTENT_KINDS } from './contract.js';
 import { createUiContentTransferRuntime } from './content-transfer-runtime.js';
@@ -58,6 +62,7 @@ import {
   createUiEnvironmentDeleteRuntime,
   createUiEnvironmentLifecycleRuntime,
 } from './environment-lifecycle-runtime.js';
+import { createUiSkillDocumentRuntime } from './skill-document-runtime.js';
 
 export interface UiRouteResult {
   status: number;
@@ -74,9 +79,11 @@ export interface UiRouteDependencies {
   createEnvironmentDeleteRuntime(paths: Paths): EnvironmentDeleteRuntime;
   createEnvironmentLifecycleRuntime(paths: Paths): EnvironmentLifecycleRuntime;
   createContentTransferRuntime(paths: Paths): ContentTransferRuntime;
+  createSkillDocumentRuntime(paths: Paths): ContentTransferRuntime;
   getEnvironmentInventory: typeof getEnvironmentInventory;
   listEnvironmentSummaries: typeof listEnvironmentSummaries;
   readSkillDocument: typeof readSkillDocument;
+  saveSkillDocument: typeof saveSkillDocument;
 }
 
 export type UiRouteDependencyOverrides = Partial<UiRouteDependencies>;
@@ -97,6 +104,9 @@ const DEFAULT_ROUTE_DEPENDENCIES: UiRouteDependencies = {
   getEnvironmentInventory,
   listEnvironmentSummaries,
   readSkillDocument,
+  saveSkillDocument,
+  createSkillDocumentRuntime: (paths) =>
+    createUiSkillDocumentRuntime({ paths, env: process.env }),
 };
 
 function skillDocumentRouteResult(result: ReadSkillDocumentResult): UiRouteResult {
@@ -115,6 +125,84 @@ function skillDocumentRouteResult(result: ReadSkillDocumentResult): UiRouteResul
       );
     case 'failure':
       return errorResult('INTERNAL_ERROR', 'The skill document could not be loaded.');
+  }
+}
+
+function malformedSkillSave(): UiRouteResult {
+  return errorResult('MALFORMED_REQUEST', 'The skill document save request is malformed.');
+}
+
+function parseSkillSaveRequest(
+  value: Record<string, unknown> | undefined,
+  environment: string,
+  skill: string,
+): { ok: true; request: SaveSkillDocumentRequest } | { ok: false; result: UiRouteResult } {
+  if (
+    value === undefined ||
+    !exactKeys(value, ['environment', 'expectedRevision', 'skill', 'text']) ||
+    typeof value.environment !== 'string' ||
+    typeof value.skill !== 'string' ||
+    typeof value.text !== 'string' ||
+    !isRevision(value.expectedRevision)
+  ) {
+    return { ok: false, result: malformedSkillSave() };
+  }
+  if (
+    validateEnvName(value.environment) !== null ||
+    validateSkillName(value.skill) !== null ||
+    value.environment !== environment ||
+    value.skill !== skill
+  ) {
+    return { ok: false, result: malformedSkillSave() };
+  }
+  return { ok: true, request: value as unknown as SaveSkillDocumentRequest };
+}
+
+function skillSaveRouteResult(
+  request: SaveSkillDocumentRequest,
+  result: SaveSkillDocumentResult,
+): UiRouteResult {
+  switch (result.status) {
+    case 'saved':
+    case 'git-pending': {
+      const data: SaveSkillDocumentSuccess = {
+        environment: request.environment,
+        skill: request.skill,
+        publication: result.publication,
+        refreshRequired: result.refreshRequired,
+        ...(result.document === undefined ? {} : { document: result.document }),
+      };
+      return { status: 200, body: { data } };
+    }
+    case 'validation':
+      return errorResult('VALIDATION_FAILED', 'The skill document is invalid.', {
+        kind: 'validation',
+        issues: result.issues.map((issue) => ({
+          path: issue.field,
+          code: issue.code,
+          message: issue.message,
+          ...(issue.line === undefined ? {} : { line: issue.line }),
+        })),
+      });
+    case 'invalid':
+      return malformedSkillSave();
+    case 'not-found':
+    case 'unsafe':
+      return errorResult('NOT_FOUND', 'The skill document was not found.');
+    case 'stale':
+      return errorResult(
+        'STALE_REVISION',
+        'The skill document changed after it was loaded.',
+        { kind: 'conflict', resource: request.skill },
+      );
+    case 'pending-recovery':
+      return errorResult(
+        'PENDING_RECOVERY',
+        'Another operation requires recovery before this skill can be saved.',
+        pendingRecoveryDetails(result.transactionId, false),
+      );
+    case 'failure':
+      return errorResult('INTERNAL_ERROR', 'The skill document could not be saved.');
   }
 }
 
@@ -754,7 +842,7 @@ export async function handleUiRoute(
   const skillDocumentMatch =
     /^\/api\/environments\/([^/]+)\/skills\/([^/]+)\/document$/.exec(url.pathname);
   if (skillDocumentMatch !== null) {
-    if (request.method !== 'GET') {
+    if (request.method !== 'GET' && request.method !== 'PUT') {
       return errorResult('METHOD_NOT_ALLOWED', 'The request method is not supported.');
     }
     if ([...url.searchParams.keys()].length > 0) {
@@ -771,11 +859,27 @@ export async function handleUiRoute(
     if (validateEnvName(environment) !== null || validateSkillName(skill) !== null) {
       return errorResult('MALFORMED_REQUEST', 'The skill document locator is malformed.');
     }
-    return skillDocumentRouteResult(await dependencies.readSkillDocument({
-      paths,
-      environment,
-      skill,
-    }));
+    if (request.method === 'GET') {
+      return skillDocumentRouteResult(await dependencies.readSkillDocument({
+        paths,
+        environment,
+        skill,
+      }));
+    }
+    const parsed = parseSkillSaveRequest(requestBody, environment, skill);
+    if (!parsed.ok) return parsed.result;
+    try {
+      return skillSaveRouteResult(parsed.request, await dependencies.saveSkillDocument({
+        paths,
+        environment: parsed.request.environment,
+        skill: parsed.request.skill,
+        text: parsed.request.text,
+        expectedRevision: parsed.request.expectedRevision,
+        runtime: dependencies.createSkillDocumentRuntime(paths),
+      }));
+    } catch {
+      return errorResult('INTERNAL_ERROR', 'The skill document could not be saved.');
+    }
   }
   if (url.pathname === '/api/content/transfer') {
     if (request.method !== 'POST') {

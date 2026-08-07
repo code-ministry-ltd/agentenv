@@ -195,6 +195,21 @@ export interface SkillDocument {
   revision: Revision;
 }
 
+export interface SaveSkillDocumentRequest {
+  environment: EnvironmentName;
+  skill: ContentName;
+  text: string;
+  expectedRevision: Revision;
+}
+
+export interface SaveSkillDocumentSuccess {
+  environment: EnvironmentName;
+  skill: ContentName;
+  publication: 'complete' | 'git-pending';
+  refreshRequired: boolean;
+  document?: SkillDocument;
+}
+
 export const API_ERROR_STATUS = {
   MALFORMED_REQUEST: 400,
   UNAUTHENTICATED: 401,
@@ -215,7 +230,9 @@ export type ApiErrorCode = keyof typeof API_ERROR_STATUS;
 
 export interface ValidationIssue {
   path?: string;
+  code?: string;
   message: string;
+  line?: number;
 }
 
 export type ApiErrorDetails =

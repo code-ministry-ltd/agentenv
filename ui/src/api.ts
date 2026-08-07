@@ -17,6 +17,8 @@ import {
   type CopyContentSuccess,
   type TransferOperation,
   type SkillDocument,
+  type SaveSkillDocumentRequest,
+  type SaveSkillDocumentSuccess,
 } from '../../src/ui/contract.js';
 
 interface SessionData {
@@ -148,6 +150,20 @@ export async function getSkillDocument(
   return await apiRequest<SkillDocument>(
     `/api/environments/${encodeURIComponent(environment)}/skills/${encodeURIComponent(skill)}/document`,
     { signal },
+  );
+}
+
+export async function saveSkillDocument(
+  request: SaveSkillDocumentRequest,
+  signal?: AbortSignal,
+): Promise<SaveSkillDocumentSuccess> {
+  return await apiRequest<SaveSkillDocumentSuccess>(
+    `/api/environments/${encodeURIComponent(request.environment)}/skills/${encodeURIComponent(request.skill)}/document`,
+    {
+      method: 'PUT',
+      body: JSON.stringify(request),
+      signal,
+    },
   );
 }
 

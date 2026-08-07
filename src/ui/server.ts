@@ -14,6 +14,7 @@ import {
   createUiEnvironmentLifecycleRuntime,
 } from './environment-lifecycle-runtime.js';
 import { createUiContentTransferRuntime } from './content-transfer-runtime.js';
+import { createUiSkillDocumentRuntime } from './skill-document-runtime.js';
 import {
   applyBrowserSecurityHeaders,
   createUiSecurityState,
@@ -228,8 +229,10 @@ async function handleApi(
   }
   let requestBody: Record<string, unknown> | undefined;
   if (
-    (pathname === '/api/environments' || pathname === '/api/content/transfer') &&
-    request.method === 'POST'
+    ((pathname === '/api/environments' || pathname === '/api/content/transfer') &&
+      request.method === 'POST') ||
+    (/^\/api\/environments\/[^/]+\/skills\/[^/]+\/document$/.test(pathname) &&
+      request.method === 'PUT')
   ) {
     const body = await readJsonBody(request);
     if (!body.ok) {
@@ -283,6 +286,12 @@ export async function startUiServer(
       }),
     createEnvironmentLifecycleRuntime: (runtimePaths) =>
       createUiEnvironmentLifecycleRuntime({
+        paths: runtimePaths,
+        env: runtimeEnv,
+        ...(options.runOptions === undefined ? {} : { runOptions: options.runOptions }),
+      }),
+    createSkillDocumentRuntime: (runtimePaths) =>
+      createUiSkillDocumentRuntime({
         paths: runtimePaths,
         env: runtimeEnv,
         ...(options.runOptions === undefined ? {} : { runOptions: options.runOptions }),

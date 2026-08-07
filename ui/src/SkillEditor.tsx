@@ -1,10 +1,11 @@
-import { Compartment, EditorState, Transaction } from '@codemirror/state';
+import { Compartment, EditorState, Prec, Transaction } from '@codemirror/state';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { markdown } from '@codemirror/lang-markdown';
 import { EditorView, keymap, lineNumbers } from '@codemirror/view';
-import { useEffect, useRef, useState } from 'react';
-import type { Revision, SkillDocument } from '../../src/ui/contract.js';
-import { getSkillDocument, UiApiError } from './api.js';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { parse as parseYaml } from 'yaml';
+import type { Revision, SkillDocument, ValidationIssue } from '../../src/ui/contract.js';
+import { getSkillDocument, saveSkillDocument, UiApiError } from './api.js';
 
 type WorkspaceMode = 'source' | 'preview' | 'split';
 
@@ -25,34 +26,60 @@ type DocumentState =
       pendingDocument?: SkillDocument;
     };
 
+type SaveState =
+  | { status: 'idle' }
+  | { status: 'submitting' }
+  | { status: 'validation'; issues: readonly ValidationIssue[] }
+  | { status: 'stale' }
+  | { status: 'failure'; message: string }
+  | { status: 'saved'; publication: 'complete' | 'git-pending'; refreshRequired: boolean };
+
 function CodeMirrorEditor({
   identity,
   layout,
   value,
   onChange,
+  canSave,
+  onSave,
 }: {
   identity: string;
   layout: WorkspaceMode;
   value: string;
   onChange(value: string): void;
+  canSave: boolean;
+  onSave(): void;
 }): React.JSX.Element {
   const parentRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | undefined>(undefined);
   const configurationRef = useRef<Compartment | undefined>(undefined);
+  const saveKeymapRef = useRef<Compartment | undefined>(undefined);
   const onChangeRef = useRef(onChange);
+  const onSaveRef = useRef(onSave);
+  const canSaveRef = useRef(canSave);
   onChangeRef.current = onChange;
+  onSaveRef.current = onSave;
+  canSaveRef.current = canSave;
 
   useEffect(() => {
     const parent = parentRef.current;
     if (parent === null) return;
     const configuration = new Compartment();
+    const saveKeymap = new Compartment();
     configurationRef.current = configuration;
+    saveKeymapRef.current = saveKeymap;
     const state = EditorState.create({
       doc: value,
       extensions: [
         lineNumbers(),
         history(),
         markdown(),
+        saveKeymap.of(Prec.high(keymap.of([{
+          key: 'Mod-s',
+          run() {
+            if (canSaveRef.current) onSaveRef.current();
+            return true;
+          },
+        }]))),
         keymap.of([...defaultKeymap, ...historyKeymap]),
         EditorView.lineWrapping,
         EditorView.updateListener.of((update) => {
@@ -70,6 +97,7 @@ function CodeMirrorEditor({
     return () => {
       viewRef.current = undefined;
       configurationRef.current = undefined;
+      saveKeymapRef.current = undefined;
       view.destroy();
     };
     // A different document identity receives a fresh undo history and focus.
@@ -90,6 +118,21 @@ function CodeMirrorEditor({
       view.focus();
     }
   }, [layout]);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    const saveKeymap = saveKeymapRef.current;
+    if (view === undefined || saveKeymap === undefined) return;
+    view.dispatch({
+      effects: saveKeymap.reconfigure(Prec.high(keymap.of([{
+        key: 'Mod-s',
+        run() {
+          if (canSaveRef.current) onSaveRef.current();
+          return true;
+        },
+      }]))),
+    });
+  }, [canSave, onSave]);
 
   useEffect(() => {
     const view = viewRef.current;
@@ -116,6 +159,49 @@ const MODES: readonly { mode: WorkspaceMode; label: string }[] = [
   { mode: 'preview', label: 'Preview' },
   { mode: 'split', label: 'Split' },
 ];
+
+function localValidation(skill: string, text: string): readonly ValidationIssue[] {
+  const block = /^\uFEFF?---\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(text);
+  if (block === null) {
+    return [{
+      path: 'frontmatter',
+      code: 'invalid-frontmatter',
+      message: 'SKILL.md must start with valid YAML frontmatter.',
+      line: 1,
+    }];
+  }
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(block[1] ?? '');
+  } catch {
+    return [{
+      path: 'frontmatter',
+      code: 'invalid-frontmatter',
+      message: 'SKILL.md must start with valid YAML frontmatter.',
+      line: 1,
+    }];
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return [{
+      path: 'frontmatter',
+      code: 'invalid-frontmatter',
+      message: 'SKILL.md must start with valid YAML frontmatter.',
+      line: 1,
+    }];
+  }
+  const name = (parsed as Record<string, unknown>).name;
+  if (typeof name !== 'string' || name === '') {
+    return [{ path: 'name', code: 'missing-name', message: 'Frontmatter must include a name.' }];
+  }
+  if (name !== skill) {
+    return [{
+      path: 'name',
+      code: 'name-mismatch',
+      message: 'The frontmatter name must match the skill folder name.',
+    }];
+  }
+  return [];
+}
 
 function ModeTabs({
   mode,
@@ -211,9 +297,19 @@ export function SkillEditor({
   const [request, setRequest] = useState(0);
   const [mode, setMode] = useState<WorkspaceMode>('source');
   const [state, setState] = useState<DocumentState>({ status: 'loading' });
+  const [saveState, setSaveState] = useState<SaveState>({ status: 'idle' });
+  const [copyNotice, setCopyNotice] = useState<string>();
   const headingRef = useRef<HTMLHeadingElement>(null);
   const stateRef = useRef(state);
+  const saveSequenceRef = useRef(0);
+  const submittingRef = useRef(false);
+  const mountedRef = useRef(true);
   stateRef.current = state;
+
+  useEffect(() => () => {
+    mountedRef.current = false;
+    saveSequenceRef.current += 1;
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -294,6 +390,12 @@ export function SkillEditor({
       ? { document: state.document, draft: state.draft }
       : undefined;
   const updateDraft = (draft: string): void => {
+    setCopyNotice(undefined);
+    setSaveState((current) =>
+      current.status === 'validation' || current.status === 'failure' ||
+      (current.status === 'saved' && current.publication === 'complete')
+        ? { status: 'idle' }
+        : current);
     setState((current) => {
       if (current.status === 'ready' || current.status === 'refreshing') {
         if (draft === current.document.text && current.pendingDocument !== undefined) {
@@ -321,6 +423,126 @@ export function SkillEditor({
   const editorIdentity = retained === undefined
     ? undefined
     : `${retained.document.environment}/${retained.document.skill}@${retained.document.revision}`;
+  const dirty = retained !== undefined && retained.draft !== retained.document.text;
+  const canSave = state.status === 'ready' && dirty &&
+    saveState.status !== 'submitting' && saveState.status !== 'stale' &&
+    !(saveState.status === 'saved' && (
+      saveState.publication === 'git-pending' || saveState.refreshRequired
+    ));
+
+  const performSave = useCallback((): void => {
+    const current = stateRef.current;
+    if (
+      submittingRef.current ||
+      current.status !== 'ready' ||
+      current.draft === current.document.text
+    ) return;
+    const issues = localValidation(skill, current.draft);
+    if (issues.length > 0) {
+      setSaveState({ status: 'validation', issues });
+      return;
+    }
+    const submittedText = current.draft;
+    const submittedRevision = current.document.revision;
+    const sequence = ++saveSequenceRef.current;
+    submittingRef.current = true;
+    setCopyNotice(undefined);
+    setSaveState({ status: 'submitting' });
+    void saveSkillDocument({
+      environment: current.document.environment,
+      skill: current.document.skill,
+      text: submittedText,
+      expectedRevision: submittedRevision,
+    }).then(
+      (result) => {
+        if (!mountedRef.current || sequence !== saveSequenceRef.current) return;
+        const saved = result.document;
+        setState((latest) => {
+          if (
+            latest.status !== 'ready' ||
+            latest.document.revision !== submittedRevision
+          ) return latest;
+          const document = saved !== undefined &&
+            saved.environment === environment &&
+            saved.skill === skill &&
+            saved.text === submittedText
+            ? saved
+            : { ...latest.document, text: submittedText };
+          return {
+            status: 'ready',
+            document,
+            draft: latest.draft,
+          };
+        });
+        setSaveState({
+          status: 'saved',
+          publication: result.publication,
+          refreshRequired: result.refreshRequired || saved === undefined,
+        });
+      },
+      (error: unknown) => {
+        if (!mountedRef.current || sequence !== saveSequenceRef.current) return;
+        if (
+          error instanceof UiApiError &&
+          error.code === 'VALIDATION_FAILED' &&
+          error.details?.kind === 'validation'
+        ) {
+          setSaveState({ status: 'validation', issues: error.details.issues });
+        } else if (error instanceof UiApiError && error.code === 'STALE_REVISION') {
+          setSaveState({ status: 'stale' });
+        } else if (error instanceof UiApiError && error.code === 'PENDING_RECOVERY') {
+          setSaveState({
+            status: 'failure',
+            message: 'Required local recovery must finish before this draft can be saved.',
+          });
+        } else {
+          setSaveState({
+            status: 'failure',
+            message: 'The save request failed. Your draft has been retained.',
+          });
+        }
+      },
+    ).finally(() => {
+      if (sequence === saveSequenceRef.current) submittingRef.current = false;
+    });
+  }, [environment, skill]);
+
+  const reloadLatest = useCallback((): void => {
+    const current = stateRef.current;
+    if (
+      current.status !== 'ready' ||
+      !window.confirm('Discard this local draft and reload the latest saved document?')
+    ) return;
+    const sequence = ++saveSequenceRef.current;
+    submittingRef.current = true;
+    setCopyNotice(undefined);
+    setSaveState({ status: 'submitting' });
+    void getSkillDocument(environment, skill).then(
+      (document) => {
+        if (!mountedRef.current || sequence !== saveSequenceRef.current) return;
+        setState({ status: 'ready', document, draft: document.text });
+        setSaveState({ status: 'idle' });
+      },
+      () => {
+        if (!mountedRef.current || sequence !== saveSequenceRef.current) return;
+        setSaveState({
+          status: 'failure',
+          message: 'The latest document could not be loaded. Your draft has been retained.',
+        });
+      },
+    ).finally(() => {
+      if (sequence === saveSequenceRef.current) submittingRef.current = false;
+    });
+  }, [environment, skill]);
+
+  const copyDraft = useCallback((): void => {
+    const current = stateRef.current;
+    if (current.status !== 'ready') return;
+    void navigator.clipboard.writeText(current.draft).then(
+      () => setCopyNotice('Draft copied to the clipboard. The saved document was not changed.'),
+      () => setCopyNotice('The draft could not be copied. It remains in the editor.'),
+    );
+  }, []);
 
   return (
     <section className="skill-editor" aria-labelledby="skill-editor-title">
@@ -335,10 +557,24 @@ export function SkillEditor({
           )}
         </div>
         <div className="skill-editor-actions">
-          <button disabled type="button" title="Saving will be available in the next editing step">
-            Save unavailable
+          <button
+            disabled={!canSave}
+            type="button"
+            onClick={performSave}
+            title={canSave ? 'Save skill document (Ctrl or Command+S)' : 'Save is available for a changed, ready document'}
+          >
+            {saveState.status === 'submitting'
+              ? 'Saving skill document…'
+              : canSave
+                ? 'Save skill document'
+                : 'Save unavailable'}
           </button>
-          <button className="button-secondary" type="button" onClick={onClose}>
+          <button
+            className="button-secondary"
+            disabled={saveState.status === 'submitting'}
+            type="button"
+            onClick={onClose}
+          >
             Close workspace
           </button>
         </div>
@@ -361,6 +597,45 @@ export function SkillEditor({
       {state.status === 'ready' && state.notice !== undefined ? (
         <div className="skill-editor-message" role="status">{state.notice}</div>
       ) : null}
+      {saveState.status === 'validation' ? (
+        <div className="skill-editor-message inventory-error" role="alert">
+          <strong>This draft is not a valid skill document.</strong>
+          <ul>
+            {saveState.issues.map((issue, index) => (
+              <li key={`${issue.path ?? 'document'}-${issue.code ?? index}`}>
+                {issue.line === undefined ? '' : `Line ${issue.line}: `}{issue.message}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {saveState.status === 'stale' ? (
+        <div className="skill-editor-message inventory-error" role="alert">
+          <div>
+            <strong>This skill changed outside the editor. Your draft was not saved.</strong>
+            <span>Copy the draft, or reload the latest document before editing again.</span>
+          </div>
+          <button className="button-secondary" type="button" onClick={copyDraft}>Copy draft</button>
+          <button type="button" onClick={reloadLatest}>Reload latest</button>
+        </div>
+      ) : null}
+      {saveState.status === 'failure' ? (
+        <div className="skill-editor-message inventory-error" role="status">
+          {saveState.message}
+        </div>
+      ) : null}
+      {copyNotice === undefined ? null : (
+        <div className="skill-editor-message" role="status">{copyNotice}</div>
+      )}
+      {saveState.status === 'saved' ? (
+        <div className="skill-editor-message" role="status">
+          {saveState.publication === 'git-pending'
+            ? 'Saved locally. Required Git bookkeeping is pending; do not save this version again.'
+            : saveState.refreshRequired
+              ? 'Saved locally. Reload the latest document before editing again.'
+              : 'Skill document saved locally.'}
+        </div>
+      ) : null}
 
       {retained === undefined || editorIdentity === undefined ? null : (
         <>
@@ -381,6 +656,8 @@ export function SkillEditor({
                 identity={editorIdentity}
                 layout={mode}
                 onChange={updateDraft}
+                canSave={canSave}
+                onSave={performSave}
                 value={retained.draft}
               />
             </div>

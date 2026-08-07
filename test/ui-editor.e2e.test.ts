@@ -1,4 +1,4 @@
-import { writeFile, rm } from 'node:fs/promises';
+import { readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { expect, test, type Locator } from '@playwright/test';
 import { startUiTestServer } from './ui-global-setup.js';
@@ -318,6 +318,181 @@ test('opens a skill document', async ({ page }) => {
     await expect(editor).not.toContainText('local retained draft');
     expect(documentRequests).toHaveLength(1);
   } finally {
+    await server.close();
+  }
+});
+
+test('validates and saves a skill', async ({ context, page }) => {
+  const server = await startUiTestServer({ fixture: 'authentication' });
+  const draftingPath = join(
+    server.home,
+    'store',
+    'environments',
+    'writing',
+    'skills',
+    'drafting',
+    'SKILL.md',
+  );
+  type SaveMode = 'normal' | 'hold-real' | 'hold-late' | 'git-pending';
+  let saveMode: SaveMode = 'normal';
+  let saveRequests = 0;
+  let held: (() => void) | undefined;
+  let release: (() => void) | undefined;
+  let heldPromise = new Promise<void>((resolve) => { held = resolve; });
+  let releasePromise = new Promise<void>((resolve) => { release = resolve; });
+  const resetHold = (): void => {
+    heldPromise = new Promise<void>((resolve) => { held = resolve; });
+    releasePromise = new Promise<void>((resolve) => { release = resolve; });
+  };
+  const shortcut = process.platform === 'darwin' ? 'Meta+s' : 'Control+s';
+  const end = process.platform === 'darwin' ? 'Meta+ArrowDown' : 'Control+End';
+
+  await page.route('**/api/environments/*/skills/*/document', async (route) => {
+    if (route.request().method() !== 'PUT') {
+      await route.continue();
+      return;
+    }
+    saveRequests += 1;
+    if (saveMode === 'normal') {
+      await route.continue();
+      return;
+    }
+    const request = route.request().postDataJSON() as {
+      environment: string;
+      skill: string;
+      text: string;
+    };
+    if (saveMode === 'hold-real') {
+      const upstream = await route.fetch();
+      held!();
+      await releasePromise;
+      await route.fulfill({ response: upstream }).catch(() => undefined);
+      return;
+    }
+    if (saveMode === 'hold-late') {
+      held!();
+      await releasePromise;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        data: {
+          environment: request.environment,
+          skill: request.skill,
+          publication: saveMode === 'git-pending' ? 'git-pending' : 'complete',
+          refreshRequired: false,
+          document: {
+            environment: request.environment,
+            skill: request.skill,
+            text: request.text,
+            revision: (saveMode === 'git-pending' ? 'g' : 'l').repeat(43),
+          },
+        },
+      }),
+    }).catch(() => undefined);
+  });
+
+  try {
+    const origin = new URL(server.launchUrl).origin;
+    await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin });
+    await writeFile(draftingPath, DRAFTING_SOURCE, 'utf8');
+    const documentRequests: string[] = [];
+    page.on('request', (request) => {
+      if (request.resourceType() === 'document') documentRequests.push(request.url());
+    });
+    await page.goto(server.launchUrl);
+    await page.getByRole('button', { name: 'Inspect writing' }).click();
+    await page.getByRole('button', { name: 'Open skill drafting' }).click();
+    const workspace = page.getByRole('region', { name: 'drafting SKILL.md' });
+    const editor = workspace.getByRole('textbox', { name: 'Skill Markdown source editor' });
+    const saveButton = workspace.getByRole('button', { name: 'Save skill document', exact: true });
+    await expect.poll(() => editorText(editor)).toBe(DRAFTING_SOURCE);
+    await expect(workspace.getByRole('button', { name: 'Save unavailable' })).toBeDisabled();
+
+    // Local validation retains the exact draft and does not send a mutation.
+    await editor.fill('# invalid local draft\n');
+    await expect(saveButton).toBeEnabled();
+    await saveButton.click();
+    await expect(workspace.getByRole('alert')).toContainText('not a valid skill document');
+    expect(await editorText(editor)).toBe('# invalid local draft\n');
+    expect(saveRequests).toBe(0);
+
+    // The CodeMirror shortcut and button share one held mutation; no duplicate can start.
+    await editor.fill(`${DRAFTING_SOURCE}\nfirst saved edit\n`);
+    saveMode = 'hold-real';
+    resetHold();
+    await editor.press(shortcut);
+    await heldPromise;
+    await expect(workspace.getByRole('button', { name: 'Saving skill document…' })).toBeDisabled();
+    await editor.press(shortcut);
+    expect(saveRequests).toBe(1);
+    release!();
+    await expect(workspace.getByRole('status')).toContainText('Skill document saved locally');
+    await expect(workspace.getByRole('button', { name: 'Save unavailable' })).toBeDisabled();
+    expect(await readFile(draftingPath, 'utf8')).toBe(`${DRAFTING_SOURCE}\nfirst saved edit\n`);
+
+    // An external edit wins; the browser draft remains available to copy or explicitly discard.
+    const external = `${DRAFTING_SOURCE}\nexternal canonical edit\n`;
+    await editor.press(end);
+    await editor.pressSequentially('browser draft after save\n');
+    const browserDraft = await editorText(editor);
+    await writeFile(draftingPath, external, 'utf8');
+    saveMode = 'normal';
+    await workspace.getByRole('button', { name: 'Save skill document', exact: true }).click();
+    const staleAlert = workspace.getByRole('alert');
+    await expect(staleAlert).toContainText('changed outside the editor');
+    expect(await editorText(editor)).toBe(browserDraft);
+    expect(await readFile(draftingPath, 'utf8')).toBe(external);
+    await staleAlert.getByRole('button', { name: 'Copy draft' }).click();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(browserDraft);
+    page.once('dialog', (dialog) => dialog.accept());
+    await staleAlert.getByRole('button', { name: 'Reload latest' }).click();
+    await expect.poll(() => editorText(editor)).toBe(external);
+    expect(await readFile(draftingPath, 'utf8')).toBe(external);
+
+    // Saving against the newly loaded revision succeeds and returns to clean state.
+    await editor.press(end);
+    await editor.pressSequentially('saved after reload\n');
+    await editor.press(shortcut);
+    await expect(workspace.getByRole('status')).toContainText('Skill document saved locally');
+    await expect(workspace.getByRole('button', { name: 'Save unavailable' })).toBeDisabled();
+    expect(await readFile(draftingPath, 'utf8')).toContain('saved after reload');
+
+    // A response for a workspace left while saving cannot replace the next selection.
+    await page.getByRole('button', { name: 'Open skill reviewing' }).click();
+    const reviewingWorkspace = page.getByRole('region', { name: 'reviewing SKILL.md' });
+    const reviewingEditor = reviewingWorkspace.getByRole('textbox', {
+      name: 'Skill Markdown source editor',
+    });
+    await reviewingEditor.press(end);
+    await reviewingEditor.pressSequentially('late reviewing draft\n');
+    saveMode = 'hold-late';
+    resetHold();
+    await reviewingEditor.press(shortcut);
+    await heldPromise;
+    await page.getByRole('button', { name: 'Open skill drafting' }).click();
+    release!();
+    const draftingAgain = page.getByRole('region', { name: 'drafting SKILL.md' });
+    await expect(draftingAgain).toBeVisible();
+    await expect(draftingAgain).not.toContainText('late reviewing draft');
+
+    // Git-pending is a successful local save, leaves the draft clean, and blocks repeats.
+    const draftingEditor = draftingAgain.getByRole('textbox', {
+      name: 'Skill Markdown source editor',
+    });
+    await draftingEditor.press(end);
+    await draftingEditor.pressSequentially('local git pending draft\n');
+    saveMode = 'git-pending';
+    const beforePending = saveRequests;
+    await draftingEditor.press(shortcut);
+    await expect(draftingAgain.getByRole('status')).toContainText('Git bookkeeping is pending');
+    await expect(draftingAgain.getByRole('button', { name: 'Save unavailable' })).toBeDisabled();
+    await draftingEditor.press(shortcut);
+    expect(saveRequests).toBe(beforePending + 1);
+    expect(documentRequests).toHaveLength(1);
+  } finally {
+    release?.();
     await server.close();
   }
 });

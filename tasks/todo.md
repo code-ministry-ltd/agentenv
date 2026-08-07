@@ -556,12 +556,27 @@ Size: M
 Add staged authoritative validation, expected-revision save, scoped Git history,
 typed validation/conflict responses, local feedback, and save shortcuts.
 
-- [ ] A valid edit publishes only `SKILL.md`, preserves the rest of the skill, and
+- [x] A valid edit publishes only `SKILL.md`, preserves the rest of the skill, and
   creates the established path-scoped local Git history.
-- [ ] Invalid content and injected failures retain the browser draft and leave
+- [x] Invalid content and injected failures retain the browser draft and leave
   canonical bytes unchanged.
-- [ ] An external edit after load refuses publication and offers reload or draft
+- [x] An external edit after load refuses publication and offers reload or draft
   copy without clobbering either version.
+
+Verified 2026-08-07: skill save application/route/listener tests (10/10) and
+combined editor tests (17/17) passed for single-file staged publication, sibling
+byte/mode preservation, path-scoped local Git history, frontmatter/name
+validation, external and byte-identical replacement staleness, pre-commit
+rollback, Git-pending recovery truth, strict authenticated CSRF mutation shape,
+and configured runtime/offline/Git seam propagation. The production-browser save
+journey passed for local validation with zero requests, one held Mod-S request,
+exact saved revision/bytes, stale refusal, copy-draft and confirmed reload,
+late-response isolation, truthful Git-pending state, draft retention, and no
+reload. Lint, all typechecks, build, UI tests (48/48), related tests (113/113),
+browser editor/copy/move journeys (4/4), and the full regression suite
+(161 files, 1,340 tests) passed. One earlier run hit the known unrelated
+`skill-source.git-hang` stdout timing flake; it passed immediately alone and the
+complete corrected rerun was green.
 
 Verification: `npx vitest run test/skill-document-save.test.ts && npm run test:ui:e2e -- --grep "validates and saves a skill"`
 
