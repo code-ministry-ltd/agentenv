@@ -802,6 +802,82 @@ h3 {
   font-size: 0.85em;
 }
 
+.git-import-dialog {
+  width: min(54rem, calc(100vw - 2rem));
+  max-height: calc(100vh - 2rem);
+  overflow: auto;
+}
+
+.git-browse-actions {
+  margin-bottom: 1rem;
+}
+
+.git-candidate-browser {
+  margin-top: 1rem;
+  border-top: 1px solid var(--line);
+  padding-top: 1rem;
+}
+
+.git-candidate-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(12rem, 18rem);
+  align-items: end;
+  gap: 0.75rem;
+}
+
+.git-candidate-heading h3,
+.git-candidate-heading p {
+  margin: 0;
+}
+
+.git-candidate-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr));
+  gap: 0.75rem;
+  margin: 1rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.git-candidate-card {
+  height: 100%;
+  padding: 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-raised);
+}
+
+.git-candidate-card h4,
+.git-candidate-card p {
+  margin-top: 0;
+}
+
+.git-candidate-card dl {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.25rem 0.65rem;
+  margin-bottom: 0;
+  font-size: 0.82rem;
+}
+
+.git-candidate-card dt {
+  color: var(--ink-muted);
+  font-weight: 650;
+}
+
+.git-candidate-card dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 720px) {
+  .git-candidate-heading {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+}
+
 .skill-code-editor .cm-editor {
   min-height: 22rem;
   background: var(--surface);

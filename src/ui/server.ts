@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { RunOptions } from '../command.js';
+import { GitCandidateStore } from '../application/git-candidates.js';
 import { resolvePaths, type Paths } from '../paths.js';
 import { API_ERROR_STATUS, type ApiErrorCode } from './contract.js';
 import {
@@ -31,6 +32,7 @@ export interface StartUiServerOptions {
   installSignalHandlers?: boolean;
   paths?: Paths;
   env?: NodeJS.ProcessEnv;
+  cwd?: string;
   runOptions?: Pick<RunOptions, 'adapters' | 'gitRun' | 'globals'>;
   routeDependencies?: UiRouteDependencyOverrides;
 }
@@ -231,6 +233,7 @@ async function handleApi(
   if (
     ((pathname === '/api/environments' || pathname === '/api/content/transfer') &&
       request.method === 'POST') ||
+    (pathname === '/api/git/candidates' && request.method === 'POST') ||
     (/^\/api\/environments\/[^/]+\/skills\/[^/]+\/document$/.test(pathname) &&
       request.method === 'PUT')
   ) {
@@ -271,6 +274,14 @@ export async function startUiServer(
   const assetsDir = options.assetsDir ?? DEFAULT_ASSETS_DIR;
   const runtimeEnv = options.env ?? process.env;
   const paths = options.paths ?? resolvePaths(runtimeEnv);
+  const gitCandidates = options.routeDependencies?.gitCandidates ?? new GitCandidateStore({
+    cwd: options.cwd ?? process.cwd(),
+    env: runtimeEnv,
+    offline: options.runOptions?.globals?.offline ?? false,
+    ...(options.runOptions?.gitRun === undefined
+      ? {}
+      : { gitRun: options.runOptions.gitRun }),
+  });
   const routeDependencies: UiRouteDependencyOverrides = {
     createContentTransferRuntime: (runtimePaths) =>
       createUiContentTransferRuntime({
@@ -296,6 +307,7 @@ export async function startUiServer(
         env: runtimeEnv,
         ...(options.runOptions === undefined ? {} : { runOptions: options.runOptions }),
       }),
+    gitCandidates,
     ...options.routeDependencies,
   };
   const security = createUiSecurityState();
@@ -335,18 +347,24 @@ export async function startUiServer(
     });
   });
 
-  await new Promise<void>((resolve, reject) => {
-    const onError = (error: Error): void => reject(error);
-    httpServer.once('error', onError);
-    httpServer.listen(requestedPort, '127.0.0.1', () => {
-      httpServer.off('error', onError);
-      resolve();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error): void => reject(error);
+      httpServer.once('error', onError);
+      httpServer.listen(requestedPort, '127.0.0.1', () => {
+        httpServer.off('error', onError);
+        resolve();
+      });
     });
-  });
+  } catch (error) {
+    await gitCandidates.shutdown();
+    throw error;
+  }
 
   const address = httpServer.address();
   if (address === null || typeof address === 'string') {
     httpServer.close();
+    await gitCandidates.shutdown();
     throw new Error('UI server did not expose a TCP address');
   }
   expectedHost = `127.0.0.1:${address.port}`;
@@ -355,14 +373,18 @@ export async function startUiServer(
   let closePromise: Promise<void> | undefined;
   let removeSignalHandlers = (): void => undefined;
   const close = (): Promise<void> => {
-    closePromise ??= new Promise<void>((resolve, reject) => {
+    closePromise ??= (async () => {
       removeSignalHandlers();
-      if (!httpServer.listening) {
-        resolve();
-        return;
+      try {
+        if (httpServer.listening) {
+          await new Promise<void>((resolve, reject) => {
+            httpServer.close((error) => (error ? reject(error) : resolve()));
+          });
+        }
+      } finally {
+        await gitCandidates.shutdown();
       }
-      httpServer.close((error) => (error ? reject(error) : resolve()));
-    });
+    })();
     return closePromise;
   };
 

@@ -666,12 +666,23 @@ Size: M
 Implement async server-owned candidate sets, progress polling, bounded pagination,
 opaque candidate IDs, private temp storage, and a repository/candidate browser.
 
-- [ ] Discovery returns immediately as `PENDING`, becomes `READY` or safely
+- [x] Discovery returns immediately as `PENDING`, becomes `READY` or safely
   `FAILED`, and never blocks unrelated catalogue/editor requests.
-- [ ] Ready candidates show safe name, description, repo path/ref/commit metadata
+- [x] Ready candidates show safe name, description, repo path/ref/commit metadata
   and support client filtering without accepting browser paths.
-- [ ] Explicit discard and 15-minute idle expiry invalidate candidates and clean
+- [x] Explicit discard and 15-minute idle expiry invalidate candidates and clean
   temporary data no later than operation release or server shutdown.
+
+Verified 2026-08-07: server-owned candidate sets return an opaque PENDING ID
+immediately, report resolving/fetching/scanning progress, settle to redacted
+READY/FAILED state, paginate at bounded sizes, and omit invalid candidates and
+all private checkout paths. Candidate IDs require server-held object identity;
+explicit discard, idle expiry, and server shutdown await private checkout
+release. The production UI browses a real local Git repository, shows exact
+repository/path/ref/commit metadata, filters client-side, restores focus, and
+mutates no environment. Candidate application/HTTP tests (4/4), UI tests
+(53/53), browser journeys (15/15), lint, all typechecks, build, and the full
+regression suite (163 files, 1,348 tests) passed.
 
 Verification: `npx vitest run test/ui-git-candidates.test.ts && npm run test:ui:e2e -- --grep "browses skills from Git"`
 

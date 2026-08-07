@@ -66,7 +66,7 @@ export const uiCommand: Command = {
   summary: 'Browse and edit environments in a local web app',
   hidden: false,
 
-  async run({ args, env, options, paths }) {
+  async run({ args, cwd, env, options, paths }) {
     const parsed = parseUiArguments(args);
     if ('code' in parsed) return parsed;
 
@@ -76,6 +76,7 @@ export const uiCommand: Command = {
       server = await start({
         port: parsed.port,
         paths,
+        cwd,
         env,
         runOptions: {
           ...(options.adapters === undefined ? {} : { adapters: options.adapters }),

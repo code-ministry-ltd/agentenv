@@ -19,6 +19,9 @@ import {
   type SkillDocument,
   type SaveSkillDocumentRequest,
   type SaveSkillDocumentSuccess,
+  type CandidateSetId,
+  type GitCandidateSet,
+  type PendingGitCandidateSet,
 } from '../../src/ui/contract.js';
 
 interface SessionData {
@@ -200,4 +203,32 @@ export async function transferContent<Operation extends TransferOperation>(
     method: 'POST',
     body: JSON.stringify(request),
   });
+}
+
+export async function startGitCandidateDiscovery(
+  source: string,
+): Promise<PendingGitCandidateSet> {
+  return await apiRequest<PendingGitCandidateSet>('/api/git/candidates', {
+    method: 'POST',
+    body: JSON.stringify({ source }),
+  });
+}
+
+export async function getGitCandidateSet(
+  candidateSetId: CandidateSetId,
+  page = 1,
+  pageSize = 100,
+): Promise<GitCandidateSet> {
+  return await apiRequest<GitCandidateSet>(
+    `/api/git/candidates/${encodeURIComponent(candidateSetId)}?page=${page}&pageSize=${pageSize}`,
+  );
+}
+
+export async function discardGitCandidateSet(
+  candidateSetId: CandidateSetId,
+): Promise<void> {
+  await apiRequest<{ candidateSetId: CandidateSetId; discarded: true }>(
+    `/api/git/candidates/${encodeURIComponent(candidateSetId)}`,
+    { method: 'DELETE' },
+  );
 }

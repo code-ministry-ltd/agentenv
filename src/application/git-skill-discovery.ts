@@ -15,7 +15,10 @@ export interface GitSkillDiscoveryInput {
   env: NodeJS.ProcessEnv;
   offline: boolean;
   gitRun?: GitRunner;
+  onPhase?: (phase: GitSkillDiscoveryPhase) => void;
 }
+
+export type GitSkillDiscoveryPhase = 'resolving' | 'fetching' | 'scanning';
 
 export interface GitSkillDiscoverySource {
   repo: string;
@@ -128,6 +131,7 @@ export function gitSkillRepoPath(
 export async function discoverGitSkills(
   input: GitSkillDiscoveryInput,
 ): Promise<GitSkillDiscoveryResult> {
+  input.onPhase?.('resolving');
   const local = await localSourceUrl(input.source, input.cwd);
   const sourceText = local ?? input.source;
   if (input.offline && local === undefined && !sourceText.trim().startsWith('file://')) {
@@ -142,6 +146,7 @@ export async function discoverGitSkills(
   if ('error' in source) {
     return { status: 'failure', kind: 'invalid-source', message: source.error };
   }
+  input.onPhase?.('fetching');
   const fetched = await fetchSkillSource(source, {
     env: input.env,
     ...(input.gitRun === undefined ? {} : { gitRun: input.gitRun }),
@@ -151,6 +156,7 @@ export async function discoverGitSkills(
   }
 
   try {
+    input.onPhase?.('scanning');
     const scanned = await scanSkillDirs(fetched.scanDir);
     const candidates = await Promise.all(scanned.map(async (candidate) => {
       const validation = await validateSkillDir(candidate.dir);

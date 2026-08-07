@@ -1,4 +1,5 @@
 import type { IncomingMessage } from 'node:http';
+import type { GitCandidateService } from '../application/git-candidates.js';
 import {
   copyContent,
   type CopyContentResult,
@@ -84,6 +85,7 @@ export interface UiRouteDependencies {
   listEnvironmentSummaries: typeof listEnvironmentSummaries;
   readSkillDocument: typeof readSkillDocument;
   saveSkillDocument: typeof saveSkillDocument;
+  gitCandidates: GitCandidateService;
 }
 
 export type UiRouteDependencyOverrides = Partial<UiRouteDependencies>;
@@ -107,6 +109,12 @@ const DEFAULT_ROUTE_DEPENDENCIES: UiRouteDependencies = {
   saveSkillDocument,
   createSkillDocumentRuntime: (paths) =>
     createUiSkillDocumentRuntime({ paths, env: process.env }),
+  gitCandidates: {
+    start: () => { throw new Error('Git candidate service is unavailable'); },
+    poll: () => undefined,
+    discard: async () => false,
+    shutdown: async () => undefined,
+  },
 };
 
 function skillDocumentRouteResult(result: ReadSkillDocumentResult): UiRouteResult {
@@ -831,6 +839,89 @@ async function handleTransferRoute(
   return await transferRouteResult(request, result, paths, dependencies);
 }
 
+const GIT_SOURCE_MAX_LENGTH = 4_096;
+const OPAQUE_CANDIDATE_SET_ID = /^[A-Za-z0-9_-]{20,100}$/;
+
+async function handleGitCandidateRoute(
+  request: IncomingMessage,
+  url: URL,
+  requestBody: Record<string, unknown> | undefined,
+  candidates: GitCandidateService,
+): Promise<UiRouteResult | undefined> {
+  if (url.pathname === '/api/git/candidates') {
+    if (request.method !== 'POST') {
+      return errorResult('METHOD_NOT_ALLOWED', 'The request method is not supported.');
+    }
+    if ([...url.searchParams.keys()].length > 0) {
+      return errorResult('MALFORMED_REQUEST', 'The request query is malformed.');
+    }
+    if (
+      requestBody === undefined ||
+      !exactKeys(requestBody, ['source']) ||
+      typeof requestBody.source !== 'string' ||
+      requestBody.source.trim() === '' ||
+      requestBody.source.length > GIT_SOURCE_MAX_LENGTH
+    ) {
+      return errorResult('VALIDATION_FAILED', 'Enter a valid Git repository source.', {
+        kind: 'validation',
+        issues: [{ path: 'source', message: 'Enter a Git repository or repository path.' }],
+      });
+    }
+    try {
+      return { status: 202, body: { data: candidates.start(requestBody.source) } };
+    } catch {
+      return errorResult('INTERNAL_ERROR', 'Git skill discovery could not be started.');
+    }
+  }
+
+  const match = /^\/api\/git\/candidates\/([^/]+)$/.exec(url.pathname);
+  if (match === null) return undefined;
+  let candidateSetId: string;
+  try {
+    candidateSetId = decodeURIComponent(match[1]!);
+  } catch {
+    return errorResult('MALFORMED_REQUEST', 'The Git candidate set identifier is malformed.');
+  }
+  if (!OPAQUE_CANDIDATE_SET_ID.test(candidateSetId)) {
+    return errorResult('MALFORMED_REQUEST', 'The Git candidate set identifier is malformed.');
+  }
+  if (request.method === 'DELETE') {
+    if ([...url.searchParams.keys()].length > 0) {
+      return errorResult('MALFORMED_REQUEST', 'The request query is malformed.');
+    }
+    return await candidates.discard(candidateSetId)
+      ? {
+          status: 200,
+          body: { data: { candidateSetId, discarded: true } },
+        }
+      : errorResult('NOT_FOUND', 'The Git candidate set was not found or has expired.');
+  }
+  if (request.method !== 'GET') {
+    return errorResult('METHOD_NOT_ALLOWED', 'The request method is not supported.');
+  }
+  if ([...url.searchParams.keys()].some((key) => key !== 'page' && key !== 'pageSize')) {
+    return errorResult('MALFORMED_REQUEST', 'The request query is malformed.');
+  }
+  try {
+    const page = boundedInteger(url.searchParams, 'page', 1, CATALOG_MAX_PAGE);
+    const pageSize = boundedInteger(
+      url.searchParams,
+      'pageSize',
+      CATALOG_MAX_PAGE_SIZE,
+      CATALOG_MAX_PAGE_SIZE,
+    );
+    const state = candidates.poll(candidateSetId, page, pageSize);
+    return state === undefined
+      ? errorResult('NOT_FOUND', 'The Git candidate set was not found or has expired.')
+      : { status: 200, body: { data: state } };
+  } catch (error) {
+    if (error instanceof CatalogPaginationError || error instanceof RangeError) {
+      return errorResult('MALFORMED_REQUEST', 'The request query is malformed.');
+    }
+    throw error;
+  }
+}
+
 export async function handleUiRoute(
   request: IncomingMessage,
   url: URL,
@@ -839,6 +930,13 @@ export async function handleUiRoute(
   requestBody?: Record<string, unknown>,
 ): Promise<UiRouteResult | undefined> {
   const dependencies = { ...DEFAULT_ROUTE_DEPENDENCIES, ...dependencyOverrides };
+  const gitCandidateRoute = await handleGitCandidateRoute(
+    request,
+    url,
+    requestBody,
+    dependencies.gitCandidates,
+  );
+  if (gitCandidateRoute !== undefined) return gitCandidateRoute;
   const skillDocumentMatch =
     /^\/api\/environments\/([^/]+)\/skills\/([^/]+)\/document$/.exec(url.pathname);
   if (skillDocumentMatch !== null) {

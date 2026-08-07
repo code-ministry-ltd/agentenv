@@ -285,6 +285,7 @@ export interface GitCandidate {
   candidateId: CandidateId;
   name: ContentName;
   description: string;
+  repository: string;
   repositoryPath: string;
   ref?: string;
   commit: string;

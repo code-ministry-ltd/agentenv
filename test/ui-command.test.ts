@@ -54,6 +54,7 @@ describe('agentenv ui command', () => {
     expect(starts).toEqual([
       {
         port: 43210,
+        cwd: process.cwd(),
         env: temp.env,
         paths: expect.objectContaining({ base: temp.home }),
         runOptions: expect.objectContaining({

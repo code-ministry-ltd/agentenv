@@ -11,6 +11,7 @@ import { listEnvironmentSummaries } from './api.js';
 import { DeleteEnvironmentDialog } from './DeleteEnvironmentDialog.js';
 import { EnvironmentDialog } from './EnvironmentDialog.js';
 import { EnvironmentView } from './EnvironmentView.js';
+import { GitImportDialog } from './GitImportDialog.js';
 import {
   UnsavedChangesDialog,
   type PendingDiscardAction,
@@ -49,9 +50,11 @@ export function EnvironmentList(): React.JSX.Element {
   const [publishedInventory, setPublishedInventory] = useState<EnvironmentInventory>();
   const [editorDirty, setEditorDirty] = useState(false);
   const [pendingDiscard, setPendingDiscard] = useState<PendingDiscardAction>();
+  const [gitDialog, setGitDialog] = useState(false);
   const createTriggerRef = useRef<HTMLButtonElement>(null);
   const cloneTriggerRef = useRef<HTMLButtonElement>(null);
   const deleteTriggerRef = useRef<HTMLButtonElement>(null);
+  const gitTriggerRef = useRef<HTMLButtonElement>(null);
   const listHeadingRef = useRef<HTMLHeadingElement>(null);
   const inspectTriggerRefs = useRef(new Map<string, HTMLButtonElement>());
   const pendingFocusNameRef = useRef<string | null | undefined>(undefined);
@@ -239,6 +242,14 @@ export function EnvironmentList(): React.JSX.Element {
               >
                 Clone environment
               </button>
+              <button
+                className="button-secondary"
+                ref={gitTriggerRef}
+                type="button"
+                onClick={() => setGitDialog(true)}
+              >
+                Import from Git
+              </button>
             </div>
           </div>
         ) : null}
@@ -396,6 +407,12 @@ export function EnvironmentList(): React.JSX.Element {
           triggerRef={deleteTriggerRef}
         />
       )}
+      {gitDialog ? (
+        <GitImportDialog
+          onClose={() => setGitDialog(false)}
+          triggerRef={gitTriggerRef}
+        />
+      ) : null}
       {pendingDiscard === undefined ? null : (
         <UnsavedChangesDialog
           pending={pendingDiscard}
