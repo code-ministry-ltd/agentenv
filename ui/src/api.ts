@@ -1,10 +1,13 @@
 import {
   API_ERROR_STATUS,
+  type ApiErrorDetails,
   type ApiErrorCode,
   type ApiErrorResponse,
   type ApiSuccessResponse,
   type EnvironmentCatalogPage,
   type EnvironmentInventory,
+  type EnvironmentLifecycleRequest,
+  type EnvironmentLifecycleSuccess,
   type EnvironmentSummary,
 } from '../../src/ui/contract.js';
 
@@ -16,11 +19,13 @@ let csrfToken: string | undefined;
 
 export class UiApiError extends Error {
   readonly code: ApiErrorCode;
+  readonly details?: ApiErrorDetails;
 
-  constructor(code: ApiErrorCode, message: string) {
+  constructor(code: ApiErrorCode, message: string, details?: ApiErrorDetails) {
     super(message);
     this.name = 'UiApiError';
     this.code = code;
+    if (details !== undefined) this.details = details;
   }
 }
 
@@ -46,7 +51,8 @@ async function responseBody<Data>(response: Response): Promise<Data> {
     const message = body && 'error' in body
       ? body.error.message
       : 'The local UI request could not be completed.';
-    throw new UiApiError(code, message);
+    const details = body && 'error' in body ? body.error.details : undefined;
+    throw new UiApiError(code, message, details);
   }
   if (body === undefined || !('data' in body)) {
     throw new UiApiError('INTERNAL_ERROR', 'The local UI returned an invalid response.');
@@ -124,4 +130,15 @@ export async function getEnvironmentInventory(
     `/api/environments/${encodeURIComponent(name)}`,
     { signal },
   );
+}
+
+export async function publishEnvironment(
+  request: EnvironmentLifecycleRequest,
+  signal?: AbortSignal,
+): Promise<EnvironmentLifecycleSuccess> {
+  return await apiRequest<EnvironmentLifecycleSuccess>('/api/environments', {
+    method: 'POST',
+    body: JSON.stringify(request),
+    signal,
+  });
 }

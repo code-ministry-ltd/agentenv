@@ -2,12 +2,14 @@ import { readFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { RunOptions } from '../command.js';
 import { resolvePaths, type Paths } from '../paths.js';
 import { API_ERROR_STATUS, type ApiErrorCode } from './contract.js';
 import {
   handleUiRoute,
   type UiRouteDependencyOverrides,
 } from './routes.js';
+import { createUiEnvironmentLifecycleRuntime } from './environment-lifecycle-runtime.js';
 import {
   applyBrowserSecurityHeaders,
   createUiSecurityState,
@@ -23,6 +25,8 @@ export interface StartUiServerOptions {
   assetsDir?: string;
   installSignalHandlers?: boolean;
   paths?: Paths;
+  env?: NodeJS.ProcessEnv;
+  runOptions?: Pick<RunOptions, 'adapters' | 'gitRun' | 'globals'>;
   routeDependencies?: UiRouteDependencyOverrides;
 }
 
@@ -218,11 +222,21 @@ async function handleApi(
     sendJson(response, 200, { data: { ready: true } });
     return;
   }
+  let requestBody: Record<string, unknown> | undefined;
+  if (pathname === '/api/environments' && request.method === 'POST') {
+    const body = await readJsonBody(request);
+    if (!body.ok) {
+      sendError(response, body.code, body.message);
+      return;
+    }
+    requestBody = body.value;
+  }
   const route = await handleUiRoute(
     request,
     new URL(request.url ?? '/', origin),
     paths,
     routeDependencies,
+    requestBody,
   );
   if (route !== undefined) {
     sendJson(response, route.status, route.body);
@@ -245,8 +259,17 @@ export async function startUiServer(
   }
 
   const assetsDir = options.assetsDir ?? DEFAULT_ASSETS_DIR;
-  const paths = options.paths ?? resolvePaths();
-  const routeDependencies = options.routeDependencies ?? {};
+  const runtimeEnv = options.env ?? process.env;
+  const paths = options.paths ?? resolvePaths(runtimeEnv);
+  const routeDependencies: UiRouteDependencyOverrides = {
+    createEnvironmentLifecycleRuntime: (runtimePaths) =>
+      createUiEnvironmentLifecycleRuntime({
+        paths: runtimePaths,
+        env: runtimeEnv,
+        ...(options.runOptions === undefined ? {} : { runOptions: options.runOptions }),
+      }),
+    ...options.routeDependencies,
+  };
   const security = createUiSecurityState();
   let origin = '';
   let expectedHost = '';

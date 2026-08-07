@@ -13,7 +13,7 @@ type InventoryState =
   | { status: 'refreshing'; inventory: EnvironmentInventory }
   | { status: 'stale'; inventory?: EnvironmentInventory }
   | { status: 'unavailable' }
-  | { status: 'error' };
+  | { status: 'error'; inventory?: EnvironmentInventory };
 
 const GROUPS: readonly {
   kind: ContentKind;
@@ -163,20 +163,31 @@ function InventoryGroups({ inventory }: { inventory: EnvironmentInventory }): Re
 
 export function EnvironmentView({
   environment,
+  initialInventory,
 }: {
   environment: EnvironmentSummary;
+  initialInventory?: EnvironmentInventory;
 }): React.JSX.Element {
   const [request, setRequest] = useState(0);
-  const [inventory, setInventory] = useState<InventoryState>({ status: 'loading' });
+  const [inventory, setInventory] = useState<InventoryState>(
+    initialInventory === undefined
+      ? { status: 'loading' }
+      : { status: 'ready', inventory: initialInventory },
+  );
 
   useEffect(() => {
     let acceptResponse = true;
     const controller = new AbortController();
-    setInventory((current) =>
-      current.status === 'ready' || current.status === 'refreshing'
-        ? { status: 'refreshing', inventory: current.inventory }
-        : { status: 'loading' },
-    );
+    setInventory((current) => {
+      const retained = current.status === 'ready' ||
+          current.status === 'refreshing' || current.status === 'stale' ||
+          current.status === 'error'
+        ? current.inventory
+        : undefined;
+      return retained === undefined
+        ? { status: 'loading' }
+        : { status: 'refreshing', inventory: retained };
+    });
     void getEnvironmentInventory(environment.name, controller.signal).then(
       (next) => {
         if (acceptResponse) setInventory({ status: 'ready', inventory: next });
@@ -195,7 +206,15 @@ export function EnvironmentView({
               : { status: 'stale', inventory: retained };
           });
         } else {
-          setInventory({ status: 'error' });
+          setInventory((current) => {
+            const retained = current.status === 'ready' ||
+                current.status === 'refreshing' || current.status === 'stale'
+              ? current.inventory
+              : undefined;
+            return retained === undefined
+              ? { status: 'error' }
+              : { status: 'error', inventory: retained };
+          });
         }
       },
     );
@@ -207,7 +226,8 @@ export function EnvironmentView({
 
   const current = inventory.status === 'ready' ||
       inventory.status === 'refreshing' ||
-      inventory.status === 'stale'
+      inventory.status === 'stale' ||
+      inventory.status === 'error'
     ? inventory.inventory
     : undefined;
   const itemCount = current?.items.length ?? 0;

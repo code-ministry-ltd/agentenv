@@ -76,7 +76,9 @@ test('browses environment summaries from a real empty home', async ({ page }) =>
     expect((await catalogResponse).status()).toBe(200);
 
     await expect(page.getByText('No environments yet.')).toBeVisible();
-    await expect(page.getByText('Create one from the CLI to see it here.')).toBeVisible();
+    await expect(
+      page.getByText('Create a new scaffold or clone an existing environment.'),
+    ).toBeVisible();
   } finally {
     await server.close();
   }

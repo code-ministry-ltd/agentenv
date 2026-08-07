@@ -100,6 +100,37 @@ export interface EnvironmentInventory extends EnvironmentSummary {
   items: readonly ContentItem[];
 }
 
+export const UI_ENVIRONMENT_DESCRIPTION_MAX_LENGTH = 1_000;
+
+export interface CreateEnvironmentRequest {
+  operation: 'create';
+  name: EnvironmentName;
+  description?: string;
+}
+
+export interface CloneEnvironmentRequest {
+  operation: 'clone';
+  name: EnvironmentName;
+  source: EnvironmentName;
+}
+
+export type EnvironmentLifecycleRequest =
+  | CreateEnvironmentRequest
+  | CloneEnvironmentRequest;
+
+export interface EnvironmentLifecycleSuccess {
+  operation: 'create' | 'clone';
+  name: EnvironmentName;
+  source?: EnvironmentName;
+  publication: 'complete';
+  /**
+   * A best-effort projection captured after durable publication. Publication is
+   * still complete when a concurrent catalogue change prevents this read; the
+   * client must then reconcile through the catalogue routes.
+   */
+  environment?: EnvironmentInventory;
+}
+
 export const API_ERROR_STATUS = {
   MALFORMED_REQUEST: 400,
   UNAUTHENTICATED: 401,
@@ -129,7 +160,11 @@ export type ApiErrorDetails =
       expectedRevision?: Revision;
       actualRevision?: Revision;
     }
-  | { kind: 'pending-recovery'; commandId?: string };
+  | {
+      kind: 'pending-recovery';
+      commandId?: string;
+      publication?: 'environment-published';
+    };
 
 export interface ApiError {
   code: ApiErrorCode;

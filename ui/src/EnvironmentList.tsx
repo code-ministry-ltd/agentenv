@@ -1,11 +1,21 @@
-import { useEffect, useState } from 'react';
-import type { ContentCounts, EnvironmentSummary } from '../../src/ui/contract.js';
+import { useEffect, useRef, useState } from 'react';
+import type {
+  ContentCounts,
+  EnvironmentInventory,
+  EnvironmentLifecycleSuccess,
+  EnvironmentSummary,
+} from '../../src/ui/contract.js';
 import { listEnvironmentSummaries } from './api.js';
+import { EnvironmentDialog } from './EnvironmentDialog.js';
 import { EnvironmentView } from './EnvironmentView.js';
 
 type CatalogState =
   | { status: 'loading' }
-  | { status: 'ready'; items: readonly EnvironmentSummary[] }
+  | {
+      status: 'ready';
+      items: readonly EnvironmentSummary[];
+      refresh: 'idle' | 'refreshing' | 'error';
+    }
   | { status: 'error' };
 
 function countLabel(count: number, singular: string, plural = `${singular}s`): string {
@@ -26,17 +36,31 @@ export function EnvironmentList(): React.JSX.Element {
   const [request, setRequest] = useState(0);
   const [catalog, setCatalog] = useState<CatalogState>({ status: 'loading' });
   const [selectedName, setSelectedName] = useState<string>();
+  const [dialog, setDialog] = useState<'create' | 'clone'>();
+  const [publishedInventory, setPublishedInventory] = useState<EnvironmentInventory>();
+  const createTriggerRef = useRef<HTMLButtonElement>(null);
+  const cloneTriggerRef = useRef<HTMLButtonElement>(null);
+  const mutationEpochRef = useRef(0);
 
   useEffect(() => {
     let ignore = false;
-    setCatalog({ status: 'loading' });
+    const mutationEpoch = mutationEpochRef.current;
+    setCatalog((current) => current.status === 'ready'
+      ? { ...current, refresh: 'refreshing' }
+      : { status: 'loading' });
 
     async function load(): Promise<void> {
       try {
         const items = await listEnvironmentSummaries();
-        if (!ignore) setCatalog({ status: 'ready', items });
+        if (!ignore && mutationEpoch === mutationEpochRef.current) {
+          setCatalog({ status: 'ready', items, refresh: 'idle' });
+        }
       } catch {
-        if (!ignore) setCatalog({ status: 'error' });
+        if (!ignore && mutationEpoch === mutationEpochRef.current) {
+          setCatalog((current) => current.status === 'ready'
+            ? { ...current, refresh: 'error' }
+            : { status: 'error' });
+        }
       }
     }
 
@@ -49,6 +73,24 @@ export function EnvironmentList(): React.JSX.Element {
   const selectedEnvironment = catalog.status === 'ready'
     ? catalog.items.find((environment) => environment.name === selectedName)
     : undefined;
+  const refresh = (): void => setRequest((current) => current + 1);
+  const published = (result: EnvironmentLifecycleSuccess): void => {
+    mutationEpochRef.current += 1;
+    setPublishedInventory(result.environment);
+    setSelectedName(result.name);
+    setCatalog((current) => {
+      if (current.status !== 'ready' || result.environment === undefined) return current;
+      return {
+        status: 'ready',
+        items: [
+          ...current.items.filter((environment) => environment.name !== result.name),
+          result.environment,
+        ].sort((left, right) => left.name.localeCompare(right.name)),
+        refresh: 'idle',
+      };
+    });
+    refresh();
+  };
 
   return (
     <section className="catalog-panel" aria-labelledby="environment-list-title">
@@ -57,8 +99,25 @@ export function EnvironmentList(): React.JSX.Element {
           <p className="eyebrow">Local catalogue</p>
           <h2 id="environment-list-title">Environments</h2>
         </div>
-        {catalog.status === 'ready' && catalog.items.length > 0 ? (
-          <span className="catalog-total">{countLabel(catalog.items.length, 'environment')}</span>
+        {catalog.status === 'ready' ? (
+          <div className="catalog-tools">
+            {catalog.items.length > 0 ? (
+              <span className="catalog-total">{countLabel(catalog.items.length, 'environment')}</span>
+            ) : null}
+            <div className="catalog-actions">
+              <button ref={createTriggerRef} type="button" onClick={() => setDialog('create')}>
+                Create environment
+              </button>
+              <button
+                className="button-secondary"
+                ref={cloneTriggerRef}
+                type="button"
+                onClick={() => setDialog('clone')}
+              >
+                Clone environment
+              </button>
+            </div>
+          </div>
         ) : null}
       </div>
 
@@ -75,9 +134,19 @@ export function EnvironmentList(): React.JSX.Element {
             <strong>Environment summaries are unavailable.</strong>
             <span>The local request failed. Your environment files were not changed.</span>
           </div>
-          <button type="button" onClick={() => setRequest((current) => current + 1)}>
+          <button type="button" onClick={refresh}>
             Retry environments
           </button>
+        </div>
+      ) : null}
+
+      {catalog.status === 'ready' && catalog.refresh === 'error' ? (
+        <div className="catalog-message catalog-error" role="alert">
+          <div>
+            <strong>Environment refresh failed.</strong>
+            <span>Showing the last known catalogue. Your environment files were not changed.</span>
+          </div>
+          <button type="button" onClick={refresh}>Retry environments</button>
         </div>
       ) : null}
 
@@ -85,7 +154,7 @@ export function EnvironmentList(): React.JSX.Element {
         <div className="catalog-message catalog-empty">
           <div>
             <strong>No environments yet.</strong>
-            <span>Create one from the CLI to see it here.</span>
+            <span>Create a new scaffold or clone an existing environment.</span>
           </div>
         </div>
       ) : null}
@@ -105,7 +174,12 @@ export function EnvironmentList(): React.JSX.Element {
                           aria-expanded={selected}
                           aria-label={`Inspect ${environment.name}`}
                           className="environment-select"
-                          onClick={() => setSelectedName(environment.name)}
+                          onClick={() => {
+                            setSelectedName(environment.name);
+                            if (publishedInventory?.name !== environment.name) {
+                              setPublishedInventory(undefined);
+                            }
+                          }}
                           type="button"
                         >
                           {environment.name}
@@ -133,11 +207,24 @@ export function EnvironmentList(): React.JSX.Element {
               <EnvironmentView
                 key={selectedEnvironment.name}
                 environment={selectedEnvironment}
+                initialInventory={publishedInventory?.name === selectedEnvironment.name
+                  ? publishedInventory
+                  : undefined}
               />
             )}
           </div>
         </>
       ) : null}
+      {dialog === undefined || catalog.status !== 'ready' ? null : (
+        <EnvironmentDialog
+          environments={catalog.items}
+          mode={dialog}
+          onClose={() => setDialog(undefined)}
+          onPublished={published}
+          onRefresh={refresh}
+          triggerRef={dialog === 'create' ? createTriggerRef : cloneTriggerRef}
+        />
+      )}
     </section>
   );
 }

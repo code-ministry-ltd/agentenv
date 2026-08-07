@@ -41,6 +41,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
 }
 
 export interface UiTestServer {
+  home: string;
   launchUrl: string;
   close(): Promise<void>;
 }
@@ -165,6 +166,7 @@ export async function startUiTestServer(
     const launchUrl = await launchUrlFrom(child);
     let closePromise: Promise<void> | undefined;
     return {
+      home,
       launchUrl,
       close: () => {
         closePromise ??= (async () => {

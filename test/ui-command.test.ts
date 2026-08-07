@@ -54,7 +54,11 @@ describe('agentenv ui command', () => {
     expect(starts).toEqual([
       {
         port: 43210,
+        env: temp.env,
         paths: expect.objectContaining({ base: temp.home }),
+        runOptions: expect.objectContaining({
+          globals: { json: false, offline: false, verbose: false },
+        }),
       },
     ]);
     expect(opened).toEqual([]);

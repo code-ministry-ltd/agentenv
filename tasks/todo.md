@@ -276,12 +276,22 @@ Size: M
 Expose create/clone through typed routes and accessible dialogs, including
 validation, progress, conflict explanation, successful selection, and refresh.
 
-- [ ] Create and clone complete end to end with exact validated names and optional
+- [x] Create and clone complete end to end with exact validated names and optional
   description/source inputs.
-- [ ] Validation, collision, stale, and pending-recovery outcomes preserve the
+- [x] Validation, collision, stale, and pending-recovery outcomes preserve the
   dialog inputs and show a safe next action.
-- [ ] Successful publication selects and displays the new complete environment
+- [x] Successful publication selects and displays the new complete environment
   without a full browser reload.
+
+Verified 2026-08-07: guarded lifecycle routes (4/4) and the production-browser
+create/clone journey passed with exact scaffolds, complete provenance-preserving
+clones, validation/refusal input retention, modal keyboard/focus behavior, and
+no document reload. Held-mutation, post-publication projection failure, failed
+refresh, stale-response, and retained-inventory retry regressions prove the UI
+never invents cancellation or failure after authoritative publication and keeps
+last-known-good state. Lint, all three typechecks, build, UI tests (28/28), all
+production-browser tests (8/8), and the full regression suite (154 files, 1,173
+tests) passed with the process-local signing override recorded under Task 5.
 
 Verification: `npx vitest run test/ui-environment-routes.test.ts && npm run test:ui:e2e -- --grep "creates or clones an environment"`
 
