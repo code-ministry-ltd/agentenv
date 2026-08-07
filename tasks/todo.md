@@ -770,12 +770,21 @@ Extend the isolated install smoke to launch/authenticate the production UI,
 browse, create, copy, edit, import from a local Git fixture, delete, and shut down
 on the supported Node floor without touching the real home.
 
-- [ ] The tarball contains everything needed and no source/dev-only UI material.
-- [ ] The core workflow succeeds from the installed prefix on a temporary home,
+- [x] The tarball contains everything needed and no source/dev-only UI material.
+- [x] The core workflow succeeds from the installed prefix on a temporary home,
   and a failed startup leaves no listener or credential/temp residue.
-- [ ] Existing CLI packed and restore-container smokes remain unchanged and green.
+- [x] Existing CLI packed and restore-container smokes remain unchanged and green.
 
 Verification: `npm run smoke:install && npm run test:restore:container`
+
+Evidence: the tarball allowlist now asserts the installed command, compiled UI
+server, index, and hashed browser assets while excluding raw UI/source/test/dev
+trees. The installed binary authenticated and served production assets, browsed
+the restored store, created an environment, copied and edited a skill, imported
+a selected skill from a local Git fixture, deleted the environment, and released
+its listener and private checkout on SIGTERM. An occupied-port startup exposed no
+credential and wrote no state or temp content. The local packed smoke and the
+clean Node 22 Linux container restore smoke passed on 2026-08-07.
 
 Dependencies: Task 22
 

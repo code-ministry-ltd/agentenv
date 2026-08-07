@@ -118,11 +118,17 @@ ok "packed $(basename "$TGZ")"
 
 # The artifact must carry the built CLI, README, licence, and third-party notice
 # — and NOT tests, docs, spike notes or CI config.
-TOP="$(tar -tzf "$TGZ" | sed 's|^package/||' | cut -d/ -f1 | sort -u)"
+CONTENTS="$(tar -tzf "$TGZ" | sed 's|^package/||')"
+TOP="$(echo "$CONTENTS" | cut -d/ -f1 | sort -u)"
 for want in dist LICENSE README.md THIRD_PARTY_NOTICES.md package.json; do
   echo "$TOP" | grep -qx "$want" || die "tarball is missing $want"
 done
-for unwanted in test docs spike .github node_modules src; do
+for want in dist/bin.js dist/ui/server.js dist/ui-assets/index.html; do
+  echo "$CONTENTS" | grep -qx "$want" || die "tarball is missing $want"
+done
+echo "$CONTENTS" | grep -qE '^dist/ui-assets/assets/.+\.(css|js)$' \
+  || die "tarball is missing built UI assets"
+for unwanted in test docs spike .github node_modules src ui tasks scripts; do
   if echo "$TOP" | grep -qx "$unwanted"; then die "tarball must not ship $unwanted/"; fi
 done
 echo "$TOP" | grep -qi 'ORCHESTRATE' && die "tarball must not ship orchestration notes"
@@ -281,5 +287,11 @@ ok "doctor --repair → clean"
 
 assert_no_home_fallback
 
-step "PASS — a clean install of the packed artifact reached a synced environment on two harnesses"
+step "8. installed local UI — complete the core environment workflow"
+node "$REPO_ROOT/scripts/smoke-ui-install.mjs" "$BIN" "$B_AGENTENV" "$B_HOME" "$WORK"
+ok "installed UI browsed, created, copied, edited, imported, deleted, and shut down"
+
+assert_no_home_fallback
+
+step "PASS — the packed artifact completed CLI restore, harness, and local UI workflows"
 PASSED=1
