@@ -1,10 +1,16 @@
 import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { run } from '../src/cli.js';
-import { commitStore, scanTextForSecrets } from '../src/git.js';
+import {
+  commitStore,
+  defaultGitRunner,
+  scanTextForSecrets,
+  type GitRunner,
+} from '../src/git.js';
 import { resolvePaths } from '../src/paths.js';
+import { readState } from '../src/state.js';
 import { makeTempHome, type TempHome } from './helpers.js';
 
 /**
@@ -73,6 +79,9 @@ describe('F2 integration: the pre-commit gate scans the staged diff (D6/D9)', ()
     const headBefore = gitIn(paths.store, 'rev-parse', 'HEAD');
     const leak = join(paths.envDir('writing'), 'only-copy.txt');
     writeFileSync(leak, `api_key: ${REAL_AWS_KEY}\n`);
+    const envBefore = readFileSync(paths.envYaml('writing'), 'utf8');
+    const leakBefore = readFileSync(leak, 'utf8');
+    const stateBefore = readFileSync(paths.state, 'utf8');
 
     const result = await run(['rm', 'writing'], {
       env: th.env,
@@ -80,9 +89,42 @@ describe('F2 integration: the pre-commit gate scans the staged diff (D6/D9)', ()
     });
 
     expect(result.code).toBe(1);
-    expect(`${result.stdout}${result.stderr ?? ''}`).toMatch(/refus|blocked|secret/i);
+    expect(result.stderr).toContain(
+      "rm: refusing to remove 'writing' while secret-bearing store drift is uncommitted",
+    );
     expect(readFileSync(leak, 'utf8')).toContain(REAL_AWS_KEY);
+    expect(readFileSync(paths.envYaml('writing'), 'utf8')).toBe(envBefore);
+    expect(readFileSync(leak, 'utf8')).toBe(leakBefore);
+    expect(readFileSync(paths.state, 'utf8')).toBe(stateBefore);
     expect(gitIn(paths.store, 'rev-parse', 'HEAD')).toBe(headBefore);
+  });
+
+  it('does not mislabel an ordinary drift commit failure as secret-bearing', async () => {
+    const th = gitHome();
+    const paths = resolvePaths(th.env);
+    await run(['init'], { env: th.env });
+    await run(['create', 'writing'], { env: th.env });
+    writeFileSync(join(paths.envDir('writing'), 'clean-drift.txt'), 'ordinary local drift\n');
+    const failingCommit: GitRunner = (args, options) => args.includes('commit')
+      ? Promise.resolve({
+          code: 1,
+          stdout: '',
+          stderr: 'injected index failure',
+          timedOut: false,
+        })
+      : defaultGitRunner(args, options);
+
+    const result = await run(['rm', 'writing'], {
+      env: th.env,
+      confirm: async () => true,
+      gitRun: failingCommit,
+    });
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('store drift remains uncommitted');
+    expect(result.stderr).not.toContain('secret-bearing');
+    expect(existsSync(paths.envDir('writing'))).toBe(true);
+    expect((await readState(paths)).commands).toHaveLength(1);
   });
 
   it('a staged documented-example token commits fine', async () => {

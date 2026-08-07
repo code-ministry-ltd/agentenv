@@ -1,15 +1,13 @@
-import { randomUUID } from 'node:crypto';
-import { mkdir, rm } from 'node:fs/promises';
-import { join } from 'node:path';
 import { parseArgs } from '../args.js';
-import type { Command, CommandContext } from '../command.js';
-import { readGlobalStack } from '../engine.js';
+import type { Command, RunResult } from '../command.js';
+import {
+  deleteEnvironment,
+  inspectEnvironmentDeletion,
+  type EnvironmentActivity,
+  type EnvironmentDeleteResult,
+} from '../application/environment-lifecycle.js';
+import { createEnvironmentDeleteRuntime } from '../application/environment-lifecycle-runtime.js';
 import { confirmDefault } from '../prompt.js';
-import { readSessionRegistry } from '../session/registry.js';
-import { capturePathIdentity } from '../path-identity.js';
-import { readState } from '../state.js';
-import { environmentExists, validateEnvName } from '../store.js';
-import { commandIsPending, publishWithPendingNotice } from './staged-publication.js';
 import {
   closeStoreSync,
   commitRequiredSteps,
@@ -36,38 +34,10 @@ export const rmCommand: Command = {
     if (parsed.positionals.length > 1) {
       return { stdout: '', stderr: `rm: unexpected argument '${parsed.positionals[1]}'\nUsage: agentenv rm <name>\n`, code: 1 };
     }
-    // Validate BEFORE any path construction: path.join collapses `..`, so an
-    // unvalidated name like `..` or `../../x` would let rm -rf escape the store.
-    const nameError = validateEnvName(name);
-    if (nameError) {
-      return { stdout: '', stderr: `rm: ${nameError}\n`, code: 1 };
-    }
-
-    if (!(await environmentExists(paths, name))) {
-      return { stdout: '', stderr: `rm: environment '${name}' does not exist\n`, code: 1 };
-    }
-
-    // Active-env refusal (deferred from Task 1.1): refuse to remove an env that
-    // is currently active — bound in any session OR present in the global stack —
-    // Active environments must be explicitly deactivated first.
-    const activity = await envActivity(ctx, name);
-    if (activity.session || activity.globalStack || activity.materialised) {
-      const where = [
-        activity.session ? 'a session binding' : null,
-        activity.globalStack ? 'the global stack' : null,
-        activity.materialised ? 'materialised global items' : null,
-      ]
-        .filter(Boolean)
-        .join(' and ');
-      return {
-        stdout: '',
-        stderr: `rm: environment '${name}' is active (${where}) — deactivate it first\n`,
-        code: 1,
-      };
-    }
+    const inspection = await inspectEnvironmentDeletion({ paths, name });
+    if (inspection.status !== 'ready') return presentInspection(inspection);
 
     const confirm = ctx.options.confirm ?? confirmDefault;
-    const expectedPreIdentity = await capturePathIdentity(paths.envDir(name));
     const confirmed = await confirm(`Remove environment '${name}'? This cannot be undone. [y/N] `);
     if (!confirmed) {
       return {
@@ -76,89 +46,105 @@ export const rmCommand: Command = {
       };
     }
 
-    // Open the Git lifecycle before deletion. If pre-existing drift contains a
-    // suspected secret, it may be the only copy; removing the environment would
-    // make the subsequent deletion-only commit look safe while losing those bytes.
     const notices: string[] = [];
     const syncCtx = { paths, env, options };
-    let before;
-    try {
-      before = await openStoreSync(syncCtx, notices);
-    } catch (error) {
-      if (!(error instanceof PendingCommandError)) throw error;
+    const runtime = createEnvironmentDeleteRuntime({
+      paths,
+      open: async () => {
+        try {
+          const opened = await openStoreSync(syncCtx, notices, {
+            stopOnDriftBlocked: true,
+          });
+          return opened.driftCommitBlocked
+            ? {
+                status: 'drift-blocked',
+                secretBearing: opened.driftBlockReason === 'secret',
+              }
+            : { status: 'ready' };
+        } catch (error) {
+          if (!(error instanceof PendingCommandError)) throw error;
+          return { status: 'pending-recovery', transactionId: error.transactionId };
+        }
+      },
+      close: async () => {
+        await closeStoreSync(syncCtx, notices);
+      },
+      gitBookkeeping: (steps, transactionId) =>
+        commitRequiredSteps(syncCtx, steps, notices, transactionId),
+      onGitPending: (error, transactionId) => {
+        notices.push(
+          `agentenv: required commit is pending — ${error.message}. ` +
+            `The local change and recovery data are retained; run ` +
+            `\`agentenv resolve command ${transactionId} --retry\`.`,
+        );
+      },
+    });
+    const result = await deleteEnvironment({
+      paths,
+      name,
+      runtime,
+      expectedTargetIdentity: inspection.targetIdentity,
+      expectedContainerIdentity: inspection.containerIdentity,
+    });
+    return presentDeleteResult(result, notices, name);
+  },
+};
+
+function activeLocation(activity: EnvironmentActivity): string {
+  return [
+    activity.session ? 'a session binding' : null,
+    activity.globalStack ? 'the global stack' : null,
+    activity.materialised ? 'materialised global items' : null,
+  ].filter(Boolean).join(' and ');
+}
+
+function presentInspection(
+  result: Exclude<EnvironmentDeleteResult, { status: 'deleted' | 'git-pending' }>,
+): RunResult {
+  switch (result.status) {
+    case 'invalid':
+      return { stdout: '', stderr: `rm: ${result.message}\n`, code: 1 };
+    case 'not-found':
+      return { stdout: '', stderr: `rm: environment '${result.name}' does not exist\n`, code: 1 };
+    case 'active':
+      return {
+        stdout: '',
+        stderr: `rm: environment '${result.name}' is active (${activeLocation(result.activity)}) — deactivate it first\n`,
+        code: 1,
+      };
+    case 'stale':
+    case 'failure':
+      return { stdout: '', stderr: `rm: ${result.message}\n`, code: 1 };
+    case 'pending-recovery':
+    case 'drift-blocked':
+      return { stdout: '', stderr: 'rm: store state prevents deletion\n', code: 1 };
+  }
+}
+
+function presentDeleteResult(
+  result: EnvironmentDeleteResult,
+  notices: readonly string[],
+  name: string,
+): RunResult {
+  switch (result.status) {
+    case 'deleted':
+    case 'git-pending':
+      return withNotices({ stdout: `Removed environment '${result.name}'.\n`, code: 0 }, notices);
+    case 'pending-recovery':
       return withNotices({
         stdout: '',
         stderr: `rm: refusing to remove '${name}' while store drift remains uncommitted\n`,
         code: 1,
       }, notices);
-    }
-    if (before.driftCommitBlocked) {
+    case 'drift-blocked':
       return withNotices({
         stdout: '',
-        stderr: `rm: refusing to remove '${name}' while secret-bearing store drift is uncommitted\n`,
+        stderr: result.secretBearing
+          ? `rm: refusing to remove '${name}' while secret-bearing store drift is uncommitted\n`
+          : `rm: refusing to remove '${name}' while store drift remains uncommitted\n`,
         code: 1,
       }, notices);
-    }
-    const transactionId = `remove-${name}-${randomUUID()}`;
-    const stagingRoot = join(paths.live, 'commands', transactionId);
-    await mkdir(stagingRoot, { recursive: true });
-    const missingStagedPath = join(stagingRoot, 'absent');
-    const gitSteps = [{
-      id: 'remove-environment',
-      message: `agentenv: remove env ${name}`,
-      paths: [paths.envDir(name)],
-    }];
-    try {
-      const publication = await publishWithPendingNotice({
-        paths,
-        transactionId,
-        kind: 'environment-remove',
-        stagingRoot,
-        allowedRoots: [paths.store],
-        entries: [{
-          id: 'environment',
-          target: paths.envDir(name),
-          staged: missingStagedPath,
-          expectedPreIdentity,
-        }],
-        gitSteps,
-        gitBookkeeping: () => commitRequiredSteps(syncCtx, gitSteps, notices, transactionId),
-      }, notices);
-      if (publication === 'complete') await closeStoreSync(syncCtx, notices);
-    } catch (error) {
-      if (!(await commandIsPending(paths, transactionId))) {
-        await rm(stagingRoot, { recursive: true, force: true });
-      }
-      await closeStoreSync(syncCtx, notices);
-      return withNotices({
-        stdout: '',
-        stderr: `rm: ${(error as Error).message}\n`,
-        code: 1,
-      }, notices);
-    }
-    return withNotices({ stdout: `Removed environment '${name}'.\n`, code: 0 }, notices);
-  },
-};
-
-/**
- * How an env is active, split so the refusal can name each cause precisely:
- * `session` (bound in any shell), `globalStack` (present in the persisted global
- * stack), and `materialised` (owns at least one manifest item on real paths — true
- * for a normally-stacked env AND for a crash-orphaned one whose stack write was lost).
- */
-async function envActivity(
-  ctx: CommandContext,
-  name: string,
-): Promise<{ session: boolean; globalStack: boolean; materialised: boolean }> {
-  const { paths } = ctx;
-  const registry = await readSessionRegistry(paths);
-  // NOTE (Finding 4 — record-only, deferred to later/D15): a binding left by a
-  // now-dead shell is never garbage-collected, so it still reads as an active
-  // session here and forces --drop-first. Accepted for 1.7 — dead-shell binding GC
-  // is future work, not part of the engine + core CLI.
-  const session = registry.bindings.some((b) => b.envs.includes(name));
-  const manifest = await readState(paths);
-  const globalStack = readGlobalStack(manifest).includes(name);
-  const materialised = manifest.items.some((i) => i.ownerEnv === name);
-  return { session, globalStack, materialised };
+    default:
+      return withNotices(presentInspection(result), notices);
+  }
 }

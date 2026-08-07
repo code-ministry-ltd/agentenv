@@ -86,6 +86,8 @@ export interface SyncBeforeResult {
    * contains a suspected secret. Destructive store commands must stop before
    * applying their own effects so they cannot erase the only local copy. */
   driftCommitBlocked?: boolean;
+  /** Present only when the blocked drift was proven secret-bearing. */
+  driftBlockReason?: 'secret';
   /** A whole-command local commit is waiting for required Git bookkeeping. */
   pendingCommand?: string;
 }
@@ -117,9 +119,14 @@ export interface SyncBeforeRequest {
   offline?: boolean;
   /** Service local persistence but defer fetch; the caller may still push afterward. */
   skipFetch?: boolean;
+  /** A destructive caller must refuse immediately after unsafe drift is found,
+   * before adoption, fetch, candidate promotion, or reconciliation can mutate
+   * other canonical/state bytes. */
+  stopOnDriftBlocked?: boolean;
   /** Command-layer whole-sweep publisher, injected to avoid low-level CLI coupling. */
   publishDrift?: () => Promise<{
-    publication: 'no-change' | 'complete' | 'git-pending';
+    publication: 'no-change' | 'complete' | 'git-pending' | 'blocked';
+    blockedReason?: 'secret';
     transactionId?: string;
   }>;
   /** Command-layer atomic automatic-adoption publisher. */
@@ -156,7 +163,7 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
 
   if (!req.alreadySwept && req.publishDrift) {
     const published = await req.publishDrift();
-    if (published.publication === 'git-pending') {
+    if (published.publication === 'git-pending' || published.publication === 'blocked') {
       return {
         synced: repo,
         pulled: false,
@@ -164,7 +171,10 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
         conflicted: false,
         paused: false,
         driftCommitBlocked: true,
-        ...(published.transactionId ? { pendingCommand: published.transactionId } : {}),
+        ...(published.blockedReason ? { driftBlockReason: published.blockedReason } : {}),
+        ...(published.publication === 'git-pending' && published.transactionId
+          ? { pendingCommand: published.transactionId }
+          : {}),
       };
     }
   }
@@ -196,6 +206,17 @@ export async function beginStoreSync(req: SyncBeforeRequest): Promise<SyncBefore
           'Remove the secret (use a ${VAR} placeholder) so the drift can be committed. ' +
           'If it is a documented example, mark the line `agentenv:allow-secret`.',
       );
+      if (req.stopOnDriftBlocked) {
+        return {
+          synced: true,
+          pulled: false,
+          quarantined: false,
+          conflicted: false,
+          paused: false,
+          driftCommitBlocked: true,
+          driftBlockReason: 'secret',
+        };
+      }
     }
 
     // 2b. Auto-adopt sweep (D10): a NEW item an agent created inside an activated

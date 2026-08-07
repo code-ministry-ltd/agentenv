@@ -142,7 +142,12 @@ export async function commitRequiredSteps(
 export async function openStoreSync(
   ctx: SyncCtx,
   notices: string[],
-  opts: { alreadySwept?: boolean; skipAdopt?: boolean; skipFetch?: boolean } = {},
+  opts: {
+    alreadySwept?: boolean;
+    skipAdopt?: boolean;
+    skipFetch?: boolean;
+    stopOnDriftBlocked?: boolean;
+  } = {},
 ): Promise<SyncBeforeResult> {
   const { paths, env, options } = ctx;
   const result = await beginStoreSync({
@@ -155,6 +160,7 @@ export async function openStoreSync(
     ...(opts.alreadySwept ? { alreadySwept: true } : {}),
     ...(opts.skipAdopt ? { skipAdopt: true } : {}),
     ...(opts.skipFetch ? { skipFetch: true } : {}),
+    ...(opts.stopOnDriftBlocked ? { stopOnDriftBlocked: true } : {}),
     ...(!opts.alreadySwept ? {
       publishDrift: async () => {
         const published = await publishDriftSweep({
@@ -169,6 +175,9 @@ export async function openStoreSync(
         });
         return {
           publication: published.publication,
+          ...(published.blockedReason
+            ? { blockedReason: published.blockedReason }
+            : {}),
           ...(published.transactionId ? { transactionId: published.transactionId } : {}),
         };
       },

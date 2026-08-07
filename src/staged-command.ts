@@ -77,6 +77,10 @@ export interface PublishStagedCommandRequest {
   gitBookkeeping?: () => Promise<void>;
   gitMessage?: string;
   gitSteps?: readonly PlannedGitStep[];
+  /** Optional operation-level critical section. The guard must call `effect`
+   * exactly once or throw; used when a logical precondition and path mutation
+   * must share the machine lock. */
+  effectGuard?: (operationId: string, effect: () => Promise<void>) => Promise<void>;
   afterApply?: (operationId: string) => Promise<void>;
   afterPersist?: (plan: CommandPlan) => Promise<void>;
 }
@@ -535,16 +539,20 @@ export async function publishStagedCommand(req: PublishStagedCommandRequest): Pr
       ...base,
       apply: async () => {
         await beforeMutation();
-        if (!identitiesEqual(await capturePathIdentity(item.entry.target), item.pre)) {
-          throw new StagedCommandExpectedIdentityError(
-            item.entry.id,
-            item.entry.target,
-            'pre-apply',
-          );
-        }
-        await rm(item.entry.target, { recursive: true, force: true });
-        if (item.post.kind !== 'absent') await copyPath(item.entry.staged, item.entry.target);
-        await req.afterApply?.(operation.id);
+        const apply = async (): Promise<void> => {
+          if (!identitiesEqual(await capturePathIdentity(item.entry.target), item.pre)) {
+            throw new StagedCommandExpectedIdentityError(
+              item.entry.id,
+              item.entry.target,
+              'pre-apply',
+            );
+          }
+          await rm(item.entry.target, { recursive: true, force: true });
+          if (item.post.kind !== 'absent') await copyPath(item.entry.staged, item.entry.target);
+          await req.afterApply?.(operation.id);
+        };
+        if (req.effectGuard) await req.effectGuard(operation.id, apply);
+        else await apply();
       },
     });
   }

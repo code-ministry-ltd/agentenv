@@ -308,10 +308,21 @@ Size: M
 Extract the delete operation and active-environment/state checks from the command
 without weakening retained-data, recovery, quarantine, or Git behavior.
 
-- [ ] Inactive deletion stages and publishes the same result as the existing CLI.
-- [ ] Active, stale, invalid, pending, and injected-failure refusals leave the
+- [x] Inactive deletion stages and publishes the same result as the existing CLI.
+- [x] Active, stale, invalid, pending, and injected-failure refusals leave the
   environment and state byte-identical.
-- [ ] Existing CLI observable behavior remains unchanged.
+- [x] Existing CLI observable behavior remains unchanged.
+
+Verified 2026-08-07: application deletion and exact CLI characterization tests
+(22/22) passed, plus 121 focused active-state, secret-drift, path-safety,
+session-binding, staged-command/WAL, concurrency, and Git-granularity tests.
+Deletion validates inactivity atomically with removal, refuses waiting session
+activation after removal, preserves concurrent replacements, never follows a
+target outside the store, and distinguishes secret-bearing drift from ordinary
+Git failure without unnecessary recovery state. Lint, all three typechecks, and
+the full regression suite (155 files, 1,189 tests) passed; the known
+`skill-source.git-hang` stdout timing fixture flaked once, passed immediately in
+isolation, and the complete rerun passed.
 
 Verification: `npx vitest run test/environment-delete.test.ts test/rm.test.ts`
 

@@ -13,14 +13,20 @@ export interface PublishDriftSweepRequest extends DriftSweepRequest {
   gitRun?: GitRunner;
   gitBookkeeping?: (
     steps: readonly PlannedGitStep[],
-    transactionId: string,
+    transactionId?: string,
   ) => Promise<void>;
 }
 
 export interface PublishDriftSweepResult {
   result: DriftSweepResult;
-  publication: 'no-change' | 'complete' | 'git-pending';
+  publication: 'no-change' | 'complete' | 'git-pending' | 'blocked';
+  blockedReason?: 'secret';
   transactionId?: string;
+}
+
+function isSecretScanBlock(error: unknown): boolean {
+  return error instanceof Error &&
+    /required Git bookkeeping .* is 'blocked'/.test(error.message);
 }
 
 /** Publish one discovered drift sweep, with its required scoped Git commit inside
@@ -49,6 +55,29 @@ export async function publishDriftSweep(
         paths: gitPaths,
       }]
     : [];
+  // Existing working-tree drift needs no local WAL: there is no effect to undo
+  // or recover. Attempt its scoped commit directly so a secret-scan refusal does
+  // not manufacture a git-pending command in state.json.
+  if (planned.entries.length === 0 && !planned.statePatch && gitSteps.length > 0) {
+    try {
+      if (!req.gitBookkeeping) throw new Error('drift sweep requires Git bookkeeping');
+      await req.gitBookkeeping(gitSteps);
+      await rm(stagingRoot, { recursive: true, force: true });
+      return { result: planned.result, publication: 'complete', transactionId };
+    } catch (error) {
+      if (isSecretScanBlock(error)) {
+        await rm(stagingRoot, { recursive: true, force: true });
+        return {
+          result: planned.result,
+          publication: 'blocked',
+          blockedReason: 'secret',
+        };
+      }
+      // Ordinary Git/index failures retain the established git-pending command
+      // so recovery can retry required bookkeeping. Only a proven secret block
+      // is safe to refuse without manufacturing recovery state.
+    }
+  }
   const publication = await publishWithPendingNotice({
     paths: req.paths,
     transactionId,

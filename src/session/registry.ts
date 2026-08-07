@@ -33,6 +33,13 @@ export class SessionRegistryError extends Error {
   }
 }
 
+export class SessionEnvironmentUnavailableError extends Error {
+  constructor(readonly environment: string) {
+    super(`environment '${environment}' disappeared during session activation`);
+    this.name = 'SessionEnvironmentUnavailableError';
+  }
+}
+
 /**
  * One binding: an env stack bound to a shell session at a project root (D8). The
  * pair (session, projectRoot) is the identity — a shell can bind different envs
@@ -150,6 +157,42 @@ export async function setBinding(
     const full: SessionBinding = { ...binding, createdAt: binding.createdAt ?? Date.now() };
     const at = registry.bindings.findIndex(
       (b) => b.session === full.session && b.projectRoot === full.projectRoot,
+    );
+    if (at >= 0) registry.bindings[at] = full;
+    else registry.bindings.push(full);
+    await writeRegistry(paths, registry);
+  });
+}
+
+/** Command-facing binding write: validation and persistence share the machine
+ * lock so a concurrent environment deletion cannot leave a fresh dangling
+ * binding after it removes the directory. Low-level `setBinding` remains
+ * permissive for registry migration/repair tests. */
+export async function setBindingForExistingEnvironments(
+  paths: Paths,
+  binding: Omit<SessionBinding, 'createdAt'> & { createdAt?: number },
+): Promise<void> {
+  await withLock(paths, async () => {
+    for (const environment of binding.envs) {
+      try {
+        const identity = await lstat(paths.envDir(environment));
+        if (!identity.isDirectory()) throw new SessionEnvironmentUnavailableError(environment);
+      } catch (error) {
+        if (error instanceof SessionEnvironmentUnavailableError) throw error;
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          throw new SessionEnvironmentUnavailableError(environment);
+        }
+        throw error;
+      }
+    }
+    const registry = await readSessionRegistry(paths);
+    const full: SessionBinding = {
+      ...binding,
+      createdAt: binding.createdAt ?? Date.now(),
+    };
+    const at = registry.bindings.findIndex(
+      (candidate) => candidate.session === full.session &&
+        candidate.projectRoot === full.projectRoot,
     );
     if (at >= 0) registry.bindings[at] = full;
     else registry.bindings.push(full);

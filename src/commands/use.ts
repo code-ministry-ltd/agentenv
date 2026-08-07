@@ -5,7 +5,10 @@ import { adapters as realAdapters } from '../adapters/index.js';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
 import { materialiseGlobal } from '../engine.js';
-import { setBinding } from '../session/registry.js';
+import {
+  SessionEnvironmentUnavailableError,
+  setBindingForExistingEnvironments,
+} from '../session/registry.js';
 import { resolveProjectRoot } from '../session/registry.js';
 import { validateEnvs } from './activation.js';
 import { renderGlobalSkips } from './global-report.js';
@@ -68,12 +71,21 @@ async function useSession(
   }
 
   const projectRoot = await resolveProjectRoot(cwd);
-  await setBinding(paths, {
-    session,
-    projectRoot,
-    envs: kept,
-    global: false,
-  });
+  try {
+    await setBindingForExistingEnvironments(paths, {
+      session,
+      projectRoot,
+      envs: kept,
+      global: false,
+    });
+  } catch (error) {
+    if (!(error instanceof SessionEnvironmentUnavailableError)) throw error;
+    return {
+      stdout: '',
+      stderr: `use: environment '${error.environment}' changed during activation — retry\n`,
+      code: 1,
+    };
+  }
 
   const stderr = notices.length > 0 ? `${notices.join('\n')}\n` : undefined;
   return {
