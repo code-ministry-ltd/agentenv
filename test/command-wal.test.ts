@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { existsSync, writeFileSync } from 'node:fs';
+import { describe, expect, it, vi } from 'vitest';
 import { createCommandPlan } from '../src/command-plan.js';
 import {
   executeCommandPlan,
@@ -8,11 +9,24 @@ import {
 import { withLock } from '../src/lock.js';
 import type { PathIdentity } from '../src/path-identity.js';
 import { resolvePaths } from '../src/paths.js';
-import { readState, writeState, type QuarantineRecord } from '../src/state.js';
+import {
+  readState,
+  STATE_SCHEMA_VERSION_STRING,
+  writeState,
+  type QuarantineRecord,
+} from '../src/state.js';
 import { makeTempHome } from './helpers.js';
 
 const absent: PathIdentity = { kind: 'absent' };
 const present = (digest: string): PathIdentity => ({ kind: 'file', digest, mode: 0o600 });
+
+function pathPreconditionUndo(expectedIdentity: PathIdentity): string {
+  return JSON.stringify({
+    schemaVersion: 1,
+    type: 'path-precondition',
+    expectedIdentity,
+  });
+}
 
 function plan(ids: string[]) {
   return createCommandPlan({
@@ -215,6 +229,192 @@ describe('whole-command WAL executor', () => {
     });
     expect(events).toEqual(['apply:a', 'git:fail', 'git:retry']);
     expect((await readState(paths)).commands).toEqual([]);
+    th.cleanup();
+  });
+
+  it('never calls a read precondition apply callback and keeps its rollback nonmutating', async () => {
+    const th = makeTempHome();
+    const paths = resolvePaths(th.env);
+    const mutationMarker = `${th.home}/malicious-read-apply`;
+    const readApply = vi.fn(async () => {
+      writeFileSync(mutationMarker, 'mutated\n');
+    });
+    const readObserve = vi.fn(async () => absent);
+    const readUndo = vi.fn(async () => {
+      writeFileSync(mutationMarker, 'undo mutated\n');
+    });
+    const mutatorState = { value: absent as PathIdentity };
+    const failingMutator = effect('mutator', [], mutatorState, true);
+    const readPlan = createCommandPlan({
+      transactionId: 'read-precondition',
+      kind: 'test-command',
+      operations: [
+        {
+          id: 'source',
+          kind: 'read-path-precondition',
+          path: '/source',
+          preIdentity: absent,
+          postIdentity: absent,
+          undoRef: pathPreconditionUndo(absent),
+        },
+        {
+          id: 'mutator',
+          kind: 'test-effect',
+          path: '/mutator',
+          preIdentity: absent,
+          postIdentity: present('mutator'),
+        },
+      ],
+    });
+
+    await expect(executeCommandPlan({
+      paths,
+      plan: readPlan,
+      effects: new Map([
+        ['source', {
+          observeIdentity: readObserve,
+          apply: readApply,
+          undo: readUndo,
+        }],
+        ['mutator', failingMutator],
+      ]),
+    })).rejects.toThrow(/failed:mutator/);
+
+    expect(readApply).not.toHaveBeenCalled();
+    expect(readObserve).not.toHaveBeenCalled();
+    expect(readUndo).not.toHaveBeenCalled();
+    expect(existsSync(mutationMarker)).toBe(false);
+    expect((await readState(paths)).commands).toEqual([]);
+    th.cleanup();
+  });
+
+  it('compares a read precondition from its durable path without caller callbacks', async () => {
+    const th = makeTempHome();
+    const paths = resolvePaths(th.env);
+    const source = `${th.home}/missing-source`;
+    const expected = present('expected-source');
+    const observe = vi.fn(async () => expected);
+    const apply = vi.fn(async () => {
+      writeFileSync(source, 'malicious mutation\n');
+    });
+    const undo = vi.fn(async () => {
+      writeFileSync(source, 'malicious rollback\n');
+    });
+
+    await expect(executeCommandPlan({
+      paths,
+      plan: createCommandPlan({
+        transactionId: 'mismatched-read-precondition',
+        kind: 'test-command',
+        operations: [{
+          id: 'source',
+          kind: 'read-path-precondition',
+          path: source,
+          preIdentity: expected,
+          postIdentity: expected,
+          undoRef: pathPreconditionUndo(expected),
+        }],
+      }),
+      effects: new Map([['source', { observeIdentity: observe, apply, undo }]]),
+    })).rejects.toThrow(/path precondition.*changed/i);
+
+    expect(observe).not.toHaveBeenCalled();
+    expect(apply).not.toHaveBeenCalled();
+    expect(undo).not.toHaveBeenCalled();
+    expect(existsSync(source)).toBe(false);
+    expect((await readState(paths)).commands).toEqual([]);
+    th.cleanup();
+  });
+
+  it('rejects duplicate durable operation ids before recovery can touch an effect', async () => {
+    const th = makeTempHome();
+    const paths = resolvePaths(th.env);
+    const apply = vi.fn(async () => {});
+    const undo = vi.fn(async () => {});
+    writeFileSync(paths.state, JSON.stringify({
+      version: STATE_SCHEMA_VERSION_STRING,
+      items: [],
+      commands: [{
+        schemaVersion: 2,
+        transactionId: 'duplicate-operations',
+        kind: 'test-command',
+        gitRequired: false,
+        phase: 'applying',
+        commitPoint: false,
+        operations: [
+          {
+            id: 'duplicate',
+            kind: 'replace-path',
+            path: '/first',
+            preIdentity: absent,
+            postIdentity: present('first'),
+            state: 'applied',
+          },
+          {
+            id: 'duplicate',
+            kind: 'replace-path',
+            path: '/second',
+            preIdentity: absent,
+            postIdentity: present('second'),
+            state: 'applied',
+          },
+        ],
+      }],
+    }));
+
+    await expect(recoverCommandPlan({
+      paths,
+      transactionId: 'duplicate-operations',
+      effects: new Map([['duplicate', {
+        observeIdentity: async () => present('second'),
+        apply,
+        undo,
+      }]]),
+    })).rejects.toThrow(/duplicate.*operation id/i);
+    expect(apply).not.toHaveBeenCalled();
+    expect(undo).not.toHaveBeenCalled();
+    th.cleanup();
+  });
+
+  it('refuses corrupted mutator rollback suppression during recovery before touching the effect', async () => {
+    const th = makeTempHome();
+    const paths = resolvePaths(th.env);
+    const apply = vi.fn(async () => {});
+    const undo = vi.fn(async () => {});
+    writeFileSync(paths.state, JSON.stringify({
+      version: STATE_SCHEMA_VERSION_STRING,
+      items: [],
+      commands: [{
+        schemaVersion: 2,
+        transactionId: 'corrupt-recovery',
+        kind: 'test-command',
+        gitRequired: false,
+        phase: 'applying',
+        commitPoint: false,
+        operations: [{
+          id: 'mutator',
+          kind: 'replace-path',
+          readOnly: true,
+          path: '/target',
+          preIdentity: absent,
+          postIdentity: present('mutator'),
+          undoRef: 'mutating undo metadata',
+          state: 'applied',
+        }],
+      }],
+    }));
+
+    await expect(recoverCommandPlan({
+      paths,
+      transactionId: 'corrupt-recovery',
+      effects: new Map([['mutator', {
+        observeIdentity: async () => present('mutator'),
+        apply,
+        undo,
+      }]]),
+    })).rejects.toThrow(/readOnly/i);
+    expect(apply).not.toHaveBeenCalled();
+    expect(undo).not.toHaveBeenCalled();
     th.cleanup();
   });
 });

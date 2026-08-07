@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { capturePathIdentity } from '../../dist/path-identity.js';
 import { resolvePaths } from '../../dist/paths.js';
 import {
   publishStagedCommand,
@@ -11,6 +12,7 @@ const paths = resolvePaths(process.env);
 const transactionId = 'staged-subprocess';
 const root = join(paths.base, 'staged-effects');
 const targets = [join(root, 'a.txt'), join(root, 'b.txt')];
+const source = join(root, 'source');
 const stagingRoot = join(paths.live, 'commands', transactionId);
 const gitMarker = join(root, 'git-complete');
 
@@ -30,6 +32,9 @@ if (process.env.MODE === 'recover') {
   await mkdir(root, { recursive: true });
   await writeFile(targets[0], 'old-a\n');
   await writeFile(targets[1], 'old-b\n');
+  await mkdir(source, { recursive: true });
+  await writeFile(join(source, 'env.yaml'), 'version: "1.0"\ndescription: original source\n');
+  const sourceIdentity = await capturePathIdentity(source);
   const manifest = emptyManifest();
   manifest.inventory = ['old'];
   await writeState(paths, manifest);
@@ -44,6 +49,13 @@ if (process.env.MODE === 'recover') {
     stagingRoot,
     allowedRoots: [root],
     entries: targets.map((target, index) => ({ id: `path-${index}`, target, staged: staged[index] })),
+    ...(process.env.USE_PRECONDITION === '1' ? {
+      preconditions: [{
+        id: 'source-environment',
+        path: source,
+        expectedIdentity: sourceIdentity,
+      }],
+    } : {}),
     statePatch: { inventory: ['new'] },
     gitSteps: [{ id: 'commit', message: 'staged kill test', paths: [join(paths.store, 'placeholder')] }],
     gitBookkeeping,

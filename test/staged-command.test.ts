@@ -1,10 +1,12 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   publishStagedCommand,
   recoverPendingStagedCommands,
+  StagedCommandExpectedIdentityError,
 } from '../src/staged-command.js';
+import { capturePathIdentity } from '../src/path-identity.js';
 import { resolvePaths } from '../src/paths.js';
 import { emptyManifest, readState, writeState } from '../src/state.js';
 import { makeTempHome, type TempHome } from './helpers.js';
@@ -16,6 +18,118 @@ afterEach(() => {
 });
 
 describe('staged whole-command publication', () => {
+  it.each(['allowed-root', 'target-ancestor'] as const)(
+    'rejects a symlinked %s without publishing through it',
+    async (kind) => {
+      const home = makeTempHome();
+      homes.push(home);
+      const paths = resolvePaths(home.env);
+      const physicalRoot = join(home.home, 'surface');
+      const outside = join(home.home, 'outside');
+      const allowedRoot = kind === 'allowed-root' ? join(home.home, 'linked-surface') : physicalRoot;
+      const target = kind === 'allowed-root'
+        ? join(allowedRoot, 'config')
+        : join(allowedRoot, 'linked-child', 'config');
+      mkdirSync(physicalRoot, { recursive: true });
+      mkdirSync(outside, { recursive: true });
+      if (kind === 'allowed-root') symlinkSync(outside, allowedRoot);
+      else symlinkSync(outside, join(physicalRoot, 'linked-child'));
+      const stagingRoot = join(paths.live, 'commands', `symlinked-${kind}`);
+      const staged = join(stagingRoot, 'config');
+      mkdirSync(stagingRoot, { recursive: true });
+      writeFileSync(staged, 'planned\n');
+
+      await expect(publishStagedCommand({
+        paths,
+        transactionId: `symlinked-${kind}`,
+        kind: 'test-maintenance',
+        stagingRoot,
+        allowedRoots: [allowedRoot],
+        entries: [{ id: 'config', target, staged }],
+      })).rejects.toThrow(/symlink.*ancestor|physical.*root/i);
+
+      expect(existsSync(join(outside, 'config'))).toBe(false);
+    },
+  );
+
+  it('reports a typed planning identity race with the affected entry id', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const root = join(home.home, 'surface');
+    const target = join(root, 'config');
+    const stagingRoot = join(paths.live, 'commands', 'planning-race');
+    const staged = join(stagingRoot, 'config');
+    mkdirSync(root, { recursive: true });
+    mkdirSync(stagingRoot, { recursive: true });
+    writeFileSync(target, 'concurrent\n');
+    writeFileSync(staged, 'planned\n');
+
+    let caught: unknown;
+    try {
+      await publishStagedCommand({
+        paths,
+        transactionId: 'planning-race',
+        kind: 'test-maintenance',
+        stagingRoot,
+        allowedRoots: [root],
+        entries: [{
+          id: 'config',
+          target,
+          staged,
+          expectedPreIdentity: { kind: 'absent' },
+        }],
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(StagedCommandExpectedIdentityError);
+    expect(caught).toMatchObject({ entryId: 'config', phase: 'planning', path: target });
+    expect(readFileSync(target, 'utf8')).toBe('concurrent\n');
+  });
+
+  it('reports a typed pre-apply race and preserves the concurrent target', async () => {
+    const home = makeTempHome();
+    homes.push(home);
+    const paths = resolvePaths(home.env);
+    const root = join(home.home, 'surface');
+    const target = join(root, 'config');
+    const stagingRoot = join(paths.live, 'commands', 'pre-apply-race');
+    const staged = join(stagingRoot, 'config');
+    mkdirSync(root, { recursive: true });
+    mkdirSync(stagingRoot, { recursive: true });
+    writeFileSync(target, 'original\n');
+    writeFileSync(staged, 'planned\n');
+    const expectedPreIdentity = await capturePathIdentity(target);
+    let replaced = false;
+
+    let caught: unknown;
+    try {
+      await publishStagedCommand({
+        paths,
+        transactionId: 'pre-apply-race',
+        kind: 'test-maintenance',
+        stagingRoot,
+        allowedRoots: [root],
+        entries: [{ id: 'config', target, staged, expectedPreIdentity }],
+        afterPersist: async (plan) => {
+          if (replaced || plan.phase !== 'planned') return;
+          replaced = true;
+          writeFileSync(target, 'concurrent\n');
+        },
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(replaced).toBe(true);
+    expect(caught).toBeInstanceOf(StagedCommandExpectedIdentityError);
+    expect(caught).toMatchObject({ entryId: 'config', phase: 'pre-apply', path: target });
+    expect(readFileSync(target, 'utf8')).toBe('concurrent\n');
+    expect((await readState(paths)).commands).toEqual([]);
+  });
+
   it('persists the complete path and state plan before the first actual effect', async () => {
     const home = makeTempHome();
     homes.push(home);

@@ -1,3 +1,5 @@
+import { identitiesEqual, type PathIdentity } from './path-identity.js';
+
 /** Durable states for one effect in a whole-command write-ahead plan. */
 export type OperationState = 'pending' | 'applying' | 'applied' | 'undoing' | 'undone';
 
@@ -18,6 +20,21 @@ export interface PlannedOperationInput {
   preIdentity?: PathIdentity;
   postIdentity?: PathIdentity;
   undoRef?: string;
+}
+
+/** The only durable operation variant whose recovery never invokes undo. */
+export interface ReadPathPreconditionOperationInput extends PlannedOperationInput {
+  kind: 'read-path-precondition';
+  path: string;
+  preIdentity: PathIdentity;
+  postIdentity: PathIdentity;
+  undoRef: string;
+}
+
+export interface PathPreconditionUndo {
+  schemaVersion: 1;
+  type: 'path-precondition';
+  expectedIdentity: PathIdentity;
 }
 
 export interface PlannedOperation extends PlannedOperationInput {
@@ -59,6 +76,97 @@ export interface CreateCommandPlanInput {
   operations: PlannedOperationInput[];
 }
 
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isValidPathIdentity(value: unknown): value is PathIdentity {
+  if (!isObject(value)) return false;
+  if (value.kind === 'absent') return true;
+  if (value.kind === 'symlink') return typeof value.target === 'string';
+  if (value.kind === 'directory-location') {
+    return (
+      typeof value.device === 'string' &&
+      value.device !== '' &&
+      typeof value.inode === 'string' &&
+      value.inode !== '' &&
+      Number.isSafeInteger(value.mode) &&
+      (value.mode as number) >= 0
+    );
+  }
+  return (
+    (value.kind === 'file' || value.kind === 'directory') &&
+    typeof value.digest === 'string' &&
+    value.digest !== '' &&
+    Number.isSafeInteger(value.mode) &&
+    (value.mode as number) >= 0
+  );
+}
+
+function parseUndoRecord(undoRef: unknown): Record<string, unknown> | null {
+  if (typeof undoRef !== 'string') return null;
+  try {
+    const parsed: unknown = JSON.parse(undoRef);
+    return isObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Validate the durable discriminator that is allowed to suppress rollback. */
+export function plannedOperationInvariantError(
+  operation: Record<string, unknown>,
+): string | null {
+  if ('readOnly' in operation) {
+    return `operation '${String(operation.id)}' cannot use the retired readOnly flag`;
+  }
+
+  const undo = parseUndoRecord(operation.undoRef);
+  const pathPreconditionUndo = undo?.type === 'path-precondition';
+  if (operation.kind !== 'read-path-precondition') {
+    return pathPreconditionUndo
+      ? `operation '${String(operation.id)}' has path-precondition undo metadata but is not a read-path-precondition`
+      : null;
+  }
+
+  if (typeof operation.path !== 'string' || operation.path === '') {
+    return `read-path-precondition operation '${String(operation.id)}' requires a non-empty path`;
+  }
+  if (!isValidPathIdentity(operation.preIdentity)) {
+    return `read-path-precondition operation '${String(operation.id)}' requires a valid preIdentity`;
+  }
+  if (!isValidPathIdentity(operation.postIdentity)) {
+    return `read-path-precondition operation '${String(operation.id)}' requires a valid postIdentity`;
+  }
+  if (!identitiesEqual(operation.preIdentity, operation.postIdentity)) {
+    return `read-path-precondition operation '${String(operation.id)}' requires identical preIdentity and postIdentity`;
+  }
+  if (
+    !pathPreconditionUndo ||
+    undo.schemaVersion !== 1 ||
+    !isValidPathIdentity(undo.expectedIdentity)
+  ) {
+    return `read-path-precondition operation '${String(operation.id)}' requires valid path-precondition undo metadata`;
+  }
+  if (!identitiesEqual(operation.preIdentity, undo.expectedIdentity)) {
+    return `read-path-precondition operation '${String(operation.id)}' undo metadata expectedIdentity must match its path identity`;
+  }
+  return null;
+}
+
+export function assertPlannedOperationInvariant(operation: PlannedOperationInput): void {
+  const invalid = plannedOperationInvariantError(operation as unknown as Record<string, unknown>);
+  if (invalid) throw new Error(invalid);
+}
+
+/** True only for the fully validated durable read-only operation variant. */
+export function isReadPathPreconditionOperation(
+  operation: PlannedOperationInput,
+): operation is ReadPathPreconditionOperationInput {
+  assertPlannedOperationInvariant(operation);
+  return operation.kind === 'read-path-precondition';
+}
+
 /** Create a complete inert plan before the first effect is applied. */
 export function createCommandPlan(input: CreateCommandPlanInput): CommandPlan {
   if (!input.transactionId) throw new Error('transactionId is required');
@@ -67,6 +175,7 @@ export function createCommandPlan(input: CreateCommandPlanInput): CommandPlan {
     if (!operation.id || ids.has(operation.id)) {
       throw new Error(`operation ids must be non-empty and unique: '${operation.id}'`);
     }
+    assertPlannedOperationInvariant(operation);
     ids.add(operation.id);
   }
   const gitStepIds = new Set<string>();
@@ -152,4 +261,3 @@ export function advanceOperation(
   operations[index] = { ...current, state: next };
   return { ...plan, operations };
 }
-import type { PathIdentity } from './path-identity.js';

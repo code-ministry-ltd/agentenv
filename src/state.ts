@@ -1,5 +1,9 @@
 import { readFile } from 'node:fs/promises';
-import type { CommandPlan, OperationState } from './command-plan.js';
+import {
+  plannedOperationInvariantError,
+  type CommandPlan,
+  type OperationState,
+} from './command-plan.js';
 import type { GlobalProjection } from './global-projection.js';
 import type { MigrationState } from './migration-state.js';
 import type { BackupRef } from './backups.js';
@@ -239,6 +243,14 @@ function validatePathIdentity(value: unknown): string | null {
   if (value.kind === 'symlink') {
     return typeof value.target === 'string' ? null : 'symlink target must be a string';
   }
+  if (value.kind === 'directory-location') {
+    if (typeof value.device !== 'string' || value.device === '') return 'device must be a string';
+    if (typeof value.inode !== 'string' || value.inode === '') return 'inode must be a string';
+    if (!Number.isSafeInteger(value.mode) || (value.mode as number) < 0) {
+      return 'mode must be a non-negative integer';
+    }
+    return null;
+  }
   if (value.kind === 'file' || value.kind === 'directory') {
     if (typeof value.digest !== 'string' || value.digest === '') return 'digest must be a string';
     if (!Number.isSafeInteger(value.mode) || (value.mode as number) < 0) {
@@ -290,6 +302,7 @@ function validateCommand(record: Record<string, unknown>, label: string): string
   if (!COMMAND_PHASES.has(record.phase as string)) return `${label}.phase is invalid`;
   if (typeof record.commitPoint !== 'boolean') return `${label}.commitPoint must be boolean`;
   if (!Array.isArray(record.operations)) return `${label}.operations must be an array`;
+  const operationIds = new Set<string>();
   for (const operation of record.operations) {
     if (
       !isObject(operation) ||
@@ -300,6 +313,10 @@ function validateCommand(record: Record<string, unknown>, label: string): string
     ) {
       return `${label}.operations contains an invalid operation`;
     }
+    if (operationIds.has(operation.id)) {
+      return `${label}.operations contains duplicate operation id '${operation.id}'`;
+    }
+    operationIds.add(operation.id);
     if (!OPERATION_STATES.has(operation.state as OperationState)) {
       return `${label}.operations contains an invalid state`;
     }
@@ -314,6 +331,8 @@ function validateCommand(record: Record<string, unknown>, label: string): string
     if (operation.undoRef !== undefined && typeof operation.undoRef !== 'string') {
       return `${label}.operations contains an invalid undoRef`;
     }
+    const invalidInvariant = plannedOperationInvariantError(operation);
+    if (invalidInvariant) return `${label}.operations ${invalidInvariant}`;
   }
   return null;
 }

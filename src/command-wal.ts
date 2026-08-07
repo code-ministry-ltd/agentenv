@@ -1,12 +1,16 @@
 import {
   advanceCommand,
   advanceOperation,
+  assertPlannedOperationInvariant,
+  isReadPathPreconditionOperation,
   type CommandPlan,
   type PlannedOperation,
 } from './command-plan.js';
 import { withLock } from './lock.js';
 import {
+  captureExpectedPathIdentity,
   decidePreCommitRecovery,
+  identitiesEqual,
   type PathIdentity,
   type PreCommitRecoveryDecision,
 } from './path-identity.js';
@@ -21,12 +25,25 @@ export interface CommandEffect {
   rescue?(observed: PathIdentity): Promise<QuarantineRecord>;
 }
 
+/** A durable read precondition no longer matches immediately before its WAL step. */
+export class CommandPathPreconditionError extends Error {
+  constructor(
+    readonly operationId: string,
+    readonly path: string,
+  ) {
+    super(`command path precondition '${operationId}' changed before apply: ${path}`);
+    this.name = 'CommandPathPreconditionError';
+  }
+}
+
 export interface CommandWalRequest {
   paths: Paths;
   plan: CommandPlan;
   effects: ReadonlyMap<string, CommandEffect>;
   /** Required local Git commit/bookkeeping; queued fail-soft push belongs after this callback. */
   gitBookkeeping?: () => Promise<void>;
+  /** Read-only validation after the inert plan is durable and before any effect transition. */
+  beforeEffects?: (plan: CommandPlan) => Promise<void>;
   /** Test/diagnostic seam invoked after each durable plan transition. */
   afterPersist?: (plan: CommandPlan) => Promise<void>;
 }
@@ -96,6 +113,7 @@ async function recoveryDecision(
   operation: PlannedOperation,
   effect: CommandEffect,
 ): Promise<PreCommitRecoveryDecision> {
+  if (isReadPathPreconditionOperation(operation)) return { action: 'skip-pre-state' };
   if (!operation.preIdentity || !operation.postIdentity) {
     return { action: 'undo-post-state' };
   }
@@ -210,6 +228,9 @@ export async function executeCommandPlan(req: CommandWalRequest): Promise<void> 
   if (requestedPlan.gitRequired && !req.gitBookkeeping) {
     throw new Error(`command '${requestedPlan.transactionId}' requires Git bookkeeping`);
   }
+  for (const operation of requestedPlan.operations) {
+    assertPlannedOperationInvariant(operation);
+  }
 
   await withLock(req.paths, async () => {
     const manifest = await readState(req.paths);
@@ -222,13 +243,23 @@ export async function executeCommandPlan(req: CommandWalRequest): Promise<void> 
 
   let plan = requestedPlan;
   try {
+    await req.beforeEffects?.(plan);
     plan = advanceCommand(plan, 'applying');
     await persistPlan(req.paths, plan, req.afterPersist);
     for (const operation of plan.operations) {
       const effect = requireEffect(req.effects, operation);
       plan = advanceOperation(plan, operation.id, 'applying');
       await persistPlan(req.paths, plan, req.afterPersist);
-      await effect.apply();
+      if (isReadPathPreconditionOperation(operation)) {
+        if (!identitiesEqual(
+          await captureExpectedPathIdentity(operation.path, operation.preIdentity),
+          operation.preIdentity,
+        )) {
+          throw new CommandPathPreconditionError(operation.id, operation.path);
+        }
+      } else {
+        await effect.apply();
+      }
       plan = advanceOperation(plan, operation.id, 'applied');
       await persistPlan(req.paths, plan, req.afterPersist);
     }

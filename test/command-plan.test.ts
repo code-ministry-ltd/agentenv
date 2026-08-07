@@ -4,7 +4,18 @@ import {
   advanceOperation,
   createCommandPlan,
   type CommandPlan,
+  type PlannedOperationInput,
 } from '../src/command-plan.js';
+
+const absent = { kind: 'absent' } as const;
+
+function pathPreconditionUndo(expectedIdentity = absent): string {
+  return JSON.stringify({
+    schemaVersion: 1,
+    type: 'path-precondition',
+    expectedIdentity,
+  });
+}
 
 function plan(): CommandPlan {
   return createCommandPlan({
@@ -75,5 +86,90 @@ describe('whole-command plan automaton', () => {
       gitSteps: [{ id: 'empty', message: 'message', paths: [] }],
       operations: [],
     })).toThrow(/Git step.*path/i);
+  });
+
+  it.each([
+    [
+      'a free readOnly flag on a mutating operation',
+      {
+        id: 'mutator',
+        kind: 'replace-path',
+        readOnly: true,
+        path: '/target',
+        preIdentity: absent,
+        postIdentity: absent,
+        undoRef: 'mutating undo metadata',
+      },
+      /readOnly/i,
+    ],
+    [
+      'a read precondition without a path',
+      {
+        id: 'source',
+        kind: 'read-path-precondition',
+        preIdentity: absent,
+        postIdentity: absent,
+        undoRef: pathPreconditionUndo(),
+      },
+      /requires.*path/i,
+    ],
+    [
+      'a read precondition with unequal identities',
+      {
+        id: 'source',
+        kind: 'read-path-precondition',
+        path: '/source',
+        preIdentity: absent,
+        postIdentity: { kind: 'file', digest: 'replacement', mode: 0o600 },
+        undoRef: pathPreconditionUndo(),
+      },
+      /identical preIdentity and postIdentity/i,
+    ],
+    [
+      'a read precondition with malformed identity metadata',
+      {
+        id: 'source',
+        kind: 'read-path-precondition',
+        path: '/source',
+        preIdentity: { kind: 'file', digest: 42, mode: 0o600 },
+        postIdentity: { kind: 'file', digest: 42, mode: 0o600 },
+        undoRef: pathPreconditionUndo(),
+      },
+      /valid preIdentity/i,
+    ],
+    [
+      'a read precondition without matching undo metadata',
+      {
+        id: 'source',
+        kind: 'read-path-precondition',
+        path: '/source',
+        preIdentity: absent,
+        postIdentity: absent,
+        undoRef: JSON.stringify({
+          schemaVersion: 1,
+          type: 'path-precondition',
+          expectedIdentity: { kind: 'symlink', target: 'elsewhere' },
+        }),
+      },
+      /undo metadata.*expectedIdentity/i,
+    ],
+    [
+      'path-precondition undo metadata on a mutating operation',
+      {
+        id: 'mutator',
+        kind: 'replace-path',
+        path: '/target',
+        preIdentity: absent,
+        postIdentity: absent,
+        undoRef: pathPreconditionUndo(),
+      },
+      /path-precondition undo metadata.*read-path-precondition/i,
+    ],
+  ] as const)('rejects %s', (_label, operation, expected) => {
+    expect(() => createCommandPlan({
+      transactionId: 'invalid-operation',
+      kind: 'test',
+      operations: [operation as unknown as PlannedOperationInput],
+    })).toThrow(expected);
   });
 });

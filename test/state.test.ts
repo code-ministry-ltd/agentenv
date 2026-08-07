@@ -246,6 +246,17 @@ describe('state manifest', () => {
   });
 
   describe('schema-v2 lifecycle validation', () => {
+    function durableCommand(operation: Record<string, unknown>): Record<string, unknown> {
+      return {
+        schemaVersion: 2,
+        transactionId: 'tx',
+        kind: 'staged-command',
+        phase: 'applying',
+        commitPoint: false,
+        operations: [{ state: 'applied', ...operation }],
+      };
+    }
+
     it('rejects a malformed durable command before it can reach a mutating path', async () => {
       const p = paths();
       writeFileSync(
@@ -336,6 +347,123 @@ describe('state manifest', () => {
       );
 
       await expect(readState(p)).rejects.toThrow(/commands.*preIdentity/i);
+    });
+
+    it.each([
+      [
+        'free readOnly rollback suppression',
+        {
+          id: 'mutator',
+          kind: 'replace-path',
+          readOnly: true,
+          path: '/target',
+          preIdentity: { kind: 'absent' },
+          postIdentity: { kind: 'absent' },
+          undoRef: 'mutating undo metadata',
+        },
+        /commands.*readOnly/i,
+      ],
+      [
+        'a read precondition without a path',
+        {
+          id: 'source',
+          kind: 'read-path-precondition',
+          preIdentity: { kind: 'absent' },
+          postIdentity: { kind: 'absent' },
+          undoRef: JSON.stringify({
+            schemaVersion: 1,
+            type: 'path-precondition',
+            expectedIdentity: { kind: 'absent' },
+          }),
+        },
+        /commands.*requires.*path/i,
+      ],
+      [
+        'a read precondition whose identities differ',
+        {
+          id: 'source',
+          kind: 'read-path-precondition',
+          path: '/source',
+          preIdentity: { kind: 'absent' },
+          postIdentity: { kind: 'symlink', target: 'replacement' },
+          undoRef: JSON.stringify({
+            schemaVersion: 1,
+            type: 'path-precondition',
+            expectedIdentity: { kind: 'absent' },
+          }),
+        },
+        /commands.*identical preIdentity and postIdentity/i,
+      ],
+      [
+        'a read precondition with mismatched undo metadata',
+        {
+          id: 'source',
+          kind: 'read-path-precondition',
+          path: '/source',
+          preIdentity: { kind: 'absent' },
+          postIdentity: { kind: 'absent' },
+          undoRef: JSON.stringify({
+            schemaVersion: 1,
+            type: 'path-precondition',
+            expectedIdentity: { kind: 'symlink', target: 'replacement' },
+          }),
+        },
+        /commands.*undo metadata.*expectedIdentity/i,
+      ],
+      [
+        'path-precondition undo metadata attached to a mutator',
+        {
+          id: 'mutator',
+          kind: 'replace-path',
+          path: '/target',
+          preIdentity: { kind: 'absent' },
+          postIdentity: { kind: 'absent' },
+          undoRef: JSON.stringify({
+            schemaVersion: 1,
+            type: 'path-precondition',
+            expectedIdentity: { kind: 'absent' },
+          }),
+        },
+        /commands.*path-precondition undo metadata.*read-path-precondition/i,
+      ],
+    ] as const)('rejects a command containing %s', async (_label, operation, expected) => {
+      const p = paths();
+      writeFileSync(
+        p.state,
+        JSON.stringify({
+          version: STATE_SCHEMA_VERSION_STRING,
+          items: [],
+          commands: [durableCommand(operation)],
+        }),
+      );
+
+      await expect(readState(p)).rejects.toThrow(expected);
+    });
+
+    it('rejects duplicate durable command operation ids', async () => {
+      const p = paths();
+      const operation = {
+        id: 'duplicate',
+        kind: 'replace-path',
+        path: '/target',
+        preIdentity: { kind: 'absent' },
+        postIdentity: { kind: 'absent' },
+      };
+      const command = durableCommand(operation);
+      command.operations = [
+        { state: 'applied', ...operation },
+        { state: 'pending', ...operation, path: '/other-target' },
+      ];
+      writeFileSync(
+        p.state,
+        JSON.stringify({
+          version: STATE_SCHEMA_VERSION_STRING,
+          items: [],
+          commands: [command],
+        }),
+      );
+
+      await expect(readState(p)).rejects.toThrow(/duplicate.*operation id/i);
     });
 
     it('rejects invalid projection identities and non-string candidate blockers', async () => {

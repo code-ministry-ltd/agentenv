@@ -244,12 +244,22 @@ Extract presentation-neutral create/clone operations over the current staged
 publication path, characterize existing CLI output, and make the CLI delegate
 without changing its behavior.
 
-- [ ] Create publishes the valid scaffold and clone preserves the complete source
+- [x] Create publishes the valid scaffold and clone preserves the complete source
   plus provenance through one recoverable command.
-- [ ] Invalid, existing, stale, pending-recovery, Git-failure, and injected-failure
+- [x] Invalid, existing, stale, pending-recovery, Git-failure, and injected-failure
   cases publish nothing partial.
-- [ ] Existing CLI text, JSON, prompts, exit codes, and Git granularity are
+- [x] Existing CLI text, JSON, prompts, exit codes, and Git granularity are
   unchanged by characterization tests.
+
+Verified 2026-08-07: presentation-neutral lifecycle/runtime tests and CLI
+characterization passed with exact scaffold/clone bytes, provenance, modes,
+self-contained links, path-scoped Git commits, typed stale/pending outcomes, and
+no partial publication. Durable source/container preconditions passed real
+SIGKILL/fresh-process recovery boundaries; no-follow source, destination, and
+ancestor-link regressions passed. Focused recovery/lifecycle tests (136/136),
+lint, all three typechecks, build, UI tests (28/28), production-browser tests
+(7/7), and the full regression suite (153 files, 1,169 tests) passed. The full
+suite used the process-local Git signing override recorded under Task 5.
 
 Verification: `npx vitest run test/environment-lifecycle.test.ts test/create.test.ts`
 

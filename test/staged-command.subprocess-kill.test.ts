@@ -1,5 +1,12 @@
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { resolvePaths } from '../src/paths.js';
@@ -21,7 +28,17 @@ afterAll(() => {
   for (const home of homes.splice(0)) home.cleanup();
 });
 
-async function killAt(label: string, failForward: boolean, kind = 'staged-kill-test'): Promise<TempHome> {
+interface KillOptions {
+  precondition?: boolean;
+  whileStopped?: (home: TempHome) => void;
+}
+
+async function killAt(
+  label: string,
+  failForward: boolean,
+  kind = 'staged-kill-test',
+  options: KillOptions = {},
+): Promise<TempHome> {
   const home = makeTempHome();
   homes.push(home);
   const child = spawn(process.execPath, [childScript], {
@@ -32,6 +49,7 @@ async function killAt(label: string, failForward: boolean, kind = 'staged-kill-t
       KILL_LABEL: label,
       FAIL_FORWARD: failForward ? '1' : '0',
       COMMAND_KIND: kind,
+      USE_PRECONDITION: options.precondition ? '1' : '0',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -46,8 +64,14 @@ async function killAt(label: string, failForward: boolean, kind = 'staged-kill-t
       stdout += chunk.toString();
       if (!stdout.includes(`READY ${label}\n`)) return;
       clearTimeout(timeout);
-      child.kill('SIGKILL');
-      resolve();
+      try {
+        options.whileStopped?.(home);
+        child.kill('SIGKILL');
+        resolve();
+      } catch (error) {
+        child.kill('SIGKILL');
+        reject(error as Error);
+      }
     });
     child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
     child.once('error', reject);
@@ -105,6 +129,12 @@ const rollback = [
   'rolling-back|undone,undone,pending',
   'rolled-back|undone,undone,pending',
 ] as const;
+const preconditionBoundaries = [
+  'planned|pending,pending,pending,pending',
+  'applying|applying,pending,pending,pending',
+  'applying|applied,pending,pending,pending',
+  'applying|applied,applying,pending,pending',
+] as const;
 
 describe.skipIf(process.platform === 'win32')('staged command real subprocess kill recovery', () => {
   for (const [label, committed] of forward) {
@@ -119,6 +149,45 @@ describe.skipIf(process.platform === 'win32')('staged command real subprocess ki
       const home = await killAt(label, true);
       recover(home);
       await expectRecovered(home, false);
+    });
+  }
+
+  for (const label of preconditionBoundaries) {
+    it(`preserves a replacement source after fresh-process recovery from precondition boundary ${label}`, async () => {
+      const replacement = 'version: "1.0"\ndescription: concurrent replacement\n';
+      let destinationBefore: Array<{ bytes: Buffer; mode: number }> = [];
+      const home = await killAt(label, false, 'environment-create', {
+        precondition: true,
+        whileStopped: (stoppedHome) => {
+          const paths = resolvePaths(stoppedHome.env);
+          const root = join(paths.base, 'staged-effects');
+          destinationBefore = ['a', 'b'].map((name) => {
+            const path = join(root, `${name}.txt`);
+            return {
+              bytes: readFileSync(path),
+              mode: lstatSync(path).mode & 0o7777,
+            };
+          });
+          const source = join(root, 'source');
+          rmSync(source, { recursive: true, force: true });
+          mkdirSync(source, { recursive: true });
+          writeFileSync(join(source, 'env.yaml'), replacement);
+        },
+      });
+
+      recover(home);
+
+      const paths = resolvePaths(home.env);
+      const root = join(paths.base, 'staged-effects');
+      expect(readFileSync(join(root, 'source', 'env.yaml'), 'utf8')).toBe(replacement);
+      for (const [index, name] of ['a', 'b'].entries()) {
+        const path = join(root, `${name}.txt`);
+        expect(readFileSync(path)).toEqual(destinationBefore[index]!.bytes);
+        expect(lstatSync(path).mode & 0o7777).toBe(destinationBefore[index]!.mode);
+      }
+      expect((await readState(paths)).inventory).toEqual(['old']);
+      expect((await readState(paths)).commands).toEqual([]);
+      expect(existsSync(join(paths.live, 'commands', 'staged-subprocess'))).toBe(false);
     });
   }
 

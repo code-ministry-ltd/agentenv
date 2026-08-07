@@ -3,6 +3,7 @@ export type PathIdentity =
   | { kind: 'absent' }
   | { kind: 'file'; digest: string; mode: number }
   | { kind: 'directory'; digest: string; mode: number }
+  | { kind: 'directory-location'; device: string; inode: string; mode: number }
   | { kind: 'symlink'; target: string };
 
 export type PreCommitRecoveryDecision =
@@ -24,7 +25,43 @@ export function identitiesEqual(left: PathIdentity, right: PathIdentity): boolea
       return (
         right.kind === 'directory' && left.digest === right.digest && left.mode === right.mode
       );
+    case 'directory-location':
+      return (
+        right.kind === 'directory-location' &&
+        left.device === right.device &&
+        left.inode === right.inode &&
+        left.mode === right.mode
+      );
   }
+}
+
+/** Capture only the no-follow physical identity of a directory entry, not its contents. */
+export async function capturePathLocationIdentity(path: string): Promise<PathIdentity> {
+  let stats;
+  try {
+    stats = await lstat(path, { bigint: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'absent' };
+    throw err;
+  }
+  if (stats.isSymbolicLink()) return { kind: 'symlink', target: await readlink(path) };
+  if (!stats.isDirectory()) throw new Error(`expected a physical directory at ${path}`);
+  return {
+    kind: 'directory-location',
+    device: String(stats.dev),
+    inode: String(stats.ino),
+    mode: Number(stats.mode & 0o7777n),
+  };
+}
+
+/** Recapture with the same content-vs-location semantics as a durable expectation. */
+export function captureExpectedPathIdentity(
+  path: string,
+  expected: PathIdentity,
+): Promise<PathIdentity> {
+  return expected.kind === 'directory-location'
+    ? capturePathLocationIdentity(path)
+    : capturePathIdentity(path);
 }
 
 /** Capture a complete no-follow identity for destructive/reconciliation checks. */

@@ -6,13 +6,21 @@ import { backup, restore, type BackupRef } from './backups.js';
 import {
   createCommandPlan,
   type CommandPlan,
+  type PathPreconditionUndo,
   type PlannedGitStep,
   type PlannedOperation,
+  type PlannedOperationInput,
 } from './command-plan.js';
 import { executeCommandPlan, recoverCommandPlan, type CommandEffect } from './command-wal.js';
 import { selectSameFilesystemRetainedPath } from './global-cow.js';
 import { withLock } from './lock.js';
-import { capturePathIdentity, identitiesEqual, type PathIdentity } from './path-identity.js';
+import {
+  captureExpectedPathIdentity,
+  capturePathIdentity,
+  identitiesEqual,
+  type PathIdentity,
+} from './path-identity.js';
+import { assertNoFollowContainment } from './path-containment.js';
 import type { Paths } from './paths.js';
 import { readState, writeState, type QuarantineRecord, type StateManifest } from './state.js';
 
@@ -24,6 +32,37 @@ export interface StagedCommandEntry {
   expectedPreIdentity?: PathIdentity;
 }
 
+export interface StagedCommandPrecondition {
+  id: string;
+  path: string;
+  expectedIdentity: PathIdentity;
+}
+
+export class StagedCommandPreconditionError extends Error {
+  constructor(
+    readonly preconditionId: string,
+    readonly path: string,
+  ) {
+    super(`staged command precondition changed before apply: ${path}`);
+    this.name = 'StagedCommandPreconditionError';
+  }
+}
+
+export class StagedCommandExpectedIdentityError extends Error {
+  constructor(
+    readonly entryId: string,
+    readonly path: string,
+    readonly phase: 'planning' | 'pre-apply',
+  ) {
+    super(
+      phase === 'planning'
+        ? `staged command target changed since planning: ${path}`
+        : `staged command target changed before apply: ${path}`,
+    );
+    this.name = 'StagedCommandExpectedIdentityError';
+  }
+}
+
 export interface PublishStagedCommandRequest {
   paths: Paths;
   transactionId: string;
@@ -31,6 +70,8 @@ export interface PublishStagedCommandRequest {
   stagingRoot: string;
   allowedRoots: readonly string[];
   entries: readonly StagedCommandEntry[];
+  /** Durable, read-only identities that must still hold when publication begins. */
+  preconditions?: readonly StagedCommandPrecondition[];
   /** Complete replacement values for selected non-WAL state domains. */
   statePatch?: Readonly<Record<string, unknown>>;
   gitBookkeeping?: () => Promise<void>;
@@ -55,7 +96,8 @@ type StagedUndo =
       marker: string;
       before: StatePatch;
       after: StatePatch;
-    };
+    }
+  | PathPreconditionUndo;
 
 const RESERVED_STATE_KEYS = new Set(['version', 'journal', 'commands']);
 
@@ -86,7 +128,7 @@ async function copyPath(source: string, destination: string): Promise<void> {
   });
 }
 
-function validateRequest(req: PublishStagedCommandRequest): void {
+async function validateRequest(req: PublishStagedCommandRequest): Promise<void> {
   if (!/^[A-Za-z0-9._-]+$/.test(req.transactionId)) {
     throw new Error('staged command transaction id must be one safe path segment');
   }
@@ -96,6 +138,34 @@ function validateRequest(req: PublishStagedCommandRequest): void {
   }
   const ids = new Set<string>();
   const targets = new Set<string>();
+  for (const root of req.allowedRoots) {
+    if (!isAbsolute(root)) throw new Error(`staged command allowed root must be absolute: ${root}`);
+    const anchor = isContained(resolve(req.paths.base), resolve(root)) ? req.paths.base : root;
+    await assertNoFollowContainment(anchor, root, {
+      includeCandidate: true,
+      label: 'staged command allowed physical root',
+    });
+  }
+  for (const precondition of req.preconditions ?? []) {
+    if (!/^[A-Za-z0-9._-]+$/.test(precondition.id) || ids.has(precondition.id)) {
+      throw new Error(
+        `staged command precondition id is invalid or duplicated: '${precondition.id}'`,
+      );
+    }
+    if (
+      !isAbsolute(precondition.path) ||
+      !req.allowedRoots.some((root) => isContained(resolve(root), resolve(precondition.path)))
+    ) {
+      throw new Error(`staged command precondition is outside its allowed roots: ${precondition.path}`);
+    }
+    const allowedRoot = req.allowedRoots.find((root) =>
+      isContained(resolve(root), resolve(precondition.path)),
+    )!;
+    await assertNoFollowContainment(allowedRoot, precondition.path, {
+      label: 'staged command precondition',
+    });
+    ids.add(precondition.id);
+  }
   for (const entry of req.entries) {
     if (!/^[A-Za-z0-9._-]+$/.test(entry.id) || ids.has(entry.id)) {
       throw new Error(`staged command entry id is invalid or duplicated: '${entry.id}'`);
@@ -103,6 +173,12 @@ function validateRequest(req: PublishStagedCommandRequest): void {
     if (!isAbsolute(entry.target) || !req.allowedRoots.some((root) => isContained(resolve(root), resolve(entry.target)))) {
       throw new Error(`staged command target is outside its allowed roots: ${entry.target}`);
     }
+    const allowedRoot = req.allowedRoots.find((root) =>
+      isContained(resolve(root), resolve(entry.target)),
+    )!;
+    await assertNoFollowContainment(allowedRoot, entry.target, {
+      label: 'staged command target',
+    });
     if (!isContained(resolve(req.stagingRoot), resolve(entry.staged))) {
       throw new Error(`staged command input escapes its staging root: ${entry.staged}`);
     }
@@ -118,7 +194,11 @@ function validateRequest(req: PublishStagedCommandRequest): void {
 function parseUndo(operation: PlannedOperation): StagedUndo {
   if (!operation.undoRef) throw new Error(`staged operation '${operation.id}' lacks undo metadata`);
   const undo = JSON.parse(operation.undoRef) as StagedUndo;
-  if (!undo || undo.schemaVersion !== 1 || !['replace-path', 'state-patch'].includes(undo.type)) {
+  if (
+    !undo ||
+    undo.schemaVersion !== 1 ||
+    !['replace-path', 'state-patch', 'path-precondition'].includes(undo.type)
+  ) {
     throw new Error(`staged operation '${operation.id}' has invalid undo metadata`);
   }
   return undo;
@@ -199,6 +279,15 @@ async function retainThirdIdentity(
 function recoveryEffect(paths: Paths, plan: CommandPlan, operation: PlannedOperation): CommandEffect {
   if (!operation.path) throw new Error(`staged operation '${operation.id}' lacks a target path`);
   const undo = parseUndo(operation);
+  if (undo.type === 'path-precondition') {
+    return {
+      observeIdentity: () => capturePathIdentity(operation.path!),
+      apply: async () => {
+        throw new Error('staged recovery preconditions cannot run forward');
+      },
+      undo: async () => {},
+    };
+  }
   let pendingStateRescue: QuarantineRecord | undefined;
   return {
     observeIdentity: async () => {
@@ -311,7 +400,7 @@ export async function recoverPendingStagedCommands(
 }
 
 export async function publishStagedCommand(req: PublishStagedCommandRequest): Promise<void> {
-  validateRequest(req);
+  await validateRequest(req);
   const pending = (await readState(req.paths)).commands[0];
   if (pending) {
     throw new Error(
@@ -328,12 +417,12 @@ export async function publishStagedCommand(req: PublishStagedCommandRequest): Pr
   for (const entry of req.entries) {
     const beforeBackup = await capturePathIdentity(entry.target);
     if (entry.expectedPreIdentity && !identitiesEqual(beforeBackup, entry.expectedPreIdentity)) {
-      throw new Error(`staged command target changed since planning: ${entry.target}`);
+      throw new StagedCommandExpectedIdentityError(entry.id, entry.target, 'planning');
     }
     const undo = await backup(req.paths, entry.target);
     const pre = await capturePathIdentity(entry.target);
     if (!identitiesEqual(beforeBackup, pre)) {
-      throw new Error(`staged command target changed while planning: ${entry.target}`);
+      throw new StagedCommandExpectedIdentityError(entry.id, entry.target, 'planning');
     }
     planned.push({ entry, pre, post: await capturePathIdentity(entry.staged), undo });
   }
@@ -346,7 +435,19 @@ export async function publishStagedCommand(req: PublishStagedCommandRequest): Pr
   const marker = join(req.stagingRoot, '.state-applied');
   if (stateKeys.length > 0) await writeFile(markerSeed, 'state applied\n', 'utf8');
 
-  const operations = planned.map(({ entry, pre, post, undo }) => ({
+  const operations: PlannedOperationInput[] = (req.preconditions ?? []).map((precondition) => ({
+    id: precondition.id,
+    kind: 'read-path-precondition',
+    path: precondition.path,
+    preIdentity: precondition.expectedIdentity,
+    postIdentity: precondition.expectedIdentity,
+    undoRef: JSON.stringify({
+      schemaVersion: 1,
+      type: 'path-precondition',
+      expectedIdentity: precondition.expectedIdentity,
+    } satisfies StagedUndo),
+  }));
+  operations.push(...planned.map(({ entry, pre, post, undo }) => ({
     id: entry.id,
     kind: 'replace-path',
     path: entry.target,
@@ -358,7 +459,7 @@ export async function publishStagedCommand(req: PublishStagedCommandRequest): Pr
       backup: undo,
       preIdentity: pre,
     } satisfies StagedUndo),
-  }));
+  })));
   if (stateKeys.length > 0) {
     operations.push({
       id: 'state',
@@ -391,14 +492,55 @@ export async function publishStagedCommand(req: PublishStagedCommandRequest): Pr
     executor: 'staged-command',
   } as CommandPlan;
   const effects = recoveryEffects(req.paths, plan);
-  for (const [index, item] of planned.entries()) {
-    const operation = plan.operations[index]!;
+  const plannedPreconditions = plan.operations.filter(
+    (operation) => operation.kind === 'read-path-precondition',
+  );
+  const checkPrecondition = async (operation: PlannedOperation): Promise<void> => {
+    if (
+      !operation.path ||
+      !operation.preIdentity ||
+      !identitiesEqual(
+        await captureExpectedPathIdentity(operation.path, operation.preIdentity),
+        operation.preIdentity,
+      )
+    ) {
+      throw new StagedCommandPreconditionError(operation.id, operation.path ?? '');
+    }
+  };
+  const checkPreconditions = async (): Promise<void> => {
+    for (const operation of plannedPreconditions) await checkPrecondition(operation);
+  };
+  const checkTargets = async (): Promise<void> => {
+    for (const item of planned) {
+      if (!identitiesEqual(await capturePathIdentity(item.entry.target), item.pre)) {
+        throw new StagedCommandExpectedIdentityError(
+          item.entry.id,
+          item.entry.target,
+          'pre-apply',
+        );
+      }
+    }
+  };
+
+  let firstMutation = true;
+  const beforeMutation = async (): Promise<void> => {
+    if (!firstMutation) return;
+    await checkPreconditions();
+    firstMutation = false;
+  };
+  for (const item of planned) {
+    const operation = plan.operations.find((candidate) => candidate.id === item.entry.id)!;
     const base = effects.get(operation.id)!;
     effects.set(operation.id, {
       ...base,
       apply: async () => {
+        await beforeMutation();
         if (!identitiesEqual(await capturePathIdentity(item.entry.target), item.pre)) {
-          throw new Error(`staged command target changed before apply: ${item.entry.target}`);
+          throw new StagedCommandExpectedIdentityError(
+            item.entry.id,
+            item.entry.target,
+            'pre-apply',
+          );
         }
         await rm(item.entry.target, { recursive: true, force: true });
         if (item.post.kind !== 'absent') await copyPath(item.entry.staged, item.entry.target);
@@ -412,6 +554,7 @@ export async function publishStagedCommand(req: PublishStagedCommandRequest): Pr
     effects.set(operation.id, {
       ...base,
       apply: async () => {
+        await beforeMutation();
         await withLock(req.paths, async () => {
           const manifest = await readState(req.paths);
           if (!isDeepStrictEqual(stateDomains(manifest, stateKeys), beforeState)) {
@@ -438,6 +581,14 @@ export async function publishStagedCommand(req: PublishStagedCommandRequest): Pr
       plan,
       effects,
       ...(req.gitBookkeeping ? { gitBookkeeping: req.gitBookkeeping } : {}),
+      ...(plannedPreconditions.length > 0 || planned.length > 0
+        ? {
+            beforeEffects: async () => {
+              await checkPreconditions();
+              await checkTargets();
+            },
+          }
+        : {}),
       ...(req.afterPersist ? { afterPersist: req.afterPersist } : {}),
     });
   } finally {
