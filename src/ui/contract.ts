@@ -147,6 +147,37 @@ export interface EnvironmentDeleteSuccess {
   publication: 'complete' | 'git-pending';
 }
 
+export interface CopyContentRequest {
+  operation: 'copy';
+  kind: ContentKind;
+  name: ContentName;
+  sourceEnvironment: EnvironmentName;
+  destinationEnvironment: EnvironmentName;
+  collision: CollisionPolicy;
+  sourceItemRevision: Revision;
+  sourceEnvironmentRevision: Revision;
+  sourceEnvironmentContainerRevision: Revision;
+  destinationEnvironmentRevision: Revision;
+  destinationEnvironmentContainerRevision: Revision;
+  destinationItemRevision: Revision | null;
+}
+
+export interface TransferContentReference {
+  environment: EnvironmentName;
+  kind: ContentKind;
+  name: ContentName;
+}
+
+export interface CopyContentSuccess {
+  operation: 'copy';
+  source: TransferContentReference;
+  destination: TransferContentReference;
+  publication: 'complete' | 'git-pending';
+  refreshRequired: boolean;
+  sourceEnvironment?: EnvironmentInventory;
+  destinationEnvironment?: EnvironmentInventory;
+}
+
 export const API_ERROR_STATUS = {
   MALFORMED_REQUEST: 400,
   UNAUTHENTICATED: 401,
@@ -189,6 +220,15 @@ export type ApiErrorDetails =
       kind: 'pending-recovery';
       commandId?: string;
       publication?: 'environment-published';
+    }
+  | {
+      kind: 'transfer-collision';
+      environment: EnvironmentName;
+      contentKind: ContentKind;
+      name: ContentName;
+      destinationItemRevision: Revision;
+      destinationEnvironmentRevision: Revision;
+      destinationEnvironmentContainerRevision: Revision;
     };
 
 export interface ApiError {

@@ -13,6 +13,7 @@ import {
   createUiEnvironmentDeleteRuntime,
   createUiEnvironmentLifecycleRuntime,
 } from './environment-lifecycle-runtime.js';
+import { createUiContentTransferRuntime } from './content-transfer-runtime.js';
 import {
   applyBrowserSecurityHeaders,
   createUiSecurityState,
@@ -226,7 +227,10 @@ async function handleApi(
     return;
   }
   let requestBody: Record<string, unknown> | undefined;
-  if (pathname === '/api/environments' && request.method === 'POST') {
+  if (
+    (pathname === '/api/environments' || pathname === '/api/content/transfer') &&
+    request.method === 'POST'
+  ) {
     const body = await readJsonBody(request);
     if (!body.ok) {
       sendError(response, body.code, body.message);
@@ -265,6 +269,12 @@ export async function startUiServer(
   const runtimeEnv = options.env ?? process.env;
   const paths = options.paths ?? resolvePaths(runtimeEnv);
   const routeDependencies: UiRouteDependencyOverrides = {
+    createContentTransferRuntime: (runtimePaths) =>
+      createUiContentTransferRuntime({
+        paths: runtimePaths,
+        env: runtimeEnv,
+        ...(options.runOptions === undefined ? {} : { runOptions: options.runOptions }),
+      }),
     createEnvironmentDeleteRuntime: (runtimePaths) =>
       createUiEnvironmentDeleteRuntime({
         paths: runtimePaths,

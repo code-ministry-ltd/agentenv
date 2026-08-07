@@ -5,6 +5,8 @@ import {
   isTerminalGitCandidateSet,
   type ApiErrorResponse,
   type CandidateSetId,
+  type CopyContentRequest,
+  type CopyContentSuccess,
   type ContentItem,
   type GitCandidateSet,
 } from '../src/ui/contract.js';
@@ -105,5 +107,36 @@ describe('UI contract', () => {
     ];
 
     expect(states.map(isTerminalGitCandidateSet)).toEqual([false, true, true]);
+  });
+
+  it('defines copy consent with public observed revisions and truthful refresh metadata', () => {
+    const revision = 'r'.repeat(43) as CopyContentRequest['sourceItemRevision'];
+    const request: CopyContentRequest = {
+      operation: 'copy',
+      kind: 'skill',
+      name: 'drafting' as CopyContentRequest['name'],
+      sourceEnvironment: 'writing' as CopyContentRequest['sourceEnvironment'],
+      destinationEnvironment: 'research' as CopyContentRequest['destinationEnvironment'],
+      collision: 'overwrite',
+      sourceItemRevision: revision,
+      sourceEnvironmentRevision: revision,
+      sourceEnvironmentContainerRevision: revision,
+      destinationEnvironmentRevision: revision,
+      destinationEnvironmentContainerRevision: revision,
+      destinationItemRevision: revision,
+    };
+    const result: CopyContentSuccess = {
+      operation: 'copy',
+      source: { environment: request.sourceEnvironment, kind: request.kind, name: request.name },
+      destination: {
+        environment: request.destinationEnvironment,
+        kind: request.kind,
+        name: request.name,
+      },
+      publication: 'git-pending',
+      refreshRequired: true,
+    };
+
+    expect(JSON.parse(JSON.stringify({ request, result }))).toEqual({ request, result });
   });
 });

@@ -410,11 +410,24 @@ Size: M
 Expose copy through a typed route and item action/dialog with destination,
 collision details, explicit overwrite, cancellation, and affected-view refresh.
 
-- [ ] Copy works end to end for every kind and shows its source, destination,
+- [x] Copy works end to end for every kind and shows its source, destination,
   kind, and name before publication.
-- [ ] Collision cancellation sends no overwrite and explicit overwrite replaces
+- [x] Collision cancellation sends no overwrite and explicit overwrite replaces
   only the declared destination element.
-- [ ] Conflict or failure retains the selection and presents a safe retry/refresh.
+- [x] Conflict or failure retains the selection and presents a safe retry/refresh.
+
+Verified 2026-08-07: typed transfer route/application/contract coverage (76/76)
+passed, including real command, skill, instruction, MCP, and agent copies from
+catalogue revisions through publication. Browser coverage proves source/kind/name/
+destination review, focus trap/restore/fallback, no-request cancellation, redacted
+failure and stale draft retention, refresh to a new source revision, collision
+review, zero-overwrite cancellation, revision-bound held overwrite, disabled
+authoritative controls, exact final bytes, and no document reload. Full UI tests
+(29/29), all production-browser journeys (10/10), lint, all typechecks, build,
+and the full suite (157 files, 1,264 tests) passed. Fresh review closed public
+identity normalization, preflight-to-copy overwrite races, durable full-source
+revision checks, and removed-item focus recovery; final re-review found no
+required issue.
 
 Verification: `npx vitest run test/ui-transfer-routes.test.ts && npm run test:ui:e2e -- --grep "copies content between environments"`
 

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type {
   ContentCounts,
+  CopyContentSuccess,
   EnvironmentDeleteSuccess,
   EnvironmentInventory,
   EnvironmentLifecycleSuccess,
@@ -51,8 +52,10 @@ export function EnvironmentList(): React.JSX.Element {
   const mutationEpochRef = useRef(0);
   const catalogRef = useRef(catalog);
   const deleteNameRef = useRef(deleteName);
+  const selectedNameRef = useRef(selectedName);
   catalogRef.current = catalog;
   deleteNameRef.current = deleteName;
+  selectedNameRef.current = selectedName;
 
   useEffect(() => {
     let ignore = false;
@@ -82,6 +85,20 @@ export function EnvironmentList(): React.JSX.Element {
               ? replacement?.name
               : current);
             setDeleteName(undefined);
+          }
+          const missingSelectedName = selectedNameRef.current;
+          if (
+            missingSelectedName !== undefined &&
+            !items.some((environment) => environment.name === missingSelectedName)
+          ) {
+            const previous = catalogRef.current;
+            const previousIndex = previous.status === 'ready'
+              ? previous.items.findIndex((item) => item.name === missingSelectedName)
+              : 0;
+            const replacement = items[Math.min(Math.max(previousIndex, 0), items.length - 1)];
+            pendingFocusNameRef.current = replacement?.name ?? null;
+            setSelectedName(replacement?.name);
+            setPublishedInventory(undefined);
           }
           setCatalog({ status: 'ready', items, refresh: 'idle' });
         }
@@ -142,6 +159,25 @@ export function EnvironmentList(): React.JSX.Element {
     setDeletionNotice(result.publication === 'git-pending'
       ? `Deleted ${result.name}. Required Git bookkeeping is pending; resolve it from the CLI.`
       : `Deleted ${result.name}.`);
+    refresh();
+  };
+  const transferred = (result: CopyContentSuccess): void => {
+    mutationEpochRef.current += 1;
+    setCatalog((current) => {
+      if (current.status !== 'ready') return current;
+      const replacements = [result.sourceEnvironment, result.destinationEnvironment]
+        .filter((candidate): candidate is EnvironmentInventory => candidate !== undefined);
+      if (replacements.length === 0) return current;
+      return {
+        status: 'ready',
+        items: current.items.map((environment) =>
+          replacements.find((candidate) => candidate.name === environment.name) ?? environment),
+        refresh: 'idle',
+      };
+    });
+    if (result.sourceEnvironment?.name === selectedName) {
+      setPublishedInventory(result.sourceEnvironment);
+    }
     refresh();
   };
   const deleteEnvironment = catalog.status === 'ready'
@@ -285,11 +321,14 @@ export function EnvironmentList(): React.JSX.Element {
           <div id="selected-environment">
             {selectedEnvironment === undefined ? null : (
               <EnvironmentView
+                environments={catalog.items}
                 key={selectedEnvironment.name}
                 environment={selectedEnvironment}
                 initialInventory={publishedInventory?.name === selectedEnvironment.name
                   ? publishedInventory
                   : undefined}
+                onRefreshEnvironments={refresh}
+                onTransferred={transferred}
               />
             )}
           </div>

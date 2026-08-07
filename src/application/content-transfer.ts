@@ -59,6 +59,16 @@ export interface CopyContentInput {
   collision?: 'fail' | 'overwrite';
   runtime: ContentTransferRuntime;
   faults?: ContentTransferFaults;
+  /** Browser-observed public identities. When supplied, the authoritative copy
+   * capture must still match them before collision consent can be applied. */
+  observedRevisions?: {
+    sourceItem: string;
+    sourceEnvironment: string;
+    sourceEnvironmentContainer: string;
+    destinationEnvironment: string;
+    destinationEnvironmentContainer: string;
+    destinationItem: string | null;
+  };
 }
 
 export type CopyContentResult =
@@ -129,6 +139,29 @@ function stableDirectoryStatsEqual(left: BigIntStats, right: BigIntStats): boole
     left.mtimeNs === right.mtimeNs &&
     left.ctimeNs === right.ctimeNs
   );
+}
+
+function publicRevision(value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(value)).digest('base64url');
+}
+
+function canonicalPathIdentity(identity: PathIdentity): PathIdentity {
+  switch (identity.kind) {
+    case 'absent': return { kind: 'absent' };
+    case 'file': return { kind: 'file', digest: identity.digest, mode: identity.mode };
+    case 'directory': return { kind: 'directory', digest: identity.digest, mode: identity.mode };
+    case 'directory-location': return {
+      kind: 'directory-location',
+      device: identity.device,
+      inode: identity.inode,
+      mode: identity.mode,
+    };
+    case 'symlink': return { kind: 'symlink', target: identity.target };
+  }
+}
+
+function publicIdentityRevision(identity: PathIdentity): string {
+  return publicRevision(canonicalPathIdentity(identity));
 }
 
 /** Read one regular file without following its final component and prove the
@@ -318,6 +351,7 @@ function contentContainer(paths: Paths, locator: ContentLocator): string {
 
 interface InspectedEnvironment {
   identity: PathIdentity;
+  stableEntry?: { device: string; inode: string; treeDigest: string };
   locationIdentity: PathIdentity;
   yamlIdentity: PathIdentity;
   yamlEntry: { device: string; inode: string };
@@ -339,9 +373,10 @@ async function inspectEnvironment(
   const locationIdentity = await capturePathLocationIdentity(environmentPath);
   if (locationIdentity.kind === 'absent') throw new ContentLocationError(field, true);
   if (locationIdentity.kind !== 'directory-location') throw new ContentLocationError(field, false);
-  const environmentIdentity = stableTree
+  const stableEnvironment = stableTree
     ? await snapshotStablePhysicalTree(environmentPath)
-    : await capturePathIdentity(environmentPath);
+    : undefined;
+  const environmentIdentity = stableEnvironment ?? await capturePathIdentity(environmentPath);
   const observedYamlIdentity = await capturePathIdentity(paths.envYaml(environment));
   if (observedYamlIdentity.kind !== 'file') {
     throw new ContentLocationError(field, observedYamlIdentity.kind === 'absent');
@@ -353,6 +388,13 @@ async function inspectEnvironment(
   const yamlText = yaml.bytes.toString('utf8');
   return {
     identity: environmentIdentity,
+    ...(stableEnvironment === undefined ? {} : {
+      stableEntry: {
+        device: stableEnvironment.device,
+        inode: stableEnvironment.inode,
+        treeDigest: stableEnvironment.treeDigest,
+      },
+    }),
     locationIdentity,
     yamlIdentity: yaml.identity,
     yamlEntry: yaml.entry,
@@ -429,10 +471,10 @@ function copyMcpEntry(
 }
 
 function staleField(id: string): CopyContentResult & { status: 'stale' } {
-  if (id === 'source-content' || id === 'source-manifest') {
+  if (id === 'source-content' || id === 'source-manifest' || id === 'source-environment') {
     return { status: 'stale', field: 'source', message: 'source content changed before copy' };
   }
-  if (id === 'source-environment' || id === 'source-container') {
+  if (id === 'source-container') {
     return {
       status: 'stale',
       field: 'source-container',
@@ -517,7 +559,12 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
       label: 'environment container',
     });
     environmentContainerIdentity = await capturePathLocationIdentity(input.paths.environments);
-    sourceEnvironment = await inspectEnvironment(input.paths, input.source.environment, 'source');
+    sourceEnvironment = await inspectEnvironment(
+      input.paths,
+      input.source.environment,
+      'source',
+      true,
+    );
     destinationEnvironment = await inspectEnvironment(
       input.paths,
       input.destination.environment,
@@ -616,6 +663,44 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
   const collision = input.source.kind === 'mcp'
     ? mcpCollision
     : destinationIdentity.kind !== 'absent';
+  if (input.observedRevisions !== undefined) {
+    const sourceItemRevision = input.source.kind === 'mcp'
+      ? publicRevision({
+          canonicalIdentity: canonicalPathIdentity(sourceIdentity),
+          name: input.source.name,
+        })
+      : publicIdentityRevision(sourceIdentity);
+    const destinationItemRevision = !collision
+      ? null
+      : input.destination.kind === 'mcp'
+        ? publicRevision({
+            canonicalIdentity: canonicalPathIdentity(destinationIdentity),
+            name: input.destination.name,
+          })
+        : publicIdentityRevision(destinationIdentity);
+    if (
+      sourceItemRevision !== input.observedRevisions.sourceItem ||
+      publicIdentityRevision(sourceEnvironment.identity) !==
+        input.observedRevisions.sourceEnvironment ||
+      publicIdentityRevision(environmentContainerIdentity) !==
+        input.observedRevisions.sourceEnvironmentContainer
+    ) {
+      return { status: 'stale', field: 'source', message: 'source changed before copy' };
+    }
+    if (
+      publicIdentityRevision(destinationEnvironment.identity) !==
+        input.observedRevisions.destinationEnvironment ||
+      publicIdentityRevision(environmentContainerIdentity) !==
+        input.observedRevisions.destinationEnvironmentContainer ||
+      destinationItemRevision !== input.observedRevisions.destinationItem
+    ) {
+      return {
+        status: 'stale',
+        field: 'destination',
+        message: 'destination changed before copy',
+      };
+    }
+  }
   if (collision && input.collision !== 'overwrite') {
     return { status: 'collision', kind: input.source.kind, name: input.destination.name };
   }
@@ -706,7 +791,13 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
         observation: input.source.kind === 'skill' ? 'stable-tree' : 'stable-file',
         expectedEntry: sourceEntry,
       },
-      { id: 'source-environment', path: input.paths.envDir(input.source.environment), expectedIdentity: sourceEnvironment.locationIdentity },
+      {
+        id: 'source-environment',
+        path: input.paths.envDir(input.source.environment),
+        expectedIdentity: sourceEnvironment.identity,
+        observation: 'stable-tree',
+        expectedEntry: sourceEnvironment.stableEntry!,
+      },
       { id: 'source-container', path: contentContainer(input.paths, input.source), expectedIdentity: sourceContainerIdentity },
     ];
 

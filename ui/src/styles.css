@@ -610,6 +610,48 @@ h3 {
   line-height: 1.45;
 }
 
+.content-item-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--line);
+}
+
+.content-item-actions button {
+  padding: 0.35rem 0.65rem;
+  font-size: 0.75rem;
+}
+
+.transfer-summary {
+  display: grid;
+  gap: 0.5rem;
+  margin: 1rem 0 0;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.transfer-summary div {
+  display: grid;
+  grid-template-columns: minmax(6rem, auto) 1fr;
+  gap: 1rem;
+}
+
+.transfer-summary dt {
+  color: var(--ink-muted);
+}
+
+.transfer-summary dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+}
+
+.transfer-result {
+  border-color: var(--accent);
+}
+
 .content-metadata {
   display: grid;
   gap: 0.45rem;

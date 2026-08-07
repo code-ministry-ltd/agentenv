@@ -1,11 +1,13 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type {
   ContentItem,
   ContentKind,
+  CopyContentSuccess,
   EnvironmentInventory,
   EnvironmentSummary,
 } from '../../src/ui/contract.js';
 import { getEnvironmentInventory, UiApiError } from './api.js';
+import { TransferDialog } from './TransferDialog.js';
 
 type InventoryState =
   | { status: 'loading' }
@@ -14,6 +16,12 @@ type InventoryState =
   | { status: 'stale'; inventory?: EnvironmentInventory }
   | { status: 'unavailable' }
   | { status: 'error'; inventory?: EnvironmentInventory };
+
+interface SelectedContentLocator {
+  kind: ContentKind;
+  name: string;
+  sourceEnvironment: string;
+}
 
 const GROUPS: readonly {
   kind: ContentKind;
@@ -73,7 +81,13 @@ function itemSearchText(
   return values.join(' ').toLowerCase();
 }
 
-function InventoryGroups({ inventory }: { inventory: EnvironmentInventory }): React.JSX.Element {
+function InventoryGroups({
+  inventory,
+  onCopy,
+}: {
+  inventory: EnvironmentInventory;
+  onCopy(item: ContentItem, trigger: HTMLButtonElement): void;
+}): React.JSX.Element {
   const [selectedItem, setSelectedItem] = useState<string>();
   const [query, setQuery] = useState('');
   const normalizedQuery = query.trim().toLowerCase();
@@ -147,6 +161,16 @@ function InventoryGroups({ inventory }: { inventory: EnvironmentInventory }): Re
                             <span>{group.singular}</span>
                           </div>
                           <ItemMetadata item={item} />
+                          <div className="content-item-actions">
+                            <button
+                              aria-label={`Copy ${group.singular} ${item.name}`}
+                              className="button-secondary"
+                              type="button"
+                              onClick={(event) => onCopy(item, event.currentTarget)}
+                            >
+                              Copy
+                            </button>
+                          </div>
                         </article>
                       </li>
                     );
@@ -163,10 +187,16 @@ function InventoryGroups({ inventory }: { inventory: EnvironmentInventory }): Re
 
 export function EnvironmentView({
   environment,
+  environments,
   initialInventory,
+  onRefreshEnvironments,
+  onTransferred,
 }: {
   environment: EnvironmentSummary;
+  environments: readonly EnvironmentSummary[];
   initialInventory?: EnvironmentInventory;
+  onRefreshEnvironments(): void;
+  onTransferred(result: CopyContentSuccess): void;
 }): React.JSX.Element {
   const [request, setRequest] = useState(0);
   const [inventory, setInventory] = useState<InventoryState>(
@@ -174,6 +204,10 @@ export function EnvironmentView({
       ? { status: 'loading' }
       : { status: 'ready', inventory: initialInventory },
   );
+  const [copyLocator, setCopyLocator] = useState<SelectedContentLocator>();
+  const [copyNotice, setCopyNotice] = useState<string>();
+  const copyTriggerRef = useRef<HTMLButtonElement>(null);
+  const viewHeadingRef = useRef<HTMLHeadingElement>(null);
 
   useEffect(() => {
     let acceptResponse = true;
@@ -231,14 +265,42 @@ export function EnvironmentView({
     ? inventory.inventory
     : undefined;
   const itemCount = current?.items.length ?? 0;
+  const copyItem = copyLocator !== undefined && current !== undefined &&
+      copyLocator.sourceEnvironment === current.name
+    ? current.items.find((item) =>
+        item.kind === copyLocator.kind && item.name === copyLocator.name)
+    : undefined;
+  useEffect(() => {
+    if (copyLocator !== undefined && current !== undefined && copyItem === undefined) {
+      setCopyLocator(undefined);
+    }
+  }, [copyItem, copyLocator, current]);
   const refreshBlocked = inventory.status === 'loading' || inventory.status === 'refreshing';
+  const refreshAffected = (): void => {
+    setRequest((value) => value + 1);
+    onRefreshEnvironments();
+  };
+  const copied = (result: CopyContentSuccess): void => {
+    if (result.sourceEnvironment !== undefined) {
+      setInventory({ status: 'ready', inventory: result.sourceEnvironment });
+    }
+    setCopyNotice(result.publication === 'git-pending'
+      ? `Copied ${result.source.name} to ${result.destination.environment}. Required Git bookkeeping is pending.`
+      : result.refreshRequired
+        ? `Copied ${result.source.name} to ${result.destination.environment}. Refresh affected content to reconcile the view.`
+        : `Copied ${result.source.name} to ${result.destination.environment}.`);
+    onTransferred(result);
+    if (result.refreshRequired) refreshAffected();
+  };
 
   return (
     <section className="inventory-panel" aria-labelledby="environment-view-title">
       <div className="inventory-heading">
         <div>
           <p className="eyebrow">Selected environment</p>
-          <h2 id="environment-view-title">{environment.name} content</h2>
+          <h2 id="environment-view-title" ref={viewHeadingRef} tabIndex={-1}>
+            {environment.name} content
+          </h2>
         </div>
         {inventory.status === 'unavailable' ||
         inventory.status === 'error' ||
@@ -296,7 +358,37 @@ export function EnvironmentView({
           <span>Add content from the CLI to see it here.</span>
         </div>
       ) : null}
-      {current === undefined ? null : <InventoryGroups inventory={current} />}
+      {copyNotice === undefined ? null : (
+        <div className="inventory-message transfer-result" role="status">
+          <span aria-hidden="true" className="status-check">✓</span>
+          <strong>{copyNotice}</strong>
+        </div>
+      )}
+      {current === undefined ? null : (
+        <InventoryGroups
+          inventory={current}
+          onCopy={(item, trigger) => {
+            copyTriggerRef.current = trigger;
+            setCopyLocator({
+              kind: item.kind,
+              name: item.name,
+              sourceEnvironment: current.name,
+            });
+          }}
+        />
+      )}
+      {copyItem === undefined || current === undefined ? null : (
+        <TransferDialog
+          environments={environments}
+          fallbackFocusRef={viewHeadingRef}
+          item={copyItem}
+          onClose={() => setCopyLocator(undefined)}
+          onCopied={copied}
+          onRefresh={refreshAffected}
+          source={current}
+          triggerRef={copyTriggerRef}
+        />
+      )}
     </section>
   );
 }

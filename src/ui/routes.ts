@@ -1,5 +1,10 @@
 import type { IncomingMessage } from 'node:http';
 import {
+  copyContent,
+  type CopyContentResult,
+} from '../application/content-transfer.js';
+import type { ContentTransferRuntime } from '../application/content-transfer-runtime.js';
+import {
   cloneEnvironment,
   createEnvironment,
   deleteEnvironment,
@@ -23,6 +28,7 @@ import {
   opaqueIdentityRevision,
 } from '../application/catalog.js';
 import type { Paths } from '../paths.js';
+import { validateItemName, validateSkillName } from '../content-items.js';
 import { validateEnvName } from '../store.js';
 import {
   API_ERROR_STATUS,
@@ -30,12 +36,18 @@ import {
   type ApiErrorCode,
   type ApiErrorDetails,
   type DeleteEnvironmentRequest,
+  type CopyContentRequest,
+  type CopyContentSuccess,
+  type ContentItem,
+  type EnvironmentInventory,
   type EnvironmentDeleteSuccess,
   type EnvironmentLifecycleRequest,
   type EnvironmentLifecycleSuccess,
   type EnvironmentName,
   type Revision,
 } from './contract.js';
+import { UI_CONTENT_KINDS } from './contract.js';
+import { createUiContentTransferRuntime } from './content-transfer-runtime.js';
 import {
   createUiEnvironmentDeleteRuntime,
   createUiEnvironmentLifecycleRuntime,
@@ -47,12 +59,14 @@ export interface UiRouteResult {
 }
 
 export interface UiRouteDependencies {
+  copyContent: typeof copyContent;
   cloneEnvironment: typeof cloneEnvironment;
   createEnvironment: typeof createEnvironment;
   deleteEnvironment: typeof deleteEnvironment;
   inspectEnvironmentDeletion: typeof inspectEnvironmentDeletion;
   createEnvironmentDeleteRuntime(paths: Paths): EnvironmentDeleteRuntime;
   createEnvironmentLifecycleRuntime(paths: Paths): EnvironmentLifecycleRuntime;
+  createContentTransferRuntime(paths: Paths): ContentTransferRuntime;
   getEnvironmentInventory: typeof getEnvironmentInventory;
   listEnvironmentSummaries: typeof listEnvironmentSummaries;
 }
@@ -60,6 +74,7 @@ export interface UiRouteDependencies {
 export type UiRouteDependencyOverrides = Partial<UiRouteDependencies>;
 
 const DEFAULT_ROUTE_DEPENDENCIES: UiRouteDependencies = {
+  copyContent,
   cloneEnvironment,
   createEnvironment,
   deleteEnvironment,
@@ -68,6 +83,8 @@ const DEFAULT_ROUTE_DEPENDENCIES: UiRouteDependencies = {
     createUiEnvironmentDeleteRuntime({ paths, env: process.env }),
   createEnvironmentLifecycleRuntime: (paths) =>
     createUiEnvironmentLifecycleRuntime({ paths, env: process.env }),
+  createContentTransferRuntime: (paths) =>
+    createUiContentTransferRuntime({ paths, env: process.env }),
   getEnvironmentInventory,
   listEnvironmentSummaries,
 };
@@ -288,6 +305,147 @@ function deleteRouteResult(result: EnvironmentDeleteResult): UiRouteResult {
   }
 }
 
+type CopyRequestParseResult =
+  | { ok: true; request: CopyContentRequest }
+  | { ok: false; result: UiRouteResult };
+
+const TRANSFER_REQUEST_KEYS = [
+  'collision',
+  'destinationEnvironment',
+  'destinationEnvironmentContainerRevision',
+  'destinationEnvironmentRevision',
+  'destinationItemRevision',
+  'kind',
+  'name',
+  'operation',
+  'sourceEnvironment',
+  'sourceEnvironmentContainerRevision',
+  'sourceEnvironmentRevision',
+  'sourceItemRevision',
+] as const;
+
+function isRevision(value: unknown): value is Revision {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value);
+}
+
+function transferValidation(
+  path: string,
+  message: string,
+): Extract<CopyRequestParseResult, { ok: false }> {
+  return {
+    ok: false,
+    result: errorResult('VALIDATION_FAILED', 'The content transfer request is invalid.', {
+      kind: 'validation',
+      issues: [{ path, message }],
+    }),
+  };
+}
+
+function parseCopyRequest(value: Record<string, unknown> | undefined): CopyRequestParseResult {
+  if (
+    value === undefined ||
+    !exactKeys(value, TRANSFER_REQUEST_KEYS) ||
+    value.operation !== 'copy' ||
+    typeof value.kind !== 'string' ||
+    typeof value.name !== 'string' ||
+    typeof value.sourceEnvironment !== 'string' ||
+    typeof value.destinationEnvironment !== 'string' ||
+    (value.collision !== 'fail' && value.collision !== 'overwrite') ||
+    !isRevision(value.sourceItemRevision) ||
+    !isRevision(value.sourceEnvironmentRevision) ||
+    !isRevision(value.sourceEnvironmentContainerRevision) ||
+    !isRevision(value.destinationEnvironmentRevision) ||
+    !isRevision(value.destinationEnvironmentContainerRevision) ||
+    (value.destinationItemRevision !== null && !isRevision(value.destinationItemRevision))
+  ) {
+    return {
+      ok: false,
+      result: errorResult('MALFORMED_REQUEST', 'The content transfer request is malformed.'),
+    };
+  }
+  if (!UI_CONTENT_KINDS.includes(value.kind as (typeof UI_CONTENT_KINDS)[number])) {
+    return transferValidation('kind', 'Choose a supported content kind.');
+  }
+  if (validateEnvName(value.sourceEnvironment) !== null) {
+    return transferValidation('sourceEnvironment', 'Enter a valid exact environment name.');
+  }
+  if (validateEnvName(value.destinationEnvironment) !== null) {
+    return transferValidation('destinationEnvironment', 'Enter a valid exact environment name.');
+  }
+  if (value.sourceEnvironment === value.destinationEnvironment) {
+    return transferValidation('destinationEnvironment', 'Choose a different destination environment.');
+  }
+  const nameError = value.kind === 'skill'
+    ? validateSkillName(value.name)
+    : validateItemName(value.kind, value.name);
+  if (nameError !== null) {
+    return transferValidation('name', 'Enter a valid exact content name.');
+  }
+  if (value.collision === 'overwrite' && value.destinationItemRevision === null) {
+    return transferValidation(
+      'destinationItemRevision',
+      'Refresh the destination collision before overwriting.',
+    );
+  }
+  return { ok: true, request: value as unknown as CopyContentRequest };
+}
+
+function transferItem(
+  inventory: EnvironmentInventory,
+  kind: CopyContentRequest['kind'],
+  name: string,
+): ContentItem | undefined {
+  return inventory.items.find((item) => item.kind === kind && item.name === name);
+}
+
+function collisionResult(
+  request: CopyContentRequest,
+  destination: EnvironmentInventory,
+  item: ContentItem,
+): UiRouteResult {
+  return errorResult('COLLISION', 'The destination already contains this content.', {
+    kind: 'transfer-collision',
+    environment: destination.name,
+    contentKind: request.kind,
+    name: request.name,
+    destinationItemRevision: item.revision,
+    destinationEnvironmentRevision: destination.revision,
+    destinationEnvironmentContainerRevision: destination.containerRevision,
+  });
+}
+
+function staleTransferResult(resource: string): UiRouteResult {
+  return errorResult(
+    'STALE_REVISION',
+    'Content changed after the copy dialog opened.',
+    { kind: 'conflict', resource },
+  );
+}
+
+async function readTransferInventory(
+  paths: Paths,
+  name: string,
+  dependencies: UiRouteDependencies,
+): Promise<{ ok: true; inventory: EnvironmentInventory } | { ok: false; result: UiRouteResult }> {
+  try {
+    return {
+      ok: true,
+      inventory: await dependencies.getEnvironmentInventory({ paths, name }),
+    };
+  } catch (error) {
+    if (error instanceof CatalogEnvironmentNotFoundError) {
+      return { ok: false, result: errorResult('NOT_FOUND', 'An environment was not found.') };
+    }
+    if (error instanceof CatalogStaleRevisionError) {
+      return { ok: false, result: staleTransferResult(name) };
+    }
+    return {
+      ok: false,
+      result: errorResult('INTERNAL_ERROR', 'The content transfer could not be inspected.'),
+    };
+  }
+}
+
 function boundedInteger(
   search: URLSearchParams,
   field: string,
@@ -371,6 +529,156 @@ async function lifecycleRouteResult(
   }
 }
 
+async function successfulCopyResult(
+  request: CopyContentRequest,
+  result: Extract<CopyContentResult, { status: 'copied' | 'git-pending' }>,
+  paths: Paths,
+  dependencies: UiRouteDependencies,
+): Promise<UiRouteResult> {
+  const [source, destination] = await Promise.all([
+    readTransferInventory(paths, request.sourceEnvironment, dependencies),
+    readTransferInventory(paths, request.destinationEnvironment, dependencies),
+  ]);
+  const data: CopyContentSuccess = {
+    operation: 'copy',
+    source: {
+      environment: request.sourceEnvironment,
+      kind: request.kind,
+      name: request.name,
+    },
+    destination: {
+      environment: request.destinationEnvironment,
+      kind: request.kind,
+      name: request.name,
+    },
+    publication: result.publication,
+    refreshRequired: !source.ok || !destination.ok,
+    ...(source.ok ? { sourceEnvironment: source.inventory } : {}),
+    ...(destination.ok ? { destinationEnvironment: destination.inventory } : {}),
+  };
+  return { status: 200, body: { data } };
+}
+
+async function copyRouteResult(
+  request: CopyContentRequest,
+  result: CopyContentResult,
+  paths: Paths,
+  dependencies: UiRouteDependencies,
+): Promise<UiRouteResult> {
+  switch (result.status) {
+    case 'copied':
+    case 'git-pending':
+      return await successfulCopyResult(request, result, paths, dependencies);
+    case 'invalid':
+      return transferValidation(result.field, 'The content location is invalid.').result;
+    case 'not-found':
+      return errorResult('NOT_FOUND', 'The requested content was not found.');
+    case 'collision': {
+      const inspected = await readTransferInventory(
+        paths,
+        request.destinationEnvironment,
+        dependencies,
+      );
+      if (!inspected.ok) return inspected.result;
+      const item = transferItem(inspected.inventory, request.kind, request.name);
+      return item === undefined
+        ? staleTransferResult(request.destinationEnvironment)
+        : collisionResult(request, inspected.inventory, item);
+    }
+    case 'stale':
+      return staleTransferResult(result.field);
+    case 'pending-recovery':
+      return errorResult(
+        'PENDING_RECOVERY',
+        'Another operation requires recovery before copying can continue.',
+        pendingRecoveryDetails(result.transactionId, false),
+      );
+    case 'failure':
+      return errorResult('INTERNAL_ERROR', 'The content could not be copied.');
+  }
+}
+
+async function handleCopyRoute(
+  requestBody: Record<string, unknown> | undefined,
+  paths: Paths,
+  dependencies: UiRouteDependencies,
+): Promise<UiRouteResult> {
+  const parsed = parseCopyRequest(requestBody);
+  if (!parsed.ok) return parsed.result;
+  const request = parsed.request;
+  const [source, destination] = await Promise.all([
+    readTransferInventory(paths, request.sourceEnvironment, dependencies),
+    readTransferInventory(paths, request.destinationEnvironment, dependencies),
+  ]);
+  if (!source.ok) return source.result;
+  if (!destination.ok) return destination.result;
+  const sourceItem = transferItem(source.inventory, request.kind, request.name);
+  if (sourceItem === undefined) {
+    return errorResult('NOT_FOUND', 'The source content was not found.');
+  }
+  if (
+    sourceItem.revision !== request.sourceItemRevision ||
+    source.inventory.revision !== request.sourceEnvironmentRevision ||
+    source.inventory.containerRevision !== request.sourceEnvironmentContainerRevision
+  ) {
+    return staleTransferResult(request.sourceEnvironment);
+  }
+  if (
+    destination.inventory.revision !== request.destinationEnvironmentRevision ||
+    destination.inventory.containerRevision !== request.destinationEnvironmentContainerRevision
+  ) {
+    return staleTransferResult(request.destinationEnvironment);
+  }
+  const destinationItem = transferItem(destination.inventory, request.kind, request.name);
+  if (request.collision === 'fail' && destinationItem !== undefined) {
+    if (
+      request.destinationItemRevision !== null &&
+      request.destinationItemRevision !== destinationItem.revision
+    ) {
+      return staleTransferResult(request.destinationEnvironment);
+    }
+    return collisionResult(request, destination.inventory, destinationItem);
+  }
+  if (
+    request.collision === 'overwrite' &&
+    (destinationItem === undefined || destinationItem.revision !== request.destinationItemRevision)
+  ) {
+    return staleTransferResult(request.destinationEnvironment);
+  }
+  if (request.collision === 'fail' && request.destinationItemRevision !== null) {
+    return staleTransferResult(request.destinationEnvironment);
+  }
+  let result: CopyContentResult;
+  try {
+    result = await dependencies.copyContent({
+      paths,
+      source: {
+        kind: request.kind,
+        environment: request.sourceEnvironment,
+        name: request.name,
+      },
+      destination: {
+        kind: request.kind,
+        environment: request.destinationEnvironment,
+        name: request.name,
+      },
+      collision: request.collision,
+      observedRevisions: {
+        sourceItem: request.sourceItemRevision,
+        sourceEnvironment: request.sourceEnvironmentRevision,
+        sourceEnvironmentContainer: request.sourceEnvironmentContainerRevision,
+        destinationEnvironment: request.destinationEnvironmentRevision,
+        destinationEnvironmentContainer: request.destinationEnvironmentContainerRevision,
+        destinationItem: request.destinationItemRevision,
+      },
+      runtime: dependencies.createContentTransferRuntime(paths),
+    });
+  } catch {
+    return errorResult('INTERNAL_ERROR', 'The content could not be copied.');
+  }
+  return await copyRouteResult(request, result, paths, dependencies);
+}
+
 export async function handleUiRoute(
   request: IncomingMessage,
   url: URL,
@@ -379,6 +687,15 @@ export async function handleUiRoute(
   requestBody?: Record<string, unknown>,
 ): Promise<UiRouteResult | undefined> {
   const dependencies = { ...DEFAULT_ROUTE_DEPENDENCIES, ...dependencyOverrides };
+  if (url.pathname === '/api/content/transfer') {
+    if (request.method !== 'POST') {
+      return errorResult('METHOD_NOT_ALLOWED', 'The request method is not supported.');
+    }
+    if ([...url.searchParams.keys()].length > 0) {
+      return errorResult('MALFORMED_REQUEST', 'The request query is malformed.');
+    }
+    return await handleCopyRoute(requestBody, paths, dependencies);
+  }
   const inventoryMatch = /^\/api\/environments\/([^/]+)$/.exec(url.pathname);
   if (inventoryMatch !== null) {
     if (request.method !== 'GET') {
