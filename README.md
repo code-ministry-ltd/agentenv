@@ -78,6 +78,35 @@ agentenv drop --global
 An env-less `drop --global` clears the complete global stack. There is no
 `--all` alias and activation cannot be limited to selected harnesses.
 
+### Local environment UI
+
+Launch the browser interface with:
+
+```sh
+agentenv ui
+```
+
+The command starts a loopback-only server, prints its one-time launch URL, and
+opens the default browser. Keep that terminal running while you use the UI and
+press Ctrl-C to stop it. On a headless machine, or when you want to open the URL
+yourself, use:
+
+```sh
+agentenv ui --no-open
+agentenv ui --no-open --port 41739
+```
+
+The UI can browse every environment and content kind; create, clone, and delete
+inactive environments; copy or move one content item at a time; edit and preview
+`SKILL.md`; and discover and import selected skills from a supported Git source.
+Existing content is skipped or refused by default and is replaced only after an
+explicit overwrite choice.
+
+It does not expose the server to the LAN, edit non-skill content, perform bulk
+transfers, or provide activation, sync, recovery, migration, secret, or harness
+administration. See [docs/UI.md](docs/UI.md) for workflows, safety behavior, and
+recovery messages.
+
 ## Commands
 
 Root flags must precede the command:
@@ -103,6 +132,7 @@ Run `agentenv --help` for the canonical one-line list. The public surface is:
 | Activation | `use <env>… [--global]`, `drop [<env>…] [--global]`, `default <env>… \| --remove`, `run <env>… -- <harness> [args…]`, `shell-init` |
 | Adoption | `capture [--dry-run]`, `adopt <name> --into <env>`, `disown <name>` |
 | Sync and recovery | `remote <url>`, `sync [--resolve \| --abort]`, `status`, `doctor [--repair] [--restore <backup>]`, `resolve …` |
+| Local UI | `ui [--no-open] [--port <port>]` |
 
 `rm` always refuses an active environment and always asks before deleting an
 inactive one. Deactivate it explicitly first; there are no `--yes`, `--force`,
@@ -307,6 +337,8 @@ npm ci
 GIT_CONFIG_GLOBAL=/dev/null npm run ci
 npm run test:offline
 npm run test:migration
+npm run test:ui
+npm run test:ui:e2e
 npm run smoke:install
 npm run test:restore:container   # Docker required
 AGENTENV_LIVE=1 npm run test:live
@@ -315,8 +347,8 @@ AGENTENV_LIVE=1 npm run test:live
 The default tests use temporary homes, local bare Git repositories, and injected
 harness seams. The packed-artifact smoke installs into a clean prefix, syncs
 between two simulated machines, activates Claude and Codex surfaces, drops them,
-and reconciles retained projections. The container gate repeats that proof in a
-clean Node 22 Linux image.
+reconciles retained projections, and completes the local UI's core workflow. The
+container gate repeats that proof in a clean Node 22 Linux image.
 
 Release procedure and rollback guidance live in
 [docs/RELEASE.md](docs/RELEASE.md).

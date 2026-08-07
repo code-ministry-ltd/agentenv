@@ -798,13 +798,20 @@ Size: M
 Document launch flags, security/local-only behavior, workflows, conflict/recovery
 messages, development commands, test tiers, build layout, and current limitations.
 
-- [ ] README user instructions match the packed CLI and every v1 boundary.
-- [ ] Development documentation contains exact clean-checkout UI build/test/smoke
+- [x] README user instructions match the packed CLI and every v1 boundary.
+- [x] Development documentation contains exact clean-checkout UI build/test/smoke
   commands and explains the shared application/HTTP/client dependency direction.
-- [ ] No documentation promises remote access, rich non-skill editing, bulk
+- [x] No documentation promises remote access, rich non-skill editing, bulk
   transfer, hosted discovery, or administration excluded from v1.
 
 Verification: `npm run build && npm run lint && npm run typecheck`
+
+Evidence: README now documents the exact `ui`, `--no-open`, `--port`, and offline
+launch forms plus the bounded v1 feature set. `docs/UI.md` covers workflows,
+security, collision/recovery messages, Git behavior, and current limits.
+Development and release docs record the application → HTTP → client → React
+dependency direction and exact clean-checkout build, focused UI, browser, packed,
+and container gates. Build, lint, and all typechecks passed on 2026-08-07.
 
 Dependencies: Task 23
 
@@ -815,12 +822,18 @@ Size: S
 
 ### Final checkpoint — Release evidence
 
-- [ ] `npm run lint && npm run typecheck && npm run build`
-- [ ] `npm test && npm run test:offline && npm run test:migration`
-- [ ] `npm run test:ui && npm run test:ui:e2e`
-- [ ] `npm run smoke:install && npm run test:restore:container`
-- [ ] Working tree is clean and every numbered task has one independently
+- [x] `npm run lint && npm run typecheck && npm run build`
+- [x] `npm test && npm run test:offline && npm run test:migration`
+- [x] `npm run test:ui && npm run test:ui:e2e`
+- [x] `npm run smoke:install && npm run test:restore:container`
+- [x] Working tree is clean and every numbered task has one independently
   revertible commit with its checkbox and verification evidence recorded.
+
+Release evidence: build/lint/typecheck, the full and offline suites (1,355/1,355
+each), migration (41/41), focused UI (57/57), all 16 production-browser journeys,
+the local packed-artifact workflow, and the Node 22 Linux container restore proof
+passed on 2026-08-07. Tasks 1–24 are recorded as separate ordered commits; the
+working tree was checked again after the final documentation commit.
 
 ## Approval gate
 

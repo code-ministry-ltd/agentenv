@@ -23,9 +23,12 @@ Run from a clean checkout with Node 22.12 or newer:
 
 ```sh
 npm ci
+npx playwright install chromium
 GIT_CONFIG_GLOBAL=/dev/null npm run ci
 npm run test:offline
 npm run test:migration
+npm run test:ui
+npm run test:ui:e2e
 npm run smoke:install
 npm run test:restore:container
 AGENTENV_LIVE=1 npm run test:live
@@ -37,7 +40,9 @@ What each extra gate proves:
 |---|---|
 | `test:offline` | The non-live suite completes without depending on hosted services or a user home. |
 | `test:migration` | Both pinned v1 readers, closed-gate cutover, probes, and fresh-process recovery after real SIGKILL at every modeled boundary. |
-| `smoke:install` | A packed artifact installs in a clean prefix, syncs through a local bare remote, restores to a second machine, launches an observed private Codex session, materialises Claude/Codex globally, drops, reconciles projections, and finishes doctor-clean. |
+| `test:ui` | Shared UI operations and the authenticated production HTTP boundary remain compatible. |
+| `test:ui:e2e` | The production React build completes the accessible browser workflows against temporary stores. |
+| `smoke:install` | A packed artifact installs in a clean prefix, completes the existing two-machine/harness restore, and then uses the installed local UI to browse, create, copy, edit, import from local Git, delete, and shut down cleanly. |
 | `test:restore:container` | The same packed restore proof in a clean Node 22 Linux container. Docker is required. |
 | `test:live` | Current installed Claude, Codex, OpenCode, and Pi binaries accept isolated views; Cursor's global-only `agent mcp list` observes a throwaway HOME. These checks are intentionally opt-in because they depend on local binaries/login state. |
 
@@ -142,7 +147,7 @@ projections, candidates, and rescues.
 ```text
 [ ] package and lockfile versions agree
 [ ] Node >=22.12 engine floor and Linux/macOS CI are green
-[ ] hermetic CI, offline, migration, packed smoke, and container restore pass
+[ ] hermetic CI, offline, migration, UI, packed smoke, and container restore pass
 [ ] live harness evidence is recorded with versions
 [ ] README and adapter limitations match the build
 [ ] no resolved secret appears in output, Git refs, fixtures, or artifacts
