@@ -378,12 +378,23 @@ Size: M
 Implement discriminated content locators and collision-aware copy staging for a
 skill directory, instruction file, MCP entry, agent file, or command file.
 
-- [ ] Exact independent copies work for all five kinds and skill copies preserve
+- [x] Exact independent copies work for all five kinds and skill copies preserve
   source provenance in both environments.
-- [ ] Default collision refusal and explicit overwrite have byte-precise tested
+- [x] Default collision refusal and explicit overwrite have byte-precise tested
   outcomes while unrelated content remains unchanged.
-- [ ] Invalid names, stale identities, pending recovery, and injected failure
+- [x] Invalid names, stale identities, pending recovery, and injected failure
   publish no partial destination.
+
+Verified 2026-08-07: the application copy suite (47/47) passed for skill,
+instruction, MCP, agent, and command content. Copy publication uses one staged
+destination-environment boundary, so skill bytes and provenance recover together;
+default collision refusal, explicit single-item overwrite, unrelated-content
+preservation, AST-exact provenance/MCP metadata, stable no-follow source snapshots,
+contained relative links, recursive physical-entry replacement, hostile runtime
+outcomes, stale parent/source replacement, concurrent recovery, commit-point
+truth, and close failure all have regressions. Lint, all three typechecks, the
+production build, and the full suite (156 files, 1,239 tests)
+passed with the process-local signing override recorded under Task 5.
 
 Verification: `npx vitest run test/content-transfer-copy.test.ts`
 

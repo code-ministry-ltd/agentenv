@@ -194,6 +194,29 @@ export function upsertEnvSource(text: string, name: string, source: SkillSourceR
   return doc.toString();
 }
 
+/** Copy one skill's exact provenance AST node into a destination manifest.
+ * An absent source node removes stale destination provenance; unrelated nodes
+ * retain their document-level presentation.
+ */
+export function copyEnvSource(
+  sourceText: string,
+  destinationText: string,
+  name: string,
+): string {
+  const source = parseDocument(sourceText);
+  const destination = parseDocument(destinationText);
+  const sourceNode = source.getIn(['sources', name], true);
+  if (sourceNode && typeof sourceNode === 'object' && 'clone' in sourceNode) {
+    destination.setIn(
+      ['sources', name],
+      (sourceNode as { clone(): unknown }).clone(),
+    );
+  } else {
+    if (destination.hasIn(['sources', name])) destination.deleteIn(['sources', name]);
+  }
+  return destination.toString();
+}
+
 /**
  * Render a fresh env.yaml for `agentenv create`: the current schema version, a
  * (safely escaped) description, and commented hints for the optional fields so

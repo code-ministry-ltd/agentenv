@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { cp, lstat, mkdir, readlink, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { constants, type BigIntStats } from 'node:fs';
+import { cp, lstat, mkdir, open, readdir, readlink, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { backup, restore, type BackupRef } from './backups.js';
@@ -32,10 +33,20 @@ export interface StagedCommandEntry {
   expectedPreIdentity?: PathIdentity;
 }
 
+interface StableEntryIdentity {
+  device: string;
+  inode: string;
+  /** Recursive physical-entry binding for stable-tree observations. */
+  treeDigest?: string;
+}
+
 export interface StagedCommandPrecondition {
   id: string;
   path: string;
   expectedIdentity: PathIdentity;
+  /** Source observations that must use an identity-pinned, no-follow read at publication. */
+  observation?: 'stable-file' | 'stable-tree';
+  expectedEntry?: StableEntryIdentity;
 }
 
 export class StagedCommandPreconditionError extends Error {
@@ -114,6 +125,121 @@ function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
+function stableStatsEqual(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode &&
+    left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+
+async function observeStableFile(path: string): Promise<{
+  identity: Extract<PathIdentity, { kind: 'file' }>;
+  entry: StableEntryIdentity;
+  bytes: Buffer;
+}> {
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile()) throw new Error('expected a regular file');
+    const bytes = await handle.readFile();
+    const after = await handle.stat({ bigint: true });
+    const current = await lstat(path, { bigint: true });
+    if (!stableStatsEqual(before, after) || !current.isFile() || !stableStatsEqual(after, current)) {
+      throw new Error('file path changed while being observed');
+    }
+    return {
+      identity: {
+        kind: 'file',
+        digest: createHash('sha256').update(bytes).digest('hex'),
+        mode: Number(after.mode & 0o7777n),
+      },
+      entry: { device: String(after.dev), inode: String(after.ino) },
+      bytes,
+    };
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+async function observeStableTree(path: string): Promise<{
+  identity: Extract<PathIdentity, { kind: 'directory' }>;
+  entry: StableEntryIdentity;
+}> {
+  const hash = createHash('sha256');
+  const entryHash = createHash('sha256');
+  const walk = async (directory: string, prefix: string): Promise<BigIntStats> => {
+    const before = await lstat(directory, { bigint: true });
+    if (!before.isDirectory() || before.isSymbolicLink()) throw new Error('expected a physical directory');
+    if (prefix === '') {
+      entryHash
+        .update('.\0d\0')
+        .update(String(before.dev))
+        .update('\0')
+        .update(String(before.ino))
+        .update('\0');
+    }
+    const entries = (await readdir(directory, { withFileTypes: true }))
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const child = join(directory, entry.name);
+      const childStats = await lstat(child, { bigint: true });
+      const childRelative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const childKind = childStats.isSymbolicLink()
+        ? 'l'
+        : childStats.isDirectory()
+          ? 'd'
+          : childStats.isFile()
+            ? 'f'
+            : 'x';
+      entryHash
+        .update(childRelative)
+        .update('\0')
+        .update(childKind)
+        .update('\0')
+        .update(String(childStats.dev))
+        .update('\0')
+        .update(String(childStats.ino))
+        .update('\0');
+      hash.update(childRelative).update('\0').update(String(childStats.mode & 0o7777n)).update('\0');
+      if (childStats.isSymbolicLink()) {
+        const target = await readlink(child);
+        const after = await lstat(child, { bigint: true });
+        if (!after.isSymbolicLink() || !stableStatsEqual(childStats, after)) {
+          throw new Error('symbolic link changed while being observed');
+        }
+        hash.update('l\0').update(target).update('\0');
+      } else if (childStats.isDirectory()) {
+        hash.update('d\0');
+        await walk(child, childRelative);
+      } else if (childStats.isFile()) {
+        const file = await observeStableFile(child);
+        const after = await lstat(child, { bigint: true });
+        if (!stableStatsEqual(childStats, after)) throw new Error('file changed while being observed');
+        hash.update('f\0').update(file.bytes).update('\0');
+      } else {
+        throw new Error('directory contains an unsupported entry');
+      }
+    }
+    const afterNames = (await readdir(directory)).sort((left, right) => left.localeCompare(right));
+    const after = await lstat(directory, { bigint: true });
+    if (
+      !stableStatsEqual(before, after) ||
+      afterNames.length !== entries.length ||
+      afterNames.some((name, index) => name !== entries[index]?.name)
+    ) {
+      throw new Error('directory changed while being observed');
+    }
+    return after;
+  };
+  const root = await walk(path, '');
+  return {
+    identity: { kind: 'directory', digest: hash.digest('hex'), mode: Number(root.mode & 0o7777n) },
+    entry: {
+      device: String(root.dev),
+      inode: String(root.ino),
+      treeDigest: entryHash.digest('hex'),
+    },
+  };
+}
+
 async function copyPath(source: string, destination: string): Promise<void> {
   const stats = await lstat(source).catch((error: NodeJS.ErrnoException) => {
     if (error.code === 'ENOENT') return null;
@@ -168,6 +294,14 @@ async function validateRequest(req: PublishStagedCommandRequest): Promise<void> 
     await assertNoFollowContainment(allowedRoot, precondition.path, {
       label: 'staged command precondition',
     });
+    if (precondition.observation && (
+      !precondition.expectedEntry ||
+      !precondition.expectedEntry.device ||
+      !precondition.expectedEntry.inode ||
+      (precondition.observation === 'stable-tree' && !precondition.expectedEntry.treeDigest)
+    )) {
+      throw new Error(`stable staged command precondition lacks an entry identity: ${precondition.path}`);
+    }
     ids.add(precondition.id);
   }
   for (const entry of req.entries) {
@@ -449,7 +583,11 @@ export async function publishStagedCommand(req: PublishStagedCommandRequest): Pr
       schemaVersion: 1,
       type: 'path-precondition',
       expectedIdentity: precondition.expectedIdentity,
-    } satisfies StagedUndo),
+      ...(precondition.observation ? {
+        observation: precondition.observation,
+        expectedEntry: precondition.expectedEntry,
+      } : {}),
+    }),
   }));
   operations.push(...planned.map(({ entry, pre, post, undo }) => ({
     id: entry.id,
@@ -500,6 +638,26 @@ export async function publishStagedCommand(req: PublishStagedCommandRequest): Pr
     (operation) => operation.kind === 'read-path-precondition',
   );
   const checkPrecondition = async (operation: PlannedOperation): Promise<void> => {
+    const requested = (req.preconditions ?? []).find((item) => item.id === operation.id);
+    if (requested?.observation && requested.expectedEntry) {
+      let observed;
+      try {
+        observed = requested.observation === 'stable-file'
+          ? await observeStableFile(requested.path)
+          : await observeStableTree(requested.path);
+      } catch {
+        throw new StagedCommandPreconditionError(operation.id, requested.path);
+      }
+      if (
+        !identitiesEqual(observed.identity, requested.expectedIdentity) ||
+        observed.entry.device !== requested.expectedEntry.device ||
+        observed.entry.inode !== requested.expectedEntry.inode ||
+        observed.entry.treeDigest !== requested.expectedEntry.treeDigest
+      ) {
+        throw new StagedCommandPreconditionError(operation.id, requested.path);
+      }
+      return;
+    }
     if (
       !operation.path ||
       !operation.preIdentity ||
