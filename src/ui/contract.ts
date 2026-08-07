@@ -31,7 +31,6 @@ export interface SkillSource {
   repository: string;
   path: string;
   ref?: string;
-  commit: string;
   shortCommit: string;
 }
 
@@ -96,6 +95,10 @@ export interface EnvironmentSummary {
 }
 
 export type EnvironmentCatalogPage = PageResponse<EnvironmentSummary>;
+
+export interface EnvironmentInventory extends EnvironmentSummary {
+  items: readonly ContentItem[];
+}
 
 export const API_ERROR_STATUS = {
   MALFORMED_REQUEST: 400,

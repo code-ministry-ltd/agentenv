@@ -98,3 +98,125 @@ test('browses environment summaries into a real request-error state', async ({ p
     await server.close();
   }
 });
+
+test('inspects environment content of every kind with safe metadata by keyboard', async ({
+  page,
+}) => {
+  const server = await startUiTestServer({ fixture: 'authentication' });
+  try {
+    await page.goto(server.launchUrl);
+    const writing = page.getByRole('button', { name: /Inspect writing/ });
+    await writing.focus();
+    await expect(writing).toBeFocused();
+    await page.keyboard.press('Enter');
+
+    await expect(page.getByRole('heading', { level: 2, name: 'writing content' })).toBeVisible();
+    const expectedGroups = [
+      ['Skills', '2'],
+      ['Instructions', '1'],
+      ['MCP servers', '2'],
+      ['Agents', '1'],
+      ['Commands', '1'],
+    ] as const;
+    for (const [name, count] of expectedGroups) {
+      await expect(page.locator('summary').filter({ hasText: name })).toContainText(count);
+    }
+
+    for (const name of ['drafting', 'reviewing', 'base', 'linear', 'notion', 'editor', 'publish']) {
+      await expect(page.getByText(name, { exact: true })).toBeVisible();
+    }
+    await expect(page.getByText('Shape a clear first draft.')).toBeVisible();
+    await expect(page.getByText('https://example.com/code-ministry/writing-tools.git')).toBeVisible();
+    await expect(page.getByText('skills/drafting', { exact: true })).toBeVisible();
+    await expect(page.getByText('abcdef1', { exact: true })).toBeVisible();
+    await expect(page.locator('body')).not.toContainText('browser-secret');
+    await expect(page.locator('body')).not.toContainText('token=hidden');
+
+    const skillsGroup = page.locator('summary').filter({ hasText: 'Skills' });
+    await skillsGroup.focus();
+    await expect(skillsGroup).toBeFocused();
+    await page.keyboard.press('Enter');
+    await expect(page.getByRole('button', { name: 'Inspect skill drafting' })).toBeHidden();
+    await page.keyboard.press('Enter');
+    const drafting = page.getByRole('button', { name: 'Inspect skill drafting' });
+    await drafting.focus();
+    await page.keyboard.press('Enter');
+    await expect(drafting).toHaveAttribute('aria-pressed', 'true');
+  } finally {
+    await server.close();
+  }
+});
+
+test('inspects environment content through empty stale unavailable and error states', async ({
+  page,
+}) => {
+  const server = await startUiTestServer({ fixture: 'authentication' });
+  try {
+    let mode: 'continue' | 'hold' | 'stale' | 'missing' | 'error' = 'continue';
+    let releaseRefresh: (() => void) | undefined;
+    let resolveRequestHeld: (() => void) | undefined;
+    const requestHeld = new Promise<void>((resolve) => {
+      resolveRequestHeld = resolve;
+    });
+    await page.route('**/api/environments/writing', async (route) => {
+      if (mode === 'hold') {
+        resolveRequestHeld!();
+        await new Promise<void>((resolve) => {
+          releaseRefresh = resolve;
+        });
+        await route.continue();
+      } else if (mode === 'missing') {
+        await route.fulfill({
+          status: 404,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: { code: 'NOT_FOUND', message: 'missing' } }),
+        });
+      } else if (mode === 'stale') {
+        await route.fulfill({
+          status: 409,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: { code: 'STALE_REVISION', message: 'stale' } }),
+        });
+      } else if (mode === 'error') {
+        await route.fulfill({
+          status: 500,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: { code: 'INTERNAL_ERROR', message: 'private detail' } }),
+        });
+      } else {
+        await route.continue();
+      }
+    });
+
+    await page.goto(server.launchUrl);
+    await page.getByRole('button', { name: /Inspect research/ }).click();
+    await expect(page.getByText('This environment has no content yet.')).toBeVisible();
+
+    await page.getByRole('button', { name: /Inspect writing/ }).click();
+    await expect(page.getByRole('button', { name: 'Refresh writing content' })).toBeVisible();
+
+    mode = 'hold';
+    await page.getByRole('button', { name: 'Refresh writing content' }).click();
+    await requestHeld;
+    await expect(
+      page.getByRole('status').filter({ hasText: 'previously loaded content' }),
+    ).toBeVisible();
+    releaseRefresh!();
+    await expect(page.getByRole('status').filter({ hasText: 'previously loaded content' })).toBeHidden();
+
+    mode = 'stale';
+    await page.getByRole('button', { name: 'Refresh writing content' }).click();
+    await expect(page.getByRole('alert')).toContainText('content changed before it could be loaded');
+
+    mode = 'missing';
+    await page.getByRole('button', { name: 'Retry writing content' }).click();
+    await expect(page.getByRole('alert')).toContainText('writing is no longer available');
+
+    mode = 'error';
+    await page.getByRole('button', { name: 'Retry writing content' }).click();
+    await expect(page.getByRole('alert')).toContainText('writing content is unavailable');
+    await expect(page.locator('body')).not.toContainText('private detail');
+  } finally {
+    await server.close();
+  }
+});

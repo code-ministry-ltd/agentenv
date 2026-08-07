@@ -4,6 +4,7 @@ import {
   type ApiErrorResponse,
   type ApiSuccessResponse,
   type EnvironmentCatalogPage,
+  type EnvironmentInventory,
   type EnvironmentSummary,
 } from '../../src/ui/contract.js';
 
@@ -113,4 +114,12 @@ export async function listEnvironmentSummaries(): Promise<readonly EnvironmentSu
     items.push(...next.items);
   }
   return items;
+}
+
+export async function getEnvironmentInventory(
+  name: string,
+): Promise<EnvironmentInventory> {
+  return await apiRequest<EnvironmentInventory>(
+    `/api/environments/${encodeURIComponent(name)}`,
+  );
 }

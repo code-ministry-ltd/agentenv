@@ -62,10 +62,30 @@ async function seedDetailedEnvironments(home: string): Promise<void> {
   await mkdir(join(writing, 'agents'), { recursive: true });
   await mkdir(join(writing, 'commands'), { recursive: true });
   await mkdir(research, { recursive: true });
-  await writeFile(join(writing, 'env.yaml'), 'version: "1.0"\ndescription: Daily writing tools.\n');
+  await writeFile(
+    join(writing, 'env.yaml'),
+    [
+      'version: "1.0"',
+      'description: Daily writing tools.',
+      'sources:',
+      '  drafting:',
+      '    repo: https://reader:browser-secret@example.com/code-ministry/writing-tools.git?token=hidden',
+      '    path: skills/drafting',
+      '    ref: main',
+      '    commit: abcdef1234567890abcdef1234567890abcdef12',
+      '    hash: private-content-hash',
+      '',
+    ].join('\n'),
+  );
   await writeFile(join(research, 'env.yaml'), 'version: "1.0"\ndescription: Source gathering.\n');
-  await writeFile(join(writing, 'skills', 'drafting', 'SKILL.md'), '# drafting\n');
-  await writeFile(join(writing, 'skills', 'reviewing', 'SKILL.md'), '# reviewing\n');
+  await writeFile(
+    join(writing, 'skills', 'drafting', 'SKILL.md'),
+    '---\nname: drafting\ndescription: Shape a clear first draft.\n---\n\n# drafting\n',
+  );
+  await writeFile(
+    join(writing, 'skills', 'reviewing', 'SKILL.md'),
+    '---\nname: reviewing\ndescription: Review prose before publishing.\n---\n\n# reviewing\n',
+  );
   await writeFile(join(writing, 'instructions', 'base.md'), '# instructions\n');
   await writeFile(
     join(writing, 'mcp', 'servers.yaml'),

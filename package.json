@@ -28,7 +28,7 @@
     "lint": "eslint .",
     "test": "vitest run --exclude 'test/*.live.test.ts' --exclude 'test/*.e2e.test.ts'",
     "test:offline": "GIT_CONFIG_GLOBAL=/dev/null vitest run --exclude 'test/*.live.test.ts' --exclude 'test/*.e2e.test.ts'",
-    "test:ui": "vitest run test/ui-contract.test.ts test/ui-build.test.ts test/ui-server.test.ts test/ui-command.test.ts test/ui-catalog.test.ts",
+    "test:ui": "vitest run test/ui-contract.test.ts test/ui-build.test.ts test/ui-server.test.ts test/ui-command.test.ts test/ui-catalog.test.ts test/ui-inventory.test.ts",
     "test:ui:e2e": "npm run build && playwright test --config playwright.config.ts",
     "test:migration": "GIT_CONFIG_GLOBAL=/dev/null vitest run test/legacy-state.test.ts test/migration-state.test.ts test/migration.test.ts test/migration-command.test.ts test/migration.subprocess-kill.test.ts",
     "test:restore:container": "bash scripts/test-restore-container.sh",

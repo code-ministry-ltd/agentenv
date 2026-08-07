@@ -57,6 +57,11 @@ button:hover {
   background: var(--accent-strong);
 }
 
+button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
 :focus-visible {
   outline: 3px solid var(--focus);
   outline-offset: 3px;
@@ -225,6 +230,28 @@ h3 {
   background: var(--surface-raised);
 }
 
+.environment-card.selected {
+  border-color: var(--accent-strong);
+  box-shadow: inset 4px 0 0 var(--accent);
+}
+
+.environment-select,
+.content-item-select {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+}
+
+.environment-select:hover,
+.content-item-select:hover {
+  background: transparent;
+  color: var(--accent-strong);
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}
+
 .activity {
   display: inline-flex;
   align-items: center;
@@ -263,6 +290,154 @@ h3 {
 
 .environment-revision {
   margin-top: 0.7rem;
+}
+
+.inventory-panel {
+  margin-top: clamp(2.5rem, 7vw, 5rem);
+  padding-top: 1.5rem;
+  border-top: 3px solid var(--ink);
+}
+
+.inventory-heading,
+.content-item-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.inventory-heading .eyebrow {
+  margin-bottom: 0.45rem;
+}
+
+.inventory-message {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.8rem;
+  margin-top: 1.5rem;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink-muted);
+}
+
+.inventory-message strong,
+.inventory-message span {
+  display: block;
+}
+
+.inventory-error {
+  flex-direction: column;
+  border-color: var(--danger);
+}
+
+.inventory-empty,
+.inventory-stale {
+  border-style: dashed;
+}
+
+.inventory-stale {
+  border-color: var(--accent);
+}
+
+.content-groups {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1.5rem;
+}
+
+.content-group {
+  border: 1px solid var(--line);
+  background: var(--surface-raised);
+}
+
+.content-group summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.9rem 1rem;
+  cursor: pointer;
+  color: var(--ink);
+  font-weight: 750;
+}
+
+.group-count {
+  display: inline-grid;
+  min-width: 1.75rem;
+  min-height: 1.75rem;
+  padding: 0.2rem;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 0.72rem;
+}
+
+.content-group ul {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
+  gap: 0.75rem;
+  margin: 0;
+  padding: 0 1rem 1rem;
+  list-style: none;
+}
+
+.content-group-empty {
+  margin: 0;
+  padding: 0 1rem 1rem;
+  color: var(--ink-muted);
+}
+
+.content-item {
+  height: 100%;
+  padding: 0.85rem;
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.content-item.selected {
+  border-color: var(--focus);
+}
+
+.content-item-heading span {
+  color: var(--ink-muted);
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+}
+
+.content-item-description {
+  margin: 0.7rem 0 0;
+  color: var(--ink-muted);
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+.content-metadata {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0.75rem 0 0;
+  padding-top: 0.7rem;
+  border-top: 1px solid var(--line);
+}
+
+.content-metadata div {
+  display: grid;
+  grid-template-columns: minmax(6rem, auto) 1fr;
+  gap: 0.75rem;
+  font-size: 0.75rem;
+}
+
+.content-metadata dt {
+  color: var(--ink-muted);
+}
+
+.content-metadata dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
 }
 
 .eyebrow {
@@ -393,7 +568,8 @@ code {
 
   .catalog-heading,
   .catalog-error,
-  .environment-card-heading {
+  .environment-card-heading,
+  .inventory-heading {
     align-items: flex-start;
     flex-direction: column;
   }

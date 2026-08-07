@@ -172,11 +172,19 @@ Extend the catalogue, route, and selected-environment view to list skills,
 instructions, MCP mapping entries, agents, and commands with relevant metadata
 and redacted Git provenance.
 
-- [ ] All five groups report correct names and counts, including individual MCP
+- [x] All five groups report correct names and counts, including individual MCP
   mapping entries and skill source metadata.
-- [ ] Selecting or refreshing an environment never mutates store or state bytes.
-- [ ] The UI presents populated, empty, stale, unavailable, and error states with
+- [x] Selecting or refreshing an environment never mutates store or state bytes.
+- [x] The UI presents populated, empty, stale, unavailable, and error states with
   keyboard-operable group/item navigation.
+
+Verified 2026-08-07: inventory/API tests (9/9) and focused production CLI
+Playwright flows (2/2) passed, covering every content kind, safe Git metadata,
+coherent/stale reads, byte-sensitive MCP revisions, no-follow regular-file
+enforcement, read-only identity preservation, all UI states, and keyboard use.
+Lint, all three typechecks, build, UI tests (28/28), all production-browser tests
+(6/6), and the full regression suite (152 files, 1,123 tests) passed. The full
+suite used the same process-local Git signing override recorded under Task 5.
 
 Verification: `npx vitest run test/ui-inventory.test.ts && npm run test:ui:e2e -- --grep "inspects environment content"`
 

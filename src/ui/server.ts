@@ -4,7 +4,10 @@ import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolvePaths, type Paths } from '../paths.js';
 import { API_ERROR_STATUS, type ApiErrorCode } from './contract.js';
-import { handleUiRoute } from './routes.js';
+import {
+  handleUiRoute,
+  type UiRouteDependencyOverrides,
+} from './routes.js';
 import {
   applyBrowserSecurityHeaders,
   createUiSecurityState,
@@ -20,6 +23,7 @@ export interface StartUiServerOptions {
   assetsDir?: string;
   installSignalHandlers?: boolean;
   paths?: Paths;
+  routeDependencies?: UiRouteDependencyOverrides;
 }
 
 export interface UiServerHandle {
@@ -154,6 +158,7 @@ async function handleApi(
   expectedHost: string,
   security: UiSecurityState,
   paths: Paths,
+  routeDependencies: UiRouteDependencyOverrides,
 ): Promise<void> {
   if (!hasExpectedHost(request, expectedHost)) {
     sendError(response, 'FORBIDDEN', 'The request host is not allowed.');
@@ -217,6 +222,7 @@ async function handleApi(
     request,
     new URL(request.url ?? '/', origin),
     paths,
+    routeDependencies,
   );
   if (route !== undefined) {
     sendJson(response, route.status, route.body);
@@ -240,6 +246,7 @@ export async function startUiServer(
 
   const assetsDir = options.assetsDir ?? DEFAULT_ASSETS_DIR;
   const paths = options.paths ?? resolvePaths();
+  const routeDependencies = options.routeDependencies ?? {};
   const security = createUiSecurityState();
   let origin = '';
   let expectedHost = '';
@@ -255,7 +262,16 @@ export async function startUiServer(
       }
 
       if (pathname === '/api' || pathname.startsWith('/api/')) {
-        await handleApi(request, response, pathname, origin, expectedHost, security, paths);
+        await handleApi(
+          request,
+          response,
+          pathname,
+          origin,
+          expectedHost,
+          security,
+          paths,
+          routeDependencies,
+        );
       } else {
         await serveAsset(request, response, pathname, assetsDir);
       }

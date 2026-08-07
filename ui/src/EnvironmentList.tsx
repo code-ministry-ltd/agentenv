@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { ContentCounts, EnvironmentSummary } from '../../src/ui/contract.js';
 import { listEnvironmentSummaries } from './api.js';
+import { EnvironmentView } from './EnvironmentView.js';
 
 type CatalogState =
   | { status: 'loading' }
@@ -24,6 +25,7 @@ function summarizeCounts(counts: ContentCounts): string {
 export function EnvironmentList(): React.JSX.Element {
   const [request, setRequest] = useState(0);
   const [catalog, setCatalog] = useState<CatalogState>({ status: 'loading' });
+  const [selectedName, setSelectedName] = useState<string>();
 
   useEffect(() => {
     let ignore = false;
@@ -43,6 +45,10 @@ export function EnvironmentList(): React.JSX.Element {
       ignore = true;
     };
   }, [request]);
+
+  const selectedEnvironment = catalog.status === 'ready'
+    ? catalog.items.find((environment) => environment.name === selectedName)
+    : undefined;
 
   return (
     <section className="catalog-panel" aria-labelledby="environment-list-title">
@@ -85,28 +91,52 @@ export function EnvironmentList(): React.JSX.Element {
       ) : null}
 
       {catalog.status === 'ready' && catalog.items.length > 0 ? (
-        <ul className="environment-list" aria-label="Environments">
-          {catalog.items.map((environment) => (
-            <li key={environment.name} data-revision={environment.revision}>
-              <article className="environment-card">
-                <div className="environment-card-heading">
-                  <h3>{environment.name}</h3>
-                  <span className={environment.active ? 'activity active' : 'activity'}>
-                    <span aria-hidden="true" className="activity-dot" />
-                    {environment.active ? 'Active' : 'Inactive'}
-                  </span>
-                </div>
-                <p className="environment-description">
-                  {environment.description || 'No description.'}
-                </p>
-                <p className="environment-counts">{summarizeCounts(environment.counts)}</p>
-                <p className="environment-revision" title={environment.revision}>
-                  Revision {environment.revision.slice(0, 10)}
-                </p>
-              </article>
-            </li>
-          ))}
-        </ul>
+        <>
+          <ul className="environment-list" aria-label="Environments">
+            {catalog.items.map((environment) => {
+              const selected = selectedName === environment.name;
+              return (
+                <li key={environment.name} data-revision={environment.revision}>
+                  <article className={selected ? 'environment-card selected' : 'environment-card'}>
+                    <div className="environment-card-heading">
+                      <h3>
+                        <button
+                          aria-controls="selected-environment"
+                          aria-expanded={selected}
+                          aria-label={`Inspect ${environment.name}`}
+                          className="environment-select"
+                          onClick={() => setSelectedName(environment.name)}
+                          type="button"
+                        >
+                          {environment.name}
+                        </button>
+                      </h3>
+                      <span className={environment.active ? 'activity active' : 'activity'}>
+                        <span aria-hidden="true" className="activity-dot" />
+                        {environment.active ? 'Active' : 'Inactive'}
+                      </span>
+                    </div>
+                    <p className="environment-description">
+                      {environment.description || 'No description.'}
+                    </p>
+                    <p className="environment-counts">{summarizeCounts(environment.counts)}</p>
+                    <p className="environment-revision" title={environment.revision}>
+                      Revision {environment.revision.slice(0, 10)}
+                    </p>
+                  </article>
+                </li>
+              );
+            })}
+          </ul>
+          <div id="selected-environment">
+            {selectedEnvironment === undefined ? null : (
+              <EnvironmentView
+                key={selectedEnvironment.name}
+                environment={selectedEnvironment}
+              />
+            )}
+          </div>
+        </>
       ) : null}
     </section>
   );
