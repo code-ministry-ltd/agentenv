@@ -593,12 +593,23 @@ Size: M
 Add a raw-HTML-disabled Markdown preview, permitted-link policy, dirty navigation/
 refresh/close guards, retained retryable drafts, and complete keyboard/focus states.
 
-- [ ] Script/HTML payloads render inertly, remote plugins/assets do not load, and
+- [x] Script/HTML payloads render inertly, remote plugins/assets do not load, and
   external links cannot retain opener access.
-- [ ] Dirty navigation, environment changes, refresh, and close warn before loss;
+- [x] Dirty navigation, environment changes, refresh, and close warn before loss;
   cancellation preserves cursor, draft, and selected skill.
-- [ ] Source, preview, and split views plus validation/status announcements are
+- [x] Source, preview, and split views plus validation/status announcements are
   keyboard operable and programmatically named.
+
+Verified 2026-08-07: the production-browser preview/draft journey passed with
+raw HTML rendered inertly, no script or image elements, zero remote image
+requests, non-navigable unsafe/relative URLs, opener-safe permitted links,
+keyboard Source/Preview/Split controls, browser unload protection, and an
+accessible cancel/discard dialog. Cancelling close or environment navigation
+retained the exact draft, cursor position, selected skill, and CodeMirror
+instance; explicit discard completed navigation and removed the unload guard.
+Stale reload uses the same in-app guard and retains the dirty state if reload
+fails. Lint, all typechecks, build, UI tests (49/49), browser journeys (14/14),
+and the full regression suite (161 files, 1,340 tests) passed.
 
 Verification: `npm run test:ui:e2e -- --grep "previews safely and retains drafts"`
 
@@ -612,9 +623,9 @@ Size: M
 
 ### Checkpoint E — Skill editor
 
-- [ ] `npm run lint && npm run typecheck && npm run build && npm test`
-- [ ] `npm run test:ui && npm run test:ui:e2e`
-- [ ] Manual editor walkthrough confirms safe preview, save, stale refusal, and draft retention.
+- [x] `npm run lint && npm run typecheck && npm run build && npm test`
+- [x] `npm run test:ui && npm run test:ui:e2e`
+- [x] Manual editor walkthrough confirms safe preview, save, stale refusal, and draft retention.
 
 ## Phase 6 — Browse and import skills from Git
 

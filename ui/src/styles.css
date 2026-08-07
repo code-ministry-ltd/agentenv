@@ -759,6 +759,49 @@ h3 {
   word-break: break-word;
 }
 
+.safe-markdown {
+  min-height: 22rem;
+  overflow-wrap: anywhere;
+  padding: 1rem;
+  background: var(--surface);
+  color: var(--ink);
+  line-height: 1.65;
+}
+
+.safe-markdown > :first-child {
+  margin-top: 0;
+}
+
+.safe-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.safe-markdown pre {
+  max-width: 100%;
+  overflow: auto;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  background: var(--surface-raised);
+}
+
+.safe-markdown a {
+  color: var(--accent-strong);
+  text-underline-offset: 0.15em;
+}
+
+.unsafe-markdown-link {
+  text-decoration: line-through;
+  text-decoration-color: var(--danger);
+}
+
+.markdown-image-placeholder {
+  display: inline-block;
+  padding: 0.15rem 0.35rem;
+  border: 1px dashed var(--line);
+  color: var(--ink-muted);
+  font-size: 0.85em;
+}
+
 .skill-code-editor .cm-editor {
   min-height: 22rem;
   background: var(--surface);

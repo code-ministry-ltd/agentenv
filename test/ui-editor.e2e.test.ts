@@ -13,7 +13,13 @@ const DRAFTING_SOURCE = [
   '',
   '<script>window.__skillExecuted = true</script>',
   '<img src=x onerror="window.__skillImageExecuted = true">',
+  '',
+  '![remote alt](https://example.invalid/tracker.png)',
   '[unsafe](javascript:window.__skillLinkExecuted=true)',
+  '[relative](../private/SKILL.md)',
+  '[safe](https://example.com/docs)',
+  '[mail](mailto:test@example.com)',
+  '[section](#drafting)',
   '',
 ].join('\n');
 
@@ -95,6 +101,8 @@ test('isolates a dirty draft and late response from the next skill selection', a
     await draftingRefreshHeld;
 
     await page.getByRole('button', { name: 'Open skill reviewing' }).click();
+    await page.getByRole('dialog', { name: 'Discard your changes?' })
+      .getByRole('button', { name: 'Discard changes' }).click();
     const reviewingWorkspace = page.getByRole('region', { name: 'reviewing SKILL.md' });
     const reviewingEditor = reviewingWorkspace.getByRole('textbox', {
       name: 'Skill Markdown source editor',
@@ -119,9 +127,10 @@ test('isolates a dirty draft and late response from the next skill selection', a
   }
 });
 
-test('opens a skill document', async ({ page }) => {
+test('previews safely and retains drafts', async ({ page }) => {
   const server = await startUiTestServer({ fixture: 'authentication' });
   const documentRequests: string[] = [];
+  const remoteAssetRequests: string[] = [];
   type ResponseMode = 'continue' | 'hold-drafting' | 'failure' | 'stale' | 'missing' | 'invalid';
   let responseMode: ResponseMode = 'hold-drafting';
   let draftingHeld: (() => void) | undefined;
@@ -131,6 +140,9 @@ test('opens a skill document', async ({ page }) => {
 
   page.on('request', (request) => {
     if (request.resourceType() === 'document') documentRequests.push(request.url());
+    if (request.url().includes('example.invalid/tracker.png')) {
+      remoteAssetRequests.push(request.url());
+    }
   });
   await page.route('**/api/environments/*/skills/*/document', async (route) => {
     const skill = decodeURIComponent(new URL(route.request().url()).pathname.split('/').at(-2)!);
@@ -220,11 +232,25 @@ test('opens a skill document', async ({ page }) => {
     await expect(splitTab).toHaveAttribute('aria-selected', 'false');
 
     await previewTab.click();
-    const literalPreview = workspace.getByLabel('Skill document literal preview');
+    const renderedPreview = workspace.getByLabel('Rendered skill document preview');
     await expect(previewTab).toHaveAttribute('aria-selected', 'true');
     await expect(editor).toHaveCount(0);
-    expect(await literalPreview.textContent()).toBe(DRAFTING_SOURCE);
-    await expect(literalPreview.locator('script, img, a')).toHaveCount(0);
+    await expect(renderedPreview.getByRole('heading', { name: 'drafting', level: 1 })).toBeVisible();
+    await expect(renderedPreview.locator('script, img')).toHaveCount(0);
+    await expect(renderedPreview.getByText('Image omitted: remote alt')).toBeVisible();
+    await expect(renderedPreview.getByText('unsafe')).not.toHaveAttribute('href');
+    await expect(renderedPreview.getByText('relative')).not.toHaveAttribute('href');
+    await expect(renderedPreview.getByRole('link', { name: 'safe' }))
+      .toHaveAttribute('href', 'https://example.com/docs');
+    await expect(renderedPreview.getByRole('link', { name: 'safe' }))
+      .toHaveAttribute('target', '_blank');
+    await expect(renderedPreview.getByRole('link', { name: 'safe' }))
+      .toHaveAttribute('rel', 'noopener noreferrer');
+    await expect(renderedPreview.getByRole('link', { name: 'mail' }))
+      .toHaveAttribute('href', 'mailto:test@example.com');
+    await expect(renderedPreview.getByRole('link', { name: 'section' }))
+      .not.toHaveAttribute('target', '_blank');
+    expect(remoteAssetRequests).toEqual([]);
     expect(await page.evaluate(() => ({
       script: (window as unknown as { __skillExecuted?: boolean }).__skillExecuted,
       image: (window as unknown as { __skillImageExecuted?: boolean }).__skillImageExecuted,
@@ -239,7 +265,7 @@ test('opens a skill document', async ({ page }) => {
     await editor.press(process.platform === 'darwin' ? 'Meta+ArrowDown' : 'Control+End');
     await editor.pressSequentially('local retained draft');
     await previewTab.click();
-    expect(await literalPreview.textContent()).toBe(`${DRAFTING_SOURCE}local retained draft`);
+    await expect(renderedPreview).toContainText('local retained draft');
 
     await sourceTab.click();
     await editor.press(process.platform === 'darwin' ? 'Meta+z' : 'Control+z');
@@ -253,8 +279,8 @@ test('opens a skill document', async ({ page }) => {
     await expect(splitTab).toHaveAttribute('aria-selected', 'true');
     await expect(editor).toBeFocused();
     await expect(workspace.getByRole('heading', { name: 'Markdown source' })).toBeVisible();
-    await expect(workspace.getByRole('heading', { name: 'Literal preview' })).toBeVisible();
-    expect(await literalPreview.textContent()).toBe(`${DRAFTING_SOURCE}local retained draft`);
+    await expect(workspace.getByRole('heading', { name: 'Rendered preview' })).toBeVisible();
+    await expect(renderedPreview).toContainText('local retained draft');
 
     await sourceTab.click();
     await splitTab.click();
@@ -263,6 +289,34 @@ test('opens a skill document', async ({ page }) => {
     expect(await editor.evaluate((node) =>
       node === (window as typeof window & { __originalSkillEditor?: Element })
         .__originalSkillEditor)).toBe(true);
+
+    // Browser unload and in-app navigation warn while preserving the live editor on cancel.
+    expect(await page.evaluate(() => {
+      const event = new Event('beforeunload', { cancelable: true });
+      return {
+        allowed: window.dispatchEvent(event),
+        prevented: event.defaultPrevented,
+      };
+    })).toEqual({ allowed: false, prevented: true });
+    await workspace.getByRole('button', { name: 'Close workspace' }).click();
+    const discardDialog = page.getByRole('dialog', { name: 'Discard your changes?' });
+    await expect(discardDialog.getByRole('button', { name: 'Continue editing' })).toBeFocused();
+    await page.keyboard.press('Escape');
+    await expect(discardDialog).toBeHidden();
+    await expect(workspace.getByRole('button', { name: 'Close workspace' })).toBeFocused();
+    expect(await editor.evaluate((node) =>
+      node === (window as typeof window & { __originalSkillEditor?: Element })
+        .__originalSkillEditor)).toBe(true);
+    await editor.focus();
+    await editor.pressSequentially('!');
+    await expect.poll(() => editorText(editor)).toBe(`${DRAFTING_SOURCE}local retained draft!`);
+    await editor.press('Backspace');
+    await expect.poll(() => editorText(editor)).toBe(`${DRAFTING_SOURCE}local retained draft`);
+
+    await page.getByRole('button', { name: 'Inspect research' }).click();
+    await discardDialog.getByRole('button', { name: 'Continue editing' }).click();
+    await expect(page.getByRole('heading', { name: 'writing content' })).toBeVisible();
+    await expect(editor).toContainText('local retained draft');
 
     // Every retryable read outcome keeps the editor draft and reveals no server detail.
     responseMode = 'failure';
@@ -317,6 +371,21 @@ test('opens a skill document', async ({ page }) => {
     await expect(editor).toContainText('second external change');
     await expect(editor).not.toContainText('local retained draft');
     expect(documentRequests).toHaveLength(1);
+
+    // Explicit discard completes navigation and removes the unload guard.
+    await editor.press(process.platform === 'darwin' ? 'Meta+ArrowDown' : 'Control+End');
+    await editor.pressSequentially('final guarded draft');
+    await page.getByRole('button', { name: 'Inspect research' }).click();
+    await discardDialog.getByRole('button', { name: 'Discard changes' }).click();
+    await expect(page.getByRole('heading', { name: 'research content' })).toBeVisible();
+    await expect(workspace).toBeHidden();
+    await expect.poll(() => page.evaluate(() => {
+      const event = new Event('beforeunload', { cancelable: true });
+      return {
+        allowed: window.dispatchEvent(event),
+        prevented: event.defaultPrevented,
+      };
+    })).toEqual({ allowed: true, prevented: false });
   } finally {
     await server.close();
   }
@@ -446,8 +515,9 @@ test('validates and saves a skill', async ({ context, page }) => {
     expect(await readFile(draftingPath, 'utf8')).toBe(external);
     await staleAlert.getByRole('button', { name: 'Copy draft' }).click();
     await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(browserDraft);
-    page.once('dialog', (dialog) => dialog.accept());
     await staleAlert.getByRole('button', { name: 'Reload latest' }).click();
+    await page.getByRole('dialog', { name: 'Discard your changes?' })
+      .getByRole('button', { name: 'Discard changes' }).click();
     await expect.poll(() => editorText(editor)).toBe(external);
     expect(await readFile(draftingPath, 'utf8')).toBe(external);
 
@@ -472,6 +542,8 @@ test('validates and saves a skill', async ({ context, page }) => {
     await reviewingEditor.press(shortcut);
     await heldPromise;
     await page.getByRole('button', { name: 'Open skill drafting' }).click();
+    await page.getByRole('dialog', { name: 'Discard your changes?' })
+      .getByRole('button', { name: 'Discard changes' }).click();
     release!();
     const draftingAgain = page.getByRole('region', { name: 'drafting SKILL.md' });
     await expect(draftingAgain).toBeVisible();

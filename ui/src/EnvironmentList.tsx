@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   ContentCounts,
   ContentTransferSuccess,
@@ -11,6 +11,10 @@ import { listEnvironmentSummaries } from './api.js';
 import { DeleteEnvironmentDialog } from './DeleteEnvironmentDialog.js';
 import { EnvironmentDialog } from './EnvironmentDialog.js';
 import { EnvironmentView } from './EnvironmentView.js';
+import {
+  UnsavedChangesDialog,
+  type PendingDiscardAction,
+} from './UnsavedChangesDialog.js';
 
 type CatalogState =
   | { status: 'loading' }
@@ -43,6 +47,8 @@ export function EnvironmentList(): React.JSX.Element {
   const [deleteName, setDeleteName] = useState<string>();
   const [deletionNotice, setDeletionNotice] = useState<string>();
   const [publishedInventory, setPublishedInventory] = useState<EnvironmentInventory>();
+  const [editorDirty, setEditorDirty] = useState(false);
+  const [pendingDiscard, setPendingDiscard] = useState<PendingDiscardAction>();
   const createTriggerRef = useRef<HTMLButtonElement>(null);
   const cloneTriggerRef = useRef<HTMLButtonElement>(null);
   const deleteTriggerRef = useRef<HTMLButtonElement>(null);
@@ -56,6 +62,27 @@ export function EnvironmentList(): React.JSX.Element {
   catalogRef.current = catalog;
   deleteNameRef.current = deleteName;
   selectedNameRef.current = selectedName;
+
+  useEffect(() => {
+    if (!editorDirty) return;
+    const warn = (event: BeforeUnloadEvent): void => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [editorDirty]);
+
+  const requestDiscard = useCallback((
+    action: () => void,
+    trigger: HTMLElement | null,
+  ): void => {
+    if (!editorDirty) {
+      action();
+      return;
+    }
+    setPendingDiscard({ action, trigger });
+  }, [editorDirty]);
 
   useEffect(() => {
     let ignore = false;
@@ -197,7 +224,11 @@ export function EnvironmentList(): React.JSX.Element {
               <span className="catalog-total">{countLabel(catalog.items.length, 'environment')}</span>
             ) : null}
             <div className="catalog-actions">
-              <button ref={createTriggerRef} type="button" onClick={() => setDialog('create')}>
+              <button
+                ref={createTriggerRef}
+                type="button"
+                onClick={() => setDialog('create')}
+              >
                 Create environment
               </button>
               <button
@@ -238,7 +269,9 @@ export function EnvironmentList(): React.JSX.Element {
             <strong>Environment refresh failed.</strong>
             <span>Showing the last known catalogue. Your environment files were not changed.</span>
           </div>
-          <button type="button" onClick={refresh}>Retry environments</button>
+          <button type="button" onClick={refresh}>
+            Retry environments
+          </button>
         </div>
       ) : null}
 
@@ -277,11 +310,14 @@ export function EnvironmentList(): React.JSX.Element {
                             if (element === null) inspectTriggerRefs.current.delete(environment.name);
                             else inspectTriggerRefs.current.set(environment.name, element);
                           }}
-                          onClick={() => {
-                            setSelectedName(environment.name);
-                            if (publishedInventory?.name !== environment.name) {
-                              setPublishedInventory(undefined);
-                            }
+                          onClick={(event) => {
+                            if (selectedName === environment.name) return;
+                            requestDiscard(() => {
+                              setSelectedName(environment.name);
+                              if (publishedInventory?.name !== environment.name) {
+                                setPublishedInventory(undefined);
+                              }
+                            }, event.currentTarget);
                           }}
                           type="button"
                         >
@@ -299,7 +335,12 @@ export function EnvironmentList(): React.JSX.Element {
                           type="button"
                           onClick={(event) => {
                             deleteTriggerRef.current = event.currentTarget;
-                            setDeleteName(environment.name);
+                            const openDelete = (): void => setDeleteName(environment.name);
+                            if (selectedName === environment.name) {
+                              requestDiscard(openDelete, event.currentTarget);
+                            } else {
+                              openDelete();
+                            }
                           }}
                         >
                           Delete
@@ -327,7 +368,9 @@ export function EnvironmentList(): React.JSX.Element {
                 initialInventory={publishedInventory?.name === selectedEnvironment.name
                   ? publishedInventory
                   : undefined}
+                onEditorDirtyChange={setEditorDirty}
                 onRefreshEnvironments={refresh}
+                onRequestDiscard={requestDiscard}
                 onTransferred={transferred}
               />
             )}
@@ -351,6 +394,17 @@ export function EnvironmentList(): React.JSX.Element {
           onDeleted={deleted}
           onRefresh={refresh}
           triggerRef={deleteTriggerRef}
+        />
+      )}
+      {pendingDiscard === undefined ? null : (
+        <UnsavedChangesDialog
+          pending={pendingDiscard}
+          onCancel={() => setPendingDiscard(undefined)}
+          onDiscard={() => {
+            const { action } = pendingDiscard;
+            setPendingDiscard(undefined);
+            action();
+          }}
         />
       )}
     </section>

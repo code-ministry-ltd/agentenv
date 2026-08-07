@@ -266,13 +266,17 @@ export function EnvironmentView({
   environment,
   environments,
   initialInventory,
+  onEditorDirtyChange,
   onRefreshEnvironments,
+  onRequestDiscard,
   onTransferred,
 }: {
   environment: EnvironmentSummary;
   environments: readonly EnvironmentSummary[];
   initialInventory?: EnvironmentInventory;
+  onEditorDirtyChange(dirty: boolean): void;
   onRefreshEnvironments(): void;
+  onRequestDiscard(action: () => void, trigger: HTMLElement | null): void;
   onTransferred(result: ContentTransferSuccess): void;
 }): React.JSX.Element {
   const [request, setRequest] = useState(0);
@@ -442,9 +446,7 @@ export function EnvironmentView({
             aria-disabled={refreshBlocked}
             type="button"
             onClick={() => {
-              if (!refreshBlocked) {
-                setRequest((value) => value + 1);
-              }
+              if (!refreshBlocked) setRequest((value) => value + 1);
             }}
           >
             Refresh {environment.name} content
@@ -497,12 +499,18 @@ export function EnvironmentView({
         <InventoryGroups
           inventory={visibleInventory}
           onOpenSkill={(item, trigger) => {
-            skillTriggerRef.current = trigger;
-            setSelectedSkillDocument({
-              environment: visibleInventory.name,
-              name: item.name,
-              revision: item.revision,
-            });
+            if (
+              selectedSkillDocument?.environment === visibleInventory.name &&
+              selectedSkillDocument.name === item.name
+            ) return;
+            onRequestDiscard(() => {
+              skillTriggerRef.current = trigger;
+              setSelectedSkillDocument({
+                environment: visibleInventory.name,
+                name: item.name,
+                revision: item.revision,
+              });
+            }, trigger);
           }}
           onTransfer={(operation, item, trigger) => {
             transferTriggerRef.current = trigger;
@@ -521,11 +529,15 @@ export function EnvironmentView({
           itemRevision={selectedSkillItem.revision}
           key={`${selectedSkillDocument.environment}/${selectedSkillDocument.name}`}
           skill={selectedSkillDocument.name}
-          onClose={() => {
-            setSelectedSkillDocument(undefined);
-            const trigger = skillTriggerRef.current;
-            if (trigger?.isConnected) trigger.focus();
-            else viewHeadingRef.current?.focus();
+          onDirtyChange={onEditorDirtyChange}
+          onRequestDiscard={onRequestDiscard}
+          onClose={(trigger) => {
+            onRequestDiscard(() => {
+              setSelectedSkillDocument(undefined);
+              const skillTrigger = skillTriggerRef.current;
+              if (skillTrigger?.isConnected) skillTrigger.focus();
+              else viewHeadingRef.current?.focus();
+            }, trigger);
           }}
         />
       )}

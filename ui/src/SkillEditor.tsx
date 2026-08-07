@@ -6,6 +6,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { parse as parseYaml } from 'yaml';
 import type { Revision, SkillDocument, ValidationIssue } from '../../src/ui/contract.js';
 import { getSkillDocument, saveSkillDocument, UiApiError } from './api.js';
+import { SafeMarkdown } from './SafeMarkdown.js';
 
 type WorkspaceMode = 'source' | 'preview' | 'split';
 
@@ -288,11 +289,15 @@ export function SkillEditor({
   itemRevision,
   skill,
   onClose,
+  onDirtyChange,
+  onRequestDiscard,
 }: {
   environment: string;
   itemRevision: Revision;
   skill: string;
-  onClose(): void;
+  onClose(trigger: HTMLElement | null): void;
+  onDirtyChange(dirty: boolean): void;
+  onRequestDiscard(action: () => void, trigger: HTMLElement | null): void;
 }): React.JSX.Element {
   const [request, setRequest] = useState(0);
   const [mode, setMode] = useState<WorkspaceMode>('source');
@@ -424,6 +429,10 @@ export function SkillEditor({
     ? undefined
     : `${retained.document.environment}/${retained.document.skill}@${retained.document.revision}`;
   const dirty = retained !== undefined && retained.draft !== retained.document.text;
+  useEffect(() => {
+    onDirtyChange(dirty);
+    return () => onDirtyChange(false);
+  }, [dirty, onDirtyChange]);
   const canSave = state.status === 'ready' && dirty &&
     saveState.status !== 'submitting' && saveState.status !== 'stale' &&
     !(saveState.status === 'saved' && (
@@ -509,10 +518,7 @@ export function SkillEditor({
 
   const reloadLatest = useCallback((): void => {
     const current = stateRef.current;
-    if (
-      current.status !== 'ready' ||
-      !window.confirm('Discard this local draft and reload the latest saved document?')
-    ) return;
+    if (current.status !== 'ready') return;
     const sequence = ++saveSequenceRef.current;
     submittingRef.current = true;
     setCopyNotice(undefined);
@@ -573,7 +579,7 @@ export function SkillEditor({
             className="button-secondary"
             disabled={saveState.status === 'submitting'}
             type="button"
-            onClick={onClose}
+            onClick={(event) => onClose(event.currentTarget)}
           >
             Close workspace
           </button>
@@ -616,7 +622,12 @@ export function SkillEditor({
             <span>Copy the draft, or reload the latest document before editing again.</span>
           </div>
           <button className="button-secondary" type="button" onClick={copyDraft}>Copy draft</button>
-          <button type="button" onClick={reloadLatest}>Reload latest</button>
+          <button
+            type="button"
+            onClick={(event) => onRequestDiscard(reloadLatest, event.currentTarget)}
+          >
+            Reload latest
+          </button>
         </div>
       ) : null}
       {saveState.status === 'failure' ? (
@@ -663,9 +674,8 @@ export function SkillEditor({
             </div>
             {mode === 'source' ? null : (
               <div className="skill-preview-pane">
-                <h3>Literal preview</h3>
-                <p>Markdown rendering is not enabled yet. This preview shows inert text.</p>
-                <pre aria-label="Skill document literal preview">{retained.draft}</pre>
+                <h3>Rendered preview</h3>
+                <SafeMarkdown source={retained.draft} />
               </div>
             )}
           </div>
