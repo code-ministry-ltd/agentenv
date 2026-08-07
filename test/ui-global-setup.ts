@@ -3,6 +3,7 @@ import { once } from 'node:events';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { seedLargeUiHome } from './fixtures/ui-large-home.js';
 
 async function launchUrlFrom(child: ChildProcess): Promise<string> {
   return await new Promise<string>((resolve, reject) => {
@@ -44,7 +45,7 @@ export interface UiTestServer {
   close(): Promise<void>;
 }
 
-type UiTestHomeFixture = 'authentication' | 'catalog' | 'empty' | 'error';
+type UiTestHomeFixture = 'authentication' | 'catalog' | 'empty' | 'error' | 'large';
 
 interface StartUiTestServerOptions {
   fixture: UiTestHomeFixture;
@@ -132,6 +133,7 @@ async function seedFixture(home: string, fixture: UiTestHomeFixture): Promise<vo
   if (fixture === 'authentication') await seedDetailedEnvironments(home);
   if (fixture === 'catalog') await seedCatalogBoundary(home);
   if (fixture === 'error') await seedRequestError(home);
+  if (fixture === 'large') await seedLargeUiHome(home);
 }
 
 export async function startUiTestServer(

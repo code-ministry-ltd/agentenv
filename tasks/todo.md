@@ -201,11 +201,20 @@ Size: M
 Add within-environment filtering, explicit refresh, stale-response suppression,
 and a deterministic 100-environment/1,000-element performance fixture.
 
-- [ ] Filtering is immediate, covers all displayed kinds, and preserves the
+- [x] Filtering is immediate, covers all displayed kinds, and preserves the
   current environment and keyboard focus where possible.
-- [ ] A late response from a previous environment cannot replace the current view.
-- [ ] The production browser list becomes enabled within one second on the
+- [x] A late response from a previous environment cannot replace the current view.
+- [x] The production browser list becomes enabled within one second on the
   deterministic performance fixture and logs useful timing on failure.
+
+Verified 2026-08-07: the production Playwright journey passed with exactly 100
+environments and 1,000 elements, all-kind/metadata filtering, explicit refresh,
+focus retention, and late-response suppression. The first environment was
+visible and trial-click actionable in 479.1ms on the exact Node 22.12.0 floor
+(379.2ms during the normal Node 22.21.1 full UI gate). Lint, all three
+typechecks, build, UI tests (28/28), all production-browser tests (7/7), and the
+full regression suite (152 files, 1,123 tests) passed; one pre-existing Git hang
+test flaked once, then passed alone and in the complete rerun.
 
 Verification: `npm run test:ui:e2e -- --grep "large environment catalogue"`
 
@@ -219,9 +228,13 @@ Size: M
 
 ### Checkpoint B — Read-only browser
 
-- [ ] `npm run lint && npm run typecheck && npm run build && npm test`
-- [ ] `npm run test:ui && npm run test:ui:e2e`
-- [ ] Manual keyboard walkthrough confirms accurate inventory and no read effects.
+- [x] `npm run lint && npm run typecheck && npm run build && npm test`
+- [x] `npm run test:ui && npm run test:ui:e2e`
+- [x] Manual keyboard walkthrough confirms accurate inventory and no read effects.
+
+Checkpoint B passed 2026-08-07. Root visual/keyboard inspection covered focused
+desktop and 320px layouts with visible focus; production-browser identity tests
+confirmed the walkthrough made no canonical writes.
 
 ## Phase 3 — Create, clone, and delete environments
 

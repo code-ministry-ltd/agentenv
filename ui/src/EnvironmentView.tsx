@@ -31,7 +31,7 @@ function ItemMetadata({ item }: { item: ContentItem }): React.JSX.Element {
   if (item.kind === 'skill') {
     return (
       <>
-        <p className="content-item-description">{item.description ?? 'No description.'}</p>
+        <p className="content-item-description">{itemSummary(item)}</p>
         {item.source === undefined ? null : (
           <dl className="content-metadata">
             <div><dt>Repository</dt><dd>{item.source.repository}</dd></div>
@@ -45,68 +45,119 @@ function ItemMetadata({ item }: { item: ContentItem }): React.JSX.Element {
       </>
     );
   }
+  return <p className="content-item-description">{itemSummary(item)}</p>;
+}
+
+function itemSummary(item: ContentItem): string {
+  if (item.kind === 'skill') return item.description ?? 'No description.';
   if (item.kind === 'instruction') {
-    return (
-      <p className="content-item-description">
-        {item.scope === 'base' ? 'Base instructions' : `${item.harness} harness instructions`}
-      </p>
+    return item.scope === 'base' ? 'Base instructions' : `${item.harness} harness instructions`;
+  }
+  if (item.kind === 'mcp') return `${item.transport.toUpperCase()} transport`;
+  return item.kind === 'agent' ? 'Subagent definition' : 'Slash command';
+}
+
+function itemSearchText(
+  item: ContentItem,
+  group: (typeof GROUPS)[number],
+): string {
+  const values = [item.name, item.kind, group.label, group.singular, itemSummary(item)];
+  if (item.kind === 'skill') {
+    values.push(
+      item.source?.repository ?? '',
+      item.source?.path ?? '',
+      item.source?.ref ?? '',
+      item.source?.shortCommit ?? '',
     );
   }
-  if (item.kind === 'mcp') {
-    return <p className="content-item-description">{item.transport.toUpperCase()} transport</p>;
-  }
-  return (
-    <p className="content-item-description">
-      {item.kind === 'agent' ? 'Subagent definition' : 'Slash command'}
-    </p>
-  );
+  return values.join(' ').toLowerCase();
 }
 
 function InventoryGroups({ inventory }: { inventory: EnvironmentInventory }): React.JSX.Element {
   const [selectedItem, setSelectedItem] = useState<string>();
+  const [query, setQuery] = useState('');
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredItems = normalizedQuery === ''
+    ? inventory.items
+    : inventory.items.filter((item) => {
+        const group = GROUPS.find((candidate) => candidate.kind === item.kind)!;
+        return itemSearchText(item, group).includes(normalizedQuery);
+      });
+  const filterStatus = normalizedQuery === ''
+    ? `Showing all ${inventory.items.length} elements.`
+    : filteredItems.length === 0
+      ? `No content matches “${query.trim()}”.`
+      : `Showing ${filteredItems.length} of ${inventory.items.length} elements.`;
+
   return (
-    <div className="content-groups">
-      {GROUPS.map((group) => {
-        const items = inventory.items.filter((item) => item.kind === group.kind);
-        return (
-          <details className="content-group" key={group.kind} open>
-            <summary>
-              <span>{group.label}</span>
-              <span className="group-count">{items.length}</span>
-            </summary>
-            {items.length === 0 ? (
-              <p className="content-group-empty">No {group.label.toLowerCase()}.</p>
-            ) : (
-              <ul aria-label={`${group.label} in ${inventory.name}`}>
-                {items.map((item) => {
-                  const key = `${item.kind}:${item.name}`;
-                  const selected = selectedItem === key;
-                  return (
-                    <li key={key} data-revision={item.revision}>
-                      <article className={selected ? 'content-item selected' : 'content-item'}>
-                        <div className="content-item-heading">
-                          <button
-                            aria-label={`Inspect ${group.singular} ${item.name}`}
-                            aria-pressed={selected}
-                            className="content-item-select"
-                            onClick={() => setSelectedItem(key)}
-                            type="button"
-                          >
-                            {item.name}
-                          </button>
-                          <span>{group.singular}</span>
-                        </div>
-                        <ItemMetadata item={item} />
-                      </article>
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
-          </details>
-        );
-      })}
-    </div>
+    <>
+      <div className="inventory-filter">
+        <label htmlFor="environment-content-filter">Filter {inventory.name} content</label>
+        <input
+          aria-describedby="environment-content-filter-status"
+          autoComplete="off"
+          id="environment-content-filter"
+          onChange={(event) => setQuery(event.currentTarget.value)}
+          placeholder="Name, kind, description, source…"
+          type="search"
+          value={query}
+        />
+        <span
+          aria-label="Filter results"
+          aria-live="polite"
+          id="environment-content-filter-status"
+          role="status"
+        >
+          {filterStatus}
+        </span>
+      </div>
+      <div className="content-groups">
+        {GROUPS.map((group) => {
+          const items = filteredItems.filter((item) => item.kind === group.kind);
+          return (
+            <details className="content-group" key={group.kind} open>
+              <summary>
+                <span>{group.label}</span>
+                <span className="group-count">{items.length}</span>
+              </summary>
+              {items.length === 0 ? (
+                <p className="content-group-empty">
+                  {normalizedQuery === ''
+                    ? `No ${group.label.toLowerCase()}.`
+                    : `No matching ${group.label.toLowerCase()}.`}
+                </p>
+              ) : (
+                <ul aria-label={`${group.label} in ${inventory.name}`}>
+                  {items.map((item) => {
+                    const key = `${item.kind}:${item.name}`;
+                    const selected = selectedItem === key;
+                    return (
+                      <li key={key} data-revision={item.revision}>
+                        <article className={selected ? 'content-item selected' : 'content-item'}>
+                          <div className="content-item-heading">
+                            <button
+                              aria-label={`Inspect ${group.singular} ${item.name}`}
+                              aria-pressed={selected}
+                              className="content-item-select"
+                              onClick={() => setSelectedItem(key)}
+                              type="button"
+                            >
+                              {item.name}
+                            </button>
+                            <span>{group.singular}</span>
+                          </div>
+                          <ItemMetadata item={item} />
+                        </article>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </details>
+          );
+        })}
+      </div>
+    </>
   );
 }
 
@@ -119,14 +170,19 @@ export function EnvironmentView({
   const [inventory, setInventory] = useState<InventoryState>({ status: 'loading' });
 
   useEffect(() => {
+    let acceptResponse = true;
+    const controller = new AbortController();
     setInventory((current) =>
       current.status === 'ready' || current.status === 'refreshing'
         ? { status: 'refreshing', inventory: current.inventory }
         : { status: 'loading' },
     );
-    void getEnvironmentInventory(environment.name).then(
-      (next) => setInventory({ status: 'ready', inventory: next }),
+    void getEnvironmentInventory(environment.name, controller.signal).then(
+      (next) => {
+        if (acceptResponse) setInventory({ status: 'ready', inventory: next });
+      },
       (error: unknown) => {
+        if (!acceptResponse) return;
         if (error instanceof UiApiError && error.code === 'NOT_FOUND') {
           setInventory({ status: 'unavailable' });
         } else if (error instanceof UiApiError && error.code === 'STALE_REVISION') {
@@ -143,6 +199,10 @@ export function EnvironmentView({
         }
       },
     );
+    return () => {
+      acceptResponse = false;
+      controller.abort();
+    };
   }, [environment.name, request]);
 
   const current = inventory.status === 'ready' ||
@@ -151,6 +211,7 @@ export function EnvironmentView({
     ? inventory.inventory
     : undefined;
   const itemCount = current?.items.length ?? 0;
+  const refreshBlocked = inventory.status === 'loading' || inventory.status === 'refreshing';
 
   return (
     <section className="inventory-panel" aria-labelledby="environment-view-title">
@@ -167,9 +228,13 @@ export function EnvironmentView({
           </button>
         ) : (
           <button
+            aria-disabled={refreshBlocked}
             type="button"
-            disabled={inventory.status === 'loading' || inventory.status === 'refreshing'}
-            onClick={() => setRequest((value) => value + 1)}
+            onClick={() => {
+              if (!refreshBlocked) {
+                setRequest((value) => value + 1);
+              }
+            }}
           >
             Refresh {environment.name} content
           </button>
@@ -206,7 +271,7 @@ export function EnvironmentView({
         </div>
       ) : null}
       {current !== undefined && itemCount === 0 ? (
-        <div className="inventory-message inventory-empty">
+        <div className="inventory-message inventory-empty" role="status">
           <strong>This environment has no content yet.</strong>
           <span>Add content from the CLI to see it here.</span>
         </div>

@@ -118,8 +118,10 @@ export async function listEnvironmentSummaries(): Promise<readonly EnvironmentSu
 
 export async function getEnvironmentInventory(
   name: string,
+  signal?: AbortSignal,
 ): Promise<EnvironmentInventory> {
   return await apiRequest<EnvironmentInventory>(
     `/api/environments/${encodeURIComponent(name)}`,
+    { signal },
   );
 }
