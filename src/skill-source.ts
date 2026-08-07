@@ -32,6 +32,12 @@ function validateSubpath(subpath: string, original: string): string | null {
   return null;
 }
 
+/** Ref values occupy Git argument positions and must never be option-like. */
+function validateRef(ref: string | undefined, original: string): string | null {
+  if (ref?.startsWith('-')) return `invalid source ref in '${original}'`;
+  return null;
+}
+
 /**
  * Split `owner/repo[/…]` path segments (from a URL, scp locator, or shorthand)
  * into an origin identity, clone URL and subpath. GitHub web `/{tree,blob}/<ref>/…`
@@ -55,6 +61,8 @@ function fromOwnerRepoPath(
     if (effectiveRef === undefined) effectiveRef = rest[1];
     rest = rest.slice(2);
   }
+  const refError = validateRef(effectiveRef, original);
+  if (refError) return { error: refError };
   const subpath = rest.join('/');
   const subpathError = validateSubpath(subpath, original);
   if (subpathError) return { error: subpathError };
@@ -151,6 +159,8 @@ export async function resolveSkillSource(arg: string): Promise<ParseSkillSourceR
     locator = locator.slice(0, refMatch.index);
   }
   if (locator === '') return { error: `invalid skill source '${arg}'` };
+  const refError = validateRef(ref, arg);
+  if (refError) return { error: refError };
 
   // scp-style: user@host:owner/repo[/path]
   const scp = /^([^@/]+)@([^:/]+):(.+)$/.exec(locator);

@@ -127,7 +127,7 @@ test('isolates a dirty draft and late response from the next skill selection', a
   }
 });
 
-test('previews safely and retains drafts', async ({ page }) => {
+test('rejects hostile UI input, previews safely, and retains drafts', async ({ page }) => {
   const server = await startUiTestServer({ fixture: 'authentication' });
   const documentRequests: string[] = [];
   const remoteAssetRequests: string[] = [];

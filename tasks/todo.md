@@ -740,13 +740,21 @@ Perform the planned focused security review and add regression cases for launch/
 session reuse, DNS rebinding headers, CSRF, path traversal, Git argument handling,
 Markdown payloads, secret redaction, candidate substitution, and shutdown cleanup.
 
-- [ ] Every identified high/medium finding has a regression test and minimal fix,
+- [x] Every identified high/medium finding has a regression test and minimal fix,
   or is recorded as a blocking unresolved decision.
-- [ ] No request can nominate an absolute path, bypass identity/recovery checks, or
+- [x] No request can nominate an absolute path, bypass identity/recovery checks, or
   expose launch/Git/private-path data.
-- [ ] Security and full compatibility suites remain green from a clean checkout.
+- [x] Security and full compatibility suites remain green from a clean checkout.
 
 Verification: `npx vitest run test/ui-security.test.ts && npm run test:ui:e2e -- --grep "rejects hostile UI input"`
+
+Evidence: the focused review added four boundary tests for exact Host/Origin/CSRF,
+single-use launch credentials, path and opaque-candidate substitution, Git argument
+handling, and shutdown cleanup. One option-shaped Git-ref finding was fixed by
+rejecting the ref before Git invocation. Existing hostile Markdown, redaction,
+identity, and recovery cases remain green. The focused security suite (4/4), UI
+suite (57/57), all 16 browser journeys, lint, typecheck, build, and the full
+compatibility suite passed on 2026-08-07; no high/medium finding remains open.
 
 Dependencies: Checkpoint F
 
