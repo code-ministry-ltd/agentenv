@@ -188,6 +188,13 @@ export interface ContentTransferSuccess<
 export type CopyContentSuccess = ContentTransferSuccess<'copy'>;
 export type MoveContentSuccess = ContentTransferSuccess<'move'>;
 
+export interface SkillDocument {
+  environment: EnvironmentName;
+  skill: ContentName;
+  text: string;
+  revision: Revision;
+}
+
 export const API_ERROR_STATUS = {
   MALFORMED_REQUEST: 400,
   UNAUTHENTICATED: 401,

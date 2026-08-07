@@ -12,6 +12,7 @@ import type {
 } from '../../src/ui/contract.js';
 import { getEnvironmentInventory, UiApiError } from './api.js';
 import { TransferDialog } from './TransferDialog.js';
+import { SkillEditor } from './SkillEditor.js';
 
 type InventoryState =
   | { status: 'loading' }
@@ -32,6 +33,12 @@ interface MovedSourceTombstone {
   sourceEnvironment: EnvironmentName;
   kind: ContentKind;
   name: ContentName;
+  revision: Revision;
+}
+
+interface SelectedSkillDocument {
+  environment: string;
+  name: string;
   revision: Revision;
 }
 
@@ -129,9 +136,11 @@ function itemSearchText(
 
 function InventoryGroups({
   inventory,
+  onOpenSkill,
   onTransfer,
 }: {
   inventory: EnvironmentInventory;
+  onOpenSkill(item: Extract<ContentItem, { kind: 'skill' }>, trigger: HTMLButtonElement): void;
   onTransfer(
     operation: TransferOperation,
     item: ContentItem,
@@ -212,6 +221,16 @@ function InventoryGroups({
                           </div>
                           <ItemMetadata item={item} />
                           <div className="content-item-actions">
+                            {item.kind === 'skill' ? (
+                              <button
+                                aria-label={`Open skill ${item.name}`}
+                                className="button-secondary"
+                                type="button"
+                                onClick={(event) => onOpenSkill(item, event.currentTarget)}
+                              >
+                                Open
+                              </button>
+                            ) : null}
                             <button
                               aria-label={`Copy ${group.singular} ${item.name}`}
                               className="button-secondary"
@@ -264,10 +283,12 @@ export function EnvironmentView({
   );
   const [transferLocator, setTransferLocator] = useState<SelectedContentLocator>();
   const [transferNotice, setTransferNotice] = useState<string>();
+  const [selectedSkillDocument, setSelectedSkillDocument] = useState<SelectedSkillDocument>();
   const [movedSourceTombstones, setMovedSourceTombstones] = useState<
     readonly MovedSourceTombstone[]
   >([]);
   const transferTriggerRef = useRef<HTMLButtonElement>(null);
+  const skillTriggerRef = useRef<HTMLButtonElement>(null);
   const viewHeadingRef = useRef<HTMLHeadingElement>(null);
 
   useEffect(() => {
@@ -338,11 +359,26 @@ export function EnvironmentView({
     ? visibleInventory.items.find((item) =>
         item.kind === transferLocator.kind && item.name === transferLocator.name)
     : undefined;
+  const selectedSkillItem = selectedSkillDocument !== undefined && visibleInventory !== undefined &&
+      selectedSkillDocument.environment === visibleInventory.name
+    ? visibleInventory.items.find((item) =>
+        item.kind === 'skill' && item.name === selectedSkillDocument.name)
+    : undefined;
   useEffect(() => {
     if (transferLocator !== undefined && current !== undefined && transferItem === undefined) {
       setTransferLocator(undefined);
     }
   }, [transferItem, transferLocator, current]);
+  useEffect(() => {
+    if (
+      selectedSkillDocument !== undefined &&
+      visibleInventory !== undefined &&
+      selectedSkillItem === undefined
+    ) {
+      setSelectedSkillDocument(undefined);
+      viewHeadingRef.current?.focus();
+    }
+  }, [selectedSkillDocument, selectedSkillItem, visibleInventory]);
   const refreshBlocked = inventory.status === 'loading' || inventory.status === 'refreshing';
   const refreshAffected = (): void => {
     setRequest((value) => value + 1);
@@ -460,6 +496,14 @@ export function EnvironmentView({
       {visibleInventory === undefined ? null : (
         <InventoryGroups
           inventory={visibleInventory}
+          onOpenSkill={(item, trigger) => {
+            skillTriggerRef.current = trigger;
+            setSelectedSkillDocument({
+              environment: visibleInventory.name,
+              name: item.name,
+              revision: item.revision,
+            });
+          }}
           onTransfer={(operation, item, trigger) => {
             transferTriggerRef.current = trigger;
             setTransferLocator({
@@ -468,6 +512,20 @@ export function EnvironmentView({
               name: item.name,
               sourceEnvironment: visibleInventory.name,
             });
+          }}
+        />
+      )}
+      {selectedSkillDocument === undefined || selectedSkillItem?.kind !== 'skill' ? null : (
+        <SkillEditor
+          environment={selectedSkillDocument.environment}
+          itemRevision={selectedSkillItem.revision}
+          key={`${selectedSkillDocument.environment}/${selectedSkillDocument.name}`}
+          skill={selectedSkillDocument.name}
+          onClose={() => {
+            setSelectedSkillDocument(undefined);
+            const trigger = skillTriggerRef.current;
+            if (trigger?.isConnected) trigger.focus();
+            else viewHeadingRef.current?.focus();
           }}
         />
       )}

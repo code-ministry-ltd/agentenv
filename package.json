@@ -28,7 +28,7 @@
     "lint": "eslint .",
     "test": "vitest run --exclude 'test/*.live.test.ts' --exclude 'test/*.e2e.test.ts'",
     "test:offline": "GIT_CONFIG_GLOBAL=/dev/null vitest run --exclude 'test/*.live.test.ts' --exclude 'test/*.e2e.test.ts'",
-    "test:ui": "vitest run test/ui-contract.test.ts test/ui-build.test.ts test/ui-server.test.ts test/ui-command.test.ts test/ui-catalog.test.ts test/ui-inventory.test.ts",
+    "test:ui": "vitest run test/ui-contract.test.ts test/ui-build.test.ts test/ui-server.test.ts test/ui-command.test.ts test/ui-catalog.test.ts test/ui-inventory.test.ts test/skill-document.test.ts",
     "test:ui:e2e": "npm run build && playwright test --config playwright.config.ts",
     "test:migration": "GIT_CONFIG_GLOBAL=/dev/null vitest run test/legacy-state.test.ts test/migration-state.test.ts test/migration.test.ts test/migration-command.test.ts test/migration.subprocess-kill.test.ts",
     "test:restore:container": "bash scripts/test-restore-container.sh",
@@ -47,6 +47,10 @@
     "url": "https://github.com/code-ministry-ltd/agentenv/issues"
   },
   "devDependencies": {
+    "@codemirror/commands": "6.10.4",
+    "@codemirror/lang-markdown": "6.5.2",
+    "@codemirror/state": "6.7.1",
+    "@codemirror/view": "6.43.8",
     "@eslint/js": "^10.0.1",
     "@playwright/test": "1.61.1",
     "@types/node": "^26.1.2",

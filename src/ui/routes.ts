@@ -7,6 +7,10 @@ import {
 } from '../application/content-transfer.js';
 import type { ContentTransferRuntime } from '../application/content-transfer-runtime.js';
 import {
+  readSkillDocument,
+  type ReadSkillDocumentResult,
+} from '../application/skill-document.js';
+import {
   cloneEnvironment,
   createEnvironment,
   deleteEnvironment,
@@ -72,6 +76,7 @@ export interface UiRouteDependencies {
   createContentTransferRuntime(paths: Paths): ContentTransferRuntime;
   getEnvironmentInventory: typeof getEnvironmentInventory;
   listEnvironmentSummaries: typeof listEnvironmentSummaries;
+  readSkillDocument: typeof readSkillDocument;
 }
 
 export type UiRouteDependencyOverrides = Partial<UiRouteDependencies>;
@@ -91,7 +96,27 @@ const DEFAULT_ROUTE_DEPENDENCIES: UiRouteDependencies = {
     createUiContentTransferRuntime({ paths, env: process.env }),
   getEnvironmentInventory,
   listEnvironmentSummaries,
+  readSkillDocument,
 };
+
+function skillDocumentRouteResult(result: ReadSkillDocumentResult): UiRouteResult {
+  switch (result.status) {
+    case 'loaded':
+      return { status: 200, body: { data: result.document } };
+    case 'invalid':
+      return errorResult('MALFORMED_REQUEST', 'The skill document locator is malformed.');
+    case 'not-found':
+    case 'unsafe':
+      return errorResult('NOT_FOUND', 'The skill document was not found.');
+    case 'stale':
+      return errorResult(
+        'STALE_REVISION',
+        'The skill document changed while it was loading.',
+      );
+    case 'failure':
+      return errorResult('INTERNAL_ERROR', 'The skill document could not be loaded.');
+  }
+}
 
 function errorResult(
   code: ApiErrorCode,
@@ -726,6 +751,32 @@ export async function handleUiRoute(
   requestBody?: Record<string, unknown>,
 ): Promise<UiRouteResult | undefined> {
   const dependencies = { ...DEFAULT_ROUTE_DEPENDENCIES, ...dependencyOverrides };
+  const skillDocumentMatch =
+    /^\/api\/environments\/([^/]+)\/skills\/([^/]+)\/document$/.exec(url.pathname);
+  if (skillDocumentMatch !== null) {
+    if (request.method !== 'GET') {
+      return errorResult('METHOD_NOT_ALLOWED', 'The request method is not supported.');
+    }
+    if ([...url.searchParams.keys()].length > 0) {
+      return errorResult('MALFORMED_REQUEST', 'The request query is malformed.');
+    }
+    let environment: string;
+    let skill: string;
+    try {
+      environment = decodeURIComponent(skillDocumentMatch[1]!);
+      skill = decodeURIComponent(skillDocumentMatch[2]!);
+    } catch {
+      return errorResult('MALFORMED_REQUEST', 'The skill document locator is malformed.');
+    }
+    if (validateEnvName(environment) !== null || validateSkillName(skill) !== null) {
+      return errorResult('MALFORMED_REQUEST', 'The skill document locator is malformed.');
+    }
+    return skillDocumentRouteResult(await dependencies.readSkillDocument({
+      paths,
+      environment,
+      skill,
+    }));
+  }
   if (url.pathname === '/api/content/transfer') {
     if (request.method !== 'POST') {
       return errorResult('METHOD_NOT_ALLOWED', 'The request method is not supported.');

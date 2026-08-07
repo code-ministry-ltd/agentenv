@@ -519,12 +519,27 @@ Checkpoint D passed 2026-08-07.
 Implement safe skill-document loading, a typed route, and a CodeMirror workspace
 that loads only the selected skill's `SKILL.md` and tracks its opaque revision.
 
-- [ ] Load validates environment/skill names, returns no absolute path, and reads
+- [x] Load validates environment/skill names, returns no absolute path, and reads
   no file outside the selected validated skill directory.
-- [ ] CodeMirror opens the exact text with accessible source/preview/split controls
+- [x] CodeMirror opens the exact text with accessible source/preview/split controls
   and conventional editing behavior.
-- [ ] Missing, invalid, stale, and request-failure states do not discard an
+- [x] Missing, invalid, stale, and request-failure states do not discard an
   existing client draft.
+
+Verified 2026-08-07: skill document application/route tests (9/9) passed for
+exact stable no-follow reads, typed invalid/missing/unsafe/stale/failure outcomes,
+opaque revisions, authenticated exact-GET behavior, and zero path/content leakage.
+The production-browser editor journeys (2/2) passed for direct CodeMirror 6
+lifecycle, exact hostile source text, keyboard-accessible Source/Preview/Split,
+inert literal preview, retained drafts through late/failing responses, pending
+newer-revision promotion, undo/cursor preservation across views, fresh history on
+new revisions, locator-keyed selection, focus fallback, disabled save, and no
+reload. Exact modular CodeMirror versions are lockfile-pinned; audit is clean.
+Lint, all typechecks, build, UI tests (38/38), copy/move journeys (2/2), the
+large-catalogue gate (518.1ms), and the full regression suite (160 files,
+1,329 tests) passed. A non-cooperating alternating ancestor-symlink mutation
+during the read window is recorded as deferred direct-store hardening under the
+v1 concurrency boundary.
 
 Verification: `npx vitest run test/skill-document.test.ts && npm run test:ui:e2e -- --grep "opens a skill document"`
 

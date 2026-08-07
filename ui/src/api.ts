@@ -16,6 +16,7 @@ import {
   type CopyContentRequest,
   type CopyContentSuccess,
   type TransferOperation,
+  type SkillDocument,
 } from '../../src/ui/contract.js';
 
 interface SessionData {
@@ -135,6 +136,17 @@ export async function getEnvironmentInventory(
 ): Promise<EnvironmentInventory> {
   return await apiRequest<EnvironmentInventory>(
     `/api/environments/${encodeURIComponent(name)}`,
+    { signal },
+  );
+}
+
+export async function getSkillDocument(
+  environment: string,
+  skill: string,
+  signal?: AbortSignal,
+): Promise<SkillDocument> {
+  return await apiRequest<SkillDocument>(
+    `/api/environments/${encodeURIComponent(environment)}/skills/${encodeURIComponent(skill)}/document`,
     { signal },
   );
 }
