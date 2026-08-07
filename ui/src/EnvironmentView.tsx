@@ -2,9 +2,13 @@ import { useEffect, useRef, useState } from 'react';
 import type {
   ContentItem,
   ContentKind,
-  CopyContentSuccess,
+  ContentName,
+  ContentTransferSuccess,
+  EnvironmentName,
   EnvironmentInventory,
   EnvironmentSummary,
+  Revision,
+  TransferOperation,
 } from '../../src/ui/contract.js';
 import { getEnvironmentInventory, UiApiError } from './api.js';
 import { TransferDialog } from './TransferDialog.js';
@@ -18,9 +22,51 @@ type InventoryState =
   | { status: 'error'; inventory?: EnvironmentInventory };
 
 interface SelectedContentLocator {
+  operation: TransferOperation;
   kind: ContentKind;
   name: string;
   sourceEnvironment: string;
+}
+
+interface MovedSourceTombstone {
+  sourceEnvironment: EnvironmentName;
+  kind: ContentKind;
+  name: ContentName;
+  revision: Revision;
+}
+
+function sameTombstone(
+  left: MovedSourceTombstone,
+  right: MovedSourceTombstone,
+): boolean {
+  return left.sourceEnvironment === right.sourceEnvironment &&
+    left.kind === right.kind &&
+    left.name === right.name &&
+    left.revision === right.revision;
+}
+
+function reconcileMovedSourceTombstones(
+  tombstones: readonly MovedSourceTombstone[],
+  inventory: EnvironmentInventory,
+): readonly MovedSourceTombstone[] {
+  return tombstones.filter((tombstone) => {
+    if (tombstone.sourceEnvironment !== inventory.name) return true;
+    const refreshedItem = inventory.items.find((item) =>
+      item.kind === tombstone.kind && item.name === tombstone.name);
+    return refreshedItem?.revision === tombstone.revision;
+  });
+}
+
+function withoutMovedSources(
+  inventory: EnvironmentInventory,
+  tombstones: readonly MovedSourceTombstone[],
+): EnvironmentInventory {
+  const items = inventory.items.filter((item) => !tombstones.some((tombstone) =>
+    tombstone.sourceEnvironment === inventory.name &&
+    tombstone.kind === item.kind &&
+    tombstone.name === item.name &&
+    tombstone.revision === item.revision));
+  return items.length === inventory.items.length ? inventory : { ...inventory, items };
 }
 
 const GROUPS: readonly {
@@ -83,10 +129,14 @@ function itemSearchText(
 
 function InventoryGroups({
   inventory,
-  onCopy,
+  onTransfer,
 }: {
   inventory: EnvironmentInventory;
-  onCopy(item: ContentItem, trigger: HTMLButtonElement): void;
+  onTransfer(
+    operation: TransferOperation,
+    item: ContentItem,
+    trigger: HTMLButtonElement,
+  ): void;
 }): React.JSX.Element {
   const [selectedItem, setSelectedItem] = useState<string>();
   const [query, setQuery] = useState('');
@@ -166,9 +216,17 @@ function InventoryGroups({
                               aria-label={`Copy ${group.singular} ${item.name}`}
                               className="button-secondary"
                               type="button"
-                              onClick={(event) => onCopy(item, event.currentTarget)}
+                              onClick={(event) => onTransfer('copy', item, event.currentTarget)}
                             >
                               Copy
+                            </button>
+                            <button
+                              aria-label={`Move ${group.singular} ${item.name}`}
+                              className="button-secondary"
+                              type="button"
+                              onClick={(event) => onTransfer('move', item, event.currentTarget)}
+                            >
+                              Move
                             </button>
                           </div>
                         </article>
@@ -196,7 +254,7 @@ export function EnvironmentView({
   environments: readonly EnvironmentSummary[];
   initialInventory?: EnvironmentInventory;
   onRefreshEnvironments(): void;
-  onTransferred(result: CopyContentSuccess): void;
+  onTransferred(result: ContentTransferSuccess): void;
 }): React.JSX.Element {
   const [request, setRequest] = useState(0);
   const [inventory, setInventory] = useState<InventoryState>(
@@ -204,9 +262,12 @@ export function EnvironmentView({
       ? { status: 'loading' }
       : { status: 'ready', inventory: initialInventory },
   );
-  const [copyLocator, setCopyLocator] = useState<SelectedContentLocator>();
-  const [copyNotice, setCopyNotice] = useState<string>();
-  const copyTriggerRef = useRef<HTMLButtonElement>(null);
+  const [transferLocator, setTransferLocator] = useState<SelectedContentLocator>();
+  const [transferNotice, setTransferNotice] = useState<string>();
+  const [movedSourceTombstones, setMovedSourceTombstones] = useState<
+    readonly MovedSourceTombstone[]
+  >([]);
+  const transferTriggerRef = useRef<HTMLButtonElement>(null);
   const viewHeadingRef = useRef<HTMLHeadingElement>(null);
 
   useEffect(() => {
@@ -224,7 +285,11 @@ export function EnvironmentView({
     });
     void getEnvironmentInventory(environment.name, controller.signal).then(
       (next) => {
-        if (acceptResponse) setInventory({ status: 'ready', inventory: next });
+        if (acceptResponse) {
+          setMovedSourceTombstones((current) =>
+            reconcileMovedSourceTombstones(current, next));
+          setInventory({ status: 'ready', inventory: next });
+        }
       },
       (error: unknown) => {
         if (!acceptResponse) return;
@@ -264,31 +329,59 @@ export function EnvironmentView({
       inventory.status === 'error'
     ? inventory.inventory
     : undefined;
-  const itemCount = current?.items.length ?? 0;
-  const copyItem = copyLocator !== undefined && current !== undefined &&
-      copyLocator.sourceEnvironment === current.name
-    ? current.items.find((item) =>
-        item.kind === copyLocator.kind && item.name === copyLocator.name)
+  const visibleInventory = current === undefined
+    ? undefined
+    : withoutMovedSources(current, movedSourceTombstones);
+  const itemCount = visibleInventory?.items.length ?? 0;
+  const transferItem = transferLocator !== undefined && visibleInventory !== undefined &&
+      transferLocator.sourceEnvironment === visibleInventory.name
+    ? visibleInventory.items.find((item) =>
+        item.kind === transferLocator.kind && item.name === transferLocator.name)
     : undefined;
   useEffect(() => {
-    if (copyLocator !== undefined && current !== undefined && copyItem === undefined) {
-      setCopyLocator(undefined);
+    if (transferLocator !== undefined && current !== undefined && transferItem === undefined) {
+      setTransferLocator(undefined);
     }
-  }, [copyItem, copyLocator, current]);
+  }, [transferItem, transferLocator, current]);
   const refreshBlocked = inventory.status === 'loading' || inventory.status === 'refreshing';
   const refreshAffected = (): void => {
     setRequest((value) => value + 1);
     onRefreshEnvironments();
   };
-  const copied = (result: CopyContentSuccess): void => {
-    if (result.sourceEnvironment !== undefined) {
-      setInventory({ status: 'ready', inventory: result.sourceEnvironment });
+  const transferred = (
+    result: ContentTransferSuccess,
+    sourceItemRevision: Revision,
+  ): void => {
+    const sourceProjection = result.sourceEnvironment;
+    if (sourceProjection !== undefined) {
+      setMovedSourceTombstones((current) =>
+        reconcileMovedSourceTombstones(current, sourceProjection));
+      setInventory({ status: 'ready', inventory: sourceProjection });
+    } else if (result.operation === 'move' && result.refreshRequired) {
+      const tombstone: MovedSourceTombstone = {
+        sourceEnvironment: result.source.environment,
+        kind: result.source.kind,
+        name: result.source.name,
+        revision: sourceItemRevision,
+      };
+      setMovedSourceTombstones((current) =>
+        current.some((candidate) => sameTombstone(candidate, tombstone))
+          ? current
+          : [...current, tombstone]);
     }
-    setCopyNotice(result.publication === 'git-pending'
-      ? `Copied ${result.source.name} to ${result.destination.environment}. Required Git bookkeeping is pending.`
-      : result.refreshRequired
-        ? `Copied ${result.source.name} to ${result.destination.environment}. Refresh affected content to reconcile the view.`
-        : `Copied ${result.source.name} to ${result.destination.environment}.`);
+    setTransferNotice(result.operation === 'copy'
+      ? result.publication === 'git-pending'
+        ? `Copied ${result.source.name} to ${result.destination.environment}. Required Git bookkeeping is pending.`
+        : result.refreshRequired
+          ? `Copied ${result.source.name} to ${result.destination.environment}. Refresh affected content to reconcile the view.`
+          : `Copied ${result.source.name} to ${result.destination.environment}.`
+      : result.publication === 'git-pending'
+        ? result.refreshRequired
+          ? `Moved ${result.source.name} to ${result.destination.environment}. The move is complete locally and required Git bookkeeping is pending. Affected content could not be refreshed; refresh to reconcile the view. Do not repeat the move.`
+          : `Moved ${result.source.name} to ${result.destination.environment}. The move is complete locally; required Git bookkeeping is pending. Do not repeat the move.`
+        : result.refreshRequired
+          ? `Moved ${result.source.name} to ${result.destination.environment}. The move is complete, but affected content could not be refreshed. Refresh to reconcile the view; do not repeat the move.`
+          : `Moved ${result.source.name} to ${result.destination.environment} and removed it from ${result.source.environment}.`);
     onTransferred(result);
     if (result.refreshRequired) refreshAffected();
   };
@@ -352,41 +445,43 @@ export function EnvironmentView({
           <span>The local request failed. Your environment files were not changed.</span>
         </div>
       ) : null}
-      {current !== undefined && itemCount === 0 ? (
+      {visibleInventory !== undefined && itemCount === 0 ? (
         <div className="inventory-message inventory-empty" role="status">
           <strong>This environment has no content yet.</strong>
           <span>Add content from the CLI to see it here.</span>
         </div>
       ) : null}
-      {copyNotice === undefined ? null : (
+      {transferNotice === undefined ? null : (
         <div className="inventory-message transfer-result" role="status">
           <span aria-hidden="true" className="status-check">✓</span>
-          <strong>{copyNotice}</strong>
+          <strong>{transferNotice}</strong>
         </div>
       )}
-      {current === undefined ? null : (
+      {visibleInventory === undefined ? null : (
         <InventoryGroups
-          inventory={current}
-          onCopy={(item, trigger) => {
-            copyTriggerRef.current = trigger;
-            setCopyLocator({
+          inventory={visibleInventory}
+          onTransfer={(operation, item, trigger) => {
+            transferTriggerRef.current = trigger;
+            setTransferLocator({
+              operation,
               kind: item.kind,
               name: item.name,
-              sourceEnvironment: current.name,
+              sourceEnvironment: visibleInventory.name,
             });
           }}
         />
       )}
-      {copyItem === undefined || current === undefined ? null : (
+      {transferItem === undefined || transferLocator === undefined || current === undefined ? null : (
         <TransferDialog
           environments={environments}
           fallbackFocusRef={viewHeadingRef}
-          item={copyItem}
-          onClose={() => setCopyLocator(undefined)}
-          onCopied={copied}
+          item={transferItem}
+          onClose={() => setTransferLocator(undefined)}
+          onTransferred={transferred}
+          operation={transferLocator.operation}
           onRefresh={refreshAffected}
           source={current}
-          triggerRef={copyTriggerRef}
+          triggerRef={transferTriggerRef}
         />
       )}
     </section>

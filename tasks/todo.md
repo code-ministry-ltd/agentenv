@@ -477,10 +477,22 @@ Size: M
 Extend the transfer contract/dialog for move, warn that the source will be
 removed, and surface collision, stale, pending, and recovery outcomes accurately.
 
-- [ ] Move works end to end for every kind and refreshes both affected inventories.
-- [ ] Cancel/overwrite decisions are explicit, keyboard operable, and never reused
+- [x] Move works end to end for every kind and refreshes both affected inventories.
+- [x] Cancel/overwrite decisions are explicit, keyboard operable, and never reused
   for a different stale destination.
-- [ ] UI success is shown only after the complete transaction is committed.
+- [x] UI success is shown only after the complete transaction is committed.
+
+Verified 2026-08-07: transfer route/application tests (41/41) passed for real
+five-kind moves, operation/result truth, collision consent, Git-pending outcomes,
+and best-effort projections of both environments. Production-browser copy and
+move journeys (2/2) passed with source-removal warning, keyboard cancellation,
+failure/stale retention, refreshed revisions, collision cancellation, consent
+invalidation, held overwrite, no duplicate requests, exact destination bytes,
+source removal, focus fallback, and no reload. A review-driven revision-keyed
+tombstone prevents an authoritatively moved item from remaining actionable when
+source reconciliation fails, while a genuinely recreated revision returns after
+refresh. Lint, all typechecks, build, UI tests (29/29), all production-browser
+tests (11/11), and the full regression suite (159 files, 1,320 tests) passed.
 
 Verification: `npx vitest run test/ui-transfer-routes.test.ts && npm run test:ui:e2e -- --grep "moves content between environments"`
 
@@ -494,9 +506,11 @@ Size: M
 
 ### Checkpoint D — Content transfer
 
-- [ ] `npm run lint && npm run typecheck && npm run build && npm test`
-- [ ] `npm run test:ui && npm run test:ui:e2e`
-- [ ] The 5 × copy/move × collision matrix and recovery injection suite are green.
+- [x] `npm run lint && npm run typecheck && npm run build && npm test`
+- [x] `npm run test:ui && npm run test:ui:e2e`
+- [x] The 5 × copy/move × collision matrix and recovery injection suite are green.
+
+Checkpoint D passed 2026-08-07.
 
 ## Phase 5 — Edit and preview `SKILL.md`
 

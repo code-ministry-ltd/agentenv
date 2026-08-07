@@ -11,8 +11,11 @@ import {
   type EnvironmentLifecycleRequest,
   type EnvironmentLifecycleSuccess,
   type EnvironmentSummary,
+  type ContentTransferRequest,
+  type ContentTransferSuccess,
   type CopyContentRequest,
   type CopyContentSuccess,
+  type TransferOperation,
 } from '../../src/ui/contract.js';
 
 interface SessionData {
@@ -159,7 +162,13 @@ export async function deleteEnvironment(
 export async function copyContent(
   request: CopyContentRequest,
 ): Promise<CopyContentSuccess> {
-  return await apiRequest<CopyContentSuccess>('/api/content/transfer', {
+  return await transferContent(request);
+}
+
+export async function transferContent<Operation extends TransferOperation>(
+  request: ContentTransferRequest<Operation>,
+): Promise<ContentTransferSuccess<Operation>> {
+  return await apiRequest<ContentTransferSuccess<Operation>>('/api/content/transfer', {
     method: 'POST',
     body: JSON.stringify(request),
   });

@@ -147,8 +147,10 @@ export interface EnvironmentDeleteSuccess {
   publication: 'complete' | 'git-pending';
 }
 
-export interface CopyContentRequest {
-  operation: 'copy';
+export interface ContentTransferRequest<
+  Operation extends TransferOperation = TransferOperation,
+> {
+  operation: Operation;
   kind: ContentKind;
   name: ContentName;
   sourceEnvironment: EnvironmentName;
@@ -162,14 +164,19 @@ export interface CopyContentRequest {
   destinationItemRevision: Revision | null;
 }
 
+export type CopyContentRequest = ContentTransferRequest<'copy'>;
+export type MoveContentRequest = ContentTransferRequest<'move'>;
+
 export interface TransferContentReference {
   environment: EnvironmentName;
   kind: ContentKind;
   name: ContentName;
 }
 
-export interface CopyContentSuccess {
-  operation: 'copy';
+export interface ContentTransferSuccess<
+  Operation extends TransferOperation = TransferOperation,
+> {
+  operation: Operation;
   source: TransferContentReference;
   destination: TransferContentReference;
   publication: 'complete' | 'git-pending';
@@ -177,6 +184,9 @@ export interface CopyContentSuccess {
   sourceEnvironment?: EnvironmentInventory;
   destinationEnvironment?: EnvironmentInventory;
 }
+
+export type CopyContentSuccess = ContentTransferSuccess<'copy'>;
+export type MoveContentSuccess = ContentTransferSuccess<'move'>;
 
 export const API_ERROR_STATUS = {
   MALFORMED_REQUEST: 400,

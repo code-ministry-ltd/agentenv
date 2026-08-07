@@ -3,7 +3,11 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { copyContent as copyContentApplication, type CopyContentResult } from '../src/application/content-transfer.js';
+import {
+  copyContent as copyContentApplication,
+  type CopyContentResult,
+  type MoveContentResult,
+} from '../src/application/content-transfer.js';
 import { createContentTransferRuntime } from '../src/application/content-transfer-runtime.js';
 import { getEnvironmentInventory as getInventory } from '../src/application/catalog.js';
 import { scaffoldEnvYaml } from '../src/env-config.js';
@@ -71,13 +75,14 @@ function observedBody(
   destination: EnvironmentInventory,
   kind: ContentItem['kind'],
   name: string,
+  operation: 'copy' | 'move' = 'copy',
 ) {
   const sourceItem = source.items.find((candidate) =>
     candidate.kind === kind && candidate.name === name)!;
   const destinationItem = destination.items.find((candidate) =>
     candidate.kind === kind && candidate.name === name);
   return {
-    operation: 'copy',
+    operation,
     kind,
     name,
     sourceEnvironment: source.name,
@@ -107,12 +112,21 @@ async function route(
     transactionId: 'copy-safe-id',
     publication: 'complete',
   }));
+  const moveContent = vi.fn(async (): Promise<MoveContentResult> => ({
+    status: 'moved',
+    operation: 'move',
+    kind,
+    name: 'drafting',
+    transactionId: 'move-safe-id',
+    publication: 'complete',
+  }));
   const getEnvironmentInventory = vi.fn(async ({ name }: { name: string }) =>
     name === 'source'
       ? inventory(name, SOURCE_ENVIRONMENT_REVISION, kind, SOURCE_REVISION)
       : inventory(name, DESTINATION_ENVIRONMENT_REVISION, kind));
-  const dependencies: UiRouteDependencyOverrides = {
+  const dependencies = {
     copyContent,
+    moveContent,
     createContentTransferRuntime: () => ({
       open: async () => ({ status: 'ready' }),
       close: async () => {},
@@ -120,7 +134,7 @@ async function route(
     }),
     getEnvironmentInventory,
     ...overrides,
-  };
+  } as UiRouteDependencyOverrides & { moveContent: typeof moveContent };
   const result = await handleUiRoute(
     { method } as IncomingMessage,
     new URL(url),
@@ -128,7 +142,7 @@ async function route(
     dependencies,
     requestBody,
   );
-  return { result, copyContent, getEnvironmentInventory };
+  return { result, copyContent, moveContent, getEnvironmentInventory };
 }
 
 describe('content transfer HTTP route', () => {
@@ -165,6 +179,40 @@ describe('content transfer HTTP route', () => {
       });
       expect(copyContent).toHaveBeenCalledOnce();
       expect(copyContent).toHaveBeenCalledWith(expect.objectContaining({
+        source: { environment: 'source', kind, name: 'drafting' },
+        destination: { environment: 'destination', kind, name: 'drafting' },
+        collision: 'fail',
+        observedRevisions: {
+          sourceItem: SOURCE_REVISION,
+          sourceEnvironment: SOURCE_ENVIRONMENT_REVISION,
+          sourceEnvironmentContainer: CONTAINER_REVISION,
+          destinationEnvironment: DESTINATION_ENVIRONMENT_REVISION,
+          destinationEnvironmentContainer: CONTAINER_REVISION,
+          destinationItem: null,
+        },
+      }));
+    },
+  );
+
+  it.each(['skill', 'instruction', 'mcp', 'agent', 'command'] as const)(
+    'moves %s through the one application boundary',
+    async (kind) => {
+      const { result, copyContent, moveContent } = await route({ ...body(kind), operation: 'move' });
+      expect(result).toMatchObject({
+        status: 200,
+        body: {
+          data: {
+            operation: 'move',
+            source: { environment: 'source', kind, name: 'drafting' },
+            destination: { environment: 'destination', kind, name: 'drafting' },
+            publication: 'complete',
+            refreshRequired: false,
+          },
+        },
+      });
+      expect(copyContent).not.toHaveBeenCalled();
+      expect(moveContent).toHaveBeenCalledOnce();
+      expect(moveContent).toHaveBeenCalledWith(expect.objectContaining({
         source: { environment: 'source', kind, name: 'drafting' },
         destination: { environment: 'destination', kind, name: 'drafting' },
         collision: 'fail',
@@ -301,6 +349,54 @@ describe('content transfer HTTP route', () => {
     })).result).toMatchObject({ status: 409, body: { error: { code: 'STALE_REVISION' } } });
   });
 
+  it('binds move overwrite consent to the currently observed source and destination revisions', async () => {
+    const destination = inventory(
+      'destination',
+      DESTINATION_ENVIRONMENT_REVISION,
+      'skill',
+      DESTINATION_REVISION,
+    );
+    const getEnvironmentInventory = vi.fn(async ({ name }: { name: string }) =>
+      name === 'source'
+        ? inventory(name, SOURCE_ENVIRONMENT_REVISION, 'skill', SOURCE_REVISION)
+        : destination);
+    const request = { ...body('skill'), operation: 'move' };
+    const refused = await route(request, { getEnvironmentInventory });
+    expect(refused.result).toMatchObject({
+      status: 409,
+      body: { error: { code: 'COLLISION', details: {
+        destinationItemRevision: DESTINATION_REVISION,
+      } } },
+    });
+    expect(refused.moveContent).not.toHaveBeenCalled();
+
+    const overwrite = await route({
+      ...request,
+      collision: 'overwrite',
+      destinationItemRevision: DESTINATION_REVISION,
+    }, { getEnvironmentInventory });
+    expect(overwrite.result).toMatchObject({
+      status: 200,
+      body: { data: { operation: 'move', publication: 'complete' } },
+    });
+    expect(overwrite.moveContent).toHaveBeenCalledOnce();
+    expect(overwrite.moveContent).toHaveBeenCalledWith(expect.objectContaining({
+      collision: 'overwrite',
+      observedRevisions: expect.objectContaining({ destinationItem: DESTINATION_REVISION }),
+    }));
+
+    const stale = await route({
+      ...request,
+      collision: 'overwrite',
+      destinationItemRevision: 'x'.repeat(43),
+    }, { getEnvironmentInventory });
+    expect(stale.result).toMatchObject({
+      status: 409,
+      body: { error: { code: 'STALE_REVISION' } },
+    });
+    expect(stale.moveContent).not.toHaveBeenCalled();
+  });
+
   it.each([
     [{ status: 'not-found', field: 'source' }, 404, 'NOT_FOUND'],
     [{ status: 'stale', field: 'source', message: '/private/path' }, 409, 'STALE_REVISION'],
@@ -314,6 +410,20 @@ describe('content transfer HTTP route', () => {
     expect(JSON.stringify(result)).not.toContain('secret');
   });
 
+  it.each([
+    [{ status: 'invalid', field: 'source', message: '/private/input' }, 422, 'VALIDATION_FAILED'],
+    [{ status: 'not-found', field: 'source' }, 404, 'NOT_FOUND'],
+    [{ status: 'stale', field: 'destination', message: '/private/stale' }, 409, 'STALE_REVISION'],
+    [{ status: 'pending-recovery', transactionId: '/private/id' }, 409, 'PENDING_RECOVERY'],
+    [{ status: 'failure', message: 'secret /private/path' }, 500, 'INTERNAL_ERROR'],
+  ] as const)('maps move outcome %s safely', async (outcome, status, code) => {
+    const moveContent = vi.fn(async () => outcome as MoveContentResult);
+    const { result } = await route({ ...body('skill'), operation: 'move' }, { moveContent });
+    expect(result).toMatchObject({ status, body: { error: { code } } });
+    expect(JSON.stringify(result)).not.toContain('/private');
+    expect(JSON.stringify(result)).not.toContain('secret');
+  });
+
   it('redacts a thrown application or runtime failure', async () => {
     const copyContent = vi.fn(async () => {
       throw new Error('secret /private/domain/error');
@@ -322,6 +432,17 @@ describe('content transfer HTTP route', () => {
     expect(result).toEqual({
       status: 500,
       body: { error: { code: 'INTERNAL_ERROR', message: 'The content could not be copied.' } },
+    });
+  });
+
+  it('redacts a thrown move application or runtime failure', async () => {
+    const moveContent = vi.fn(async (): Promise<MoveContentResult> => {
+      throw new Error('secret /private/domain/move-error');
+    });
+    const { result } = await route({ ...body('skill'), operation: 'move' }, { moveContent });
+    expect(result).toEqual({
+      status: 500,
+      body: { error: { code: 'INTERNAL_ERROR', message: 'The content could not be moved.' } },
     });
   });
 
@@ -351,6 +472,55 @@ describe('content transfer HTTP route', () => {
       });
       expect(JSON.stringify(result)).not.toContain('/private');
     }
+  });
+
+  it('keeps moved and move git-pending publication truthful when either projection fails', async () => {
+    for (const publication of ['complete', 'git-pending'] as const) {
+      let reads = 0;
+      const getEnvironmentInventory = vi.fn(async ({ name }: { name: string }) => {
+        reads += 1;
+        if (reads > 2) throw new Error('/private move projection failure');
+        return name === 'source'
+          ? inventory(name, SOURCE_ENVIRONMENT_REVISION, 'skill', SOURCE_REVISION)
+          : inventory(name, DESTINATION_ENVIRONMENT_REVISION, 'skill');
+      });
+      const moveContent = vi.fn(async (): Promise<MoveContentResult> => publication === 'complete'
+        ? {
+            status: 'moved', operation: 'move', kind: 'skill', name: 'drafting',
+            transactionId: 'safe-move-id', publication,
+          }
+        : {
+            status: 'git-pending', operation: 'move', kind: 'skill', name: 'drafting',
+            transactionId: 'safe-move-id', publication,
+          });
+      const { result } = await route(
+        { ...body('skill'), operation: 'move' },
+        { moveContent, getEnvironmentInventory },
+      );
+      expect(result).toMatchObject({
+        status: 200,
+        body: { data: { operation: 'move', publication, refreshRequired: true } },
+      });
+      expect(moveContent).toHaveBeenCalledOnce();
+      expect(JSON.stringify(result)).not.toContain('/private');
+    }
+  });
+
+  it.each([
+    { status: 'moved', operation: 'move', publication: 'git-pending' },
+    { status: 'moved', operation: 'copy', publication: 'complete' },
+    { status: 'git-pending', operation: 'move', publication: 'complete' },
+  ])('rejects a non-authoritative move success shape %#', async (outcome) => {
+    const moveContent = vi.fn(async () => outcome as unknown as MoveContentResult);
+    const { result, getEnvironmentInventory } = await route(
+      { ...body('skill'), operation: 'move' },
+      { moveContent },
+    );
+    expect(result).toEqual({
+      status: 500,
+      body: { error: { code: 'INTERNAL_ERROR', message: 'The content could not be moved.' } },
+    });
+    expect(getEnvironmentInventory).toHaveBeenCalledTimes(2);
   });
 
   it('copies all five real inventory kinds through the production application boundary', async () => {
@@ -411,6 +581,94 @@ describe('content transfer HTTP route', () => {
           } },
         });
       }
+      expect(await readFile(
+        join(paths.envDir('destination'), 'skills', 'drafting', 'SKILL.md'),
+        'utf8',
+      )).toContain('# drafting');
+      expect(await readFile(
+        join(paths.envDir('destination'), 'commands', 'publish.md'),
+        'utf8',
+      )).toBe('# publish\n');
+      expect(await readFile(
+        join(paths.envDir('destination'), 'mcp', 'servers.yaml'),
+        'utf8',
+      )).toContain('linear:');
+      expect(await readFile(
+        join(paths.envDir('destination'), 'instructions', 'base.md'),
+        'utf8',
+      )).toBe('# instructions\n');
+      expect(await readFile(
+        join(paths.envDir('destination'), 'agents', 'editor.md'),
+        'utf8',
+      )).toBe('# editor\n');
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('moves all five real inventory kinds through Task 14 and projects both affected inventories', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'agentenv-ui-transfer-real-move-'));
+    const paths = resolvePaths({ AGENTENV_HOME: home, HOME: home });
+    try {
+      await ensureStore(paths);
+      for (const name of ['source', 'destination']) {
+        await mkdir(paths.envDir(name), { recursive: true });
+        await writeFile(paths.envYaml(name), scaffoldEnvYaml({ description: '' }));
+      }
+      await mkdir(join(paths.envDir('source'), 'skills', 'drafting'), { recursive: true });
+      await writeFile(
+        join(paths.envDir('source'), 'skills', 'drafting', 'SKILL.md'),
+        '---\nname: drafting\ndescription: Move route fixture.\n---\n\n# drafting\n',
+      );
+      await mkdir(join(paths.envDir('source'), 'commands'), { recursive: true });
+      await writeFile(join(paths.envDir('source'), 'commands', 'publish.md'), '# publish\n');
+      await mkdir(join(paths.envDir('source'), 'instructions'), { recursive: true });
+      await writeFile(join(paths.envDir('source'), 'instructions', 'base.md'), '# instructions\n');
+      await mkdir(join(paths.envDir('source'), 'agents'), { recursive: true });
+      await writeFile(join(paths.envDir('source'), 'agents', 'editor.md'), '# editor\n');
+      await mkdir(join(paths.envDir('source'), 'mcp'), { recursive: true });
+      await writeFile(
+        join(paths.envDir('source'), 'mcp', 'servers.yaml'),
+        'linear:\n  transport: stdio\n  command: linear\n',
+      );
+
+      for (const [kind, name] of [
+        ['command', 'publish'],
+        ['skill', 'drafting'],
+        ['mcp', 'linear'],
+        ['instruction', 'base'],
+        ['agent', 'editor'],
+      ] as const) {
+        const source = await getInventory({ paths, name: 'source' });
+        const destination = await getInventory({ paths, name: 'destination' });
+        const result = await handleUiRoute(
+          { method: 'POST' } as IncomingMessage,
+          new URL('http://localhost/api/content/transfer'),
+          paths,
+          {
+            createContentTransferRuntime: () => createContentTransferRuntime({ paths }),
+          },
+          observedBody(source, destination, kind, name, 'move'),
+        );
+        expect(result).toMatchObject({
+          status: 200,
+          body: { data: {
+            operation: 'move',
+            publication: 'complete',
+            refreshRequired: false,
+            sourceEnvironment: {
+              items: expect.not.arrayContaining([expect.objectContaining({ kind, name })]),
+            },
+            destinationEnvironment: {
+              items: expect.arrayContaining([expect.objectContaining({ kind, name })]),
+            },
+          } },
+        });
+      }
+      const source = await getInventory({ paths, name: 'source' });
+      const destination = await getInventory({ paths, name: 'destination' });
+      expect(source.items).toEqual([]);
+      expect(destination.items).toHaveLength(5);
       expect(await readFile(
         join(paths.envDir('destination'), 'skills', 'drafting', 'SKILL.md'),
         'utf8',

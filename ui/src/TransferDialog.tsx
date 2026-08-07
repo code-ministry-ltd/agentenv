@@ -1,23 +1,25 @@
 import { useEffect, useRef, useState, type RefObject } from 'react';
 import type {
   ContentItem,
-  CopyContentRequest,
-  CopyContentSuccess,
+  ContentTransferRequest,
+  ContentTransferSuccess,
   EnvironmentInventory,
   EnvironmentName,
   EnvironmentSummary,
   Revision,
+  TransferOperation,
 } from '../../src/ui/contract.js';
-import { copyContent, getEnvironmentInventory, UiApiError } from './api.js';
+import { getEnvironmentInventory, transferContent, UiApiError } from './api.js';
 
 interface TransferDialogProps {
+  operation: TransferOperation;
   source: EnvironmentInventory;
   item: ContentItem;
   environments: readonly EnvironmentSummary[];
   triggerRef: RefObject<HTMLButtonElement | null>;
   fallbackFocusRef: RefObject<HTMLElement | null>;
   onClose(): void;
-  onCopied(result: CopyContentSuccess): void;
+  onTransferred(result: ContentTransferSuccess, sourceItemRevision: Revision): void;
   onRefresh(): void;
 }
 
@@ -27,6 +29,8 @@ type DestinationState =
   | { status: 'error' };
 
 interface CollisionConsent {
+  sourceEnvironment: EnvironmentName;
+  destinationEnvironment: EnvironmentName;
   itemRevision: Revision;
   environmentRevision: Revision;
   containerRevision: Revision;
@@ -44,12 +48,14 @@ type TransferIssue = {
 function safeIssue(
   error: unknown,
   destination: string,
-  request: CopyContentRequest,
+  request: ContentTransferRequest,
 ): TransferIssue {
+  const operation = request.operation;
+  const verb = operation === 'copy' ? 'copied' : 'moved';
   if (!(error instanceof UiApiError)) {
     return {
       kind: 'failure',
-      message: 'The content could not be copied. Your destination is retained; retry when ready.',
+      message: `The content could not be ${verb}. Your destination is retained; retry when ready.`,
     };
   }
   if (error.code === 'COLLISION' && error.details?.kind === 'transfer-collision') {
@@ -57,6 +63,8 @@ function safeIssue(
       kind: 'collision',
       message: `${destination} already contains this exact item. Review the collision before replacing it.`,
       collision: {
+        sourceEnvironment: request.sourceEnvironment,
+        destinationEnvironment: request.destinationEnvironment,
         itemRevision: error.details.destinationItemRevision,
         environmentRevision: error.details.destinationEnvironmentRevision,
         containerRevision: error.details.destinationEnvironmentContainerRevision,
@@ -86,18 +94,19 @@ function safeIssue(
   }
   return {
     kind: 'failure',
-    message: 'The content could not be copied. Your destination is retained; retry when ready.',
+    message: `The content could not be ${verb}. Your destination is retained; retry when ready.`,
   };
 }
 
 export function TransferDialog({
+  operation,
   source,
   item,
   environments,
   triggerRef,
   fallbackFocusRef,
   onClose,
-  onCopied,
+  onTransferred,
   onRefresh,
 }: TransferDialogProps): React.JSX.Element {
   const destinations = environments.filter((environment) => environment.name !== source.name);
@@ -110,6 +119,8 @@ export function TransferDialog({
   const [destinationRequest, setDestinationRequest] = useState(0);
   const [submitting, setSubmitting] = useState(false);
   const [issue, setIssue] = useState<TransferIssue>();
+  const action = operation === 'copy' ? 'Copy' : 'Move';
+  const actionProgress = operation === 'copy' ? 'Copying' : 'Moving';
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -129,6 +140,7 @@ export function TransferDialog({
       return;
     }
     setDestination(destinations[0]?.name ?? '');
+    setIssue(undefined);
     if (destinations.length === 0) cancelRef.current?.focus();
     else destinationRef.current?.focus();
   }, [destination, destinations]);
@@ -170,6 +182,8 @@ export function TransferDialog({
       )
     : undefined;
   const collisionConsentCurrent = collisionConsent !== undefined &&
+    collisionConsent.sourceEnvironment === source.name &&
+    collisionConsent.destinationEnvironment === destination &&
     collisionConsent.sourceItemRevision === item.revision &&
     collisionConsent.sourceEnvironmentRevision === source.revision &&
     collisionConsent.sourceContainerRevision === source.containerRevision &&
@@ -183,8 +197,8 @@ export function TransferDialog({
       ? collisionConsent
       : undefined;
     if (collision === 'overwrite' && consent === undefined) return;
-    const request: CopyContentRequest = {
-      operation: 'copy',
+    const request: ContentTransferRequest = {
+      operation,
       kind: item.kind,
       name: item.name,
       sourceEnvironment: source.name,
@@ -202,8 +216,8 @@ export function TransferDialog({
     setSubmitting(true);
     if (collision === 'fail') setIssue(undefined);
     try {
-      const result = await copyContent(request);
-      onCopied(result);
+      const result = await transferContent(request);
+      onTransferred(result, request.sourceItemRevision);
       dialogRef.current?.close();
     } catch (error) {
       setIssue(safeIssue(error, destination, request));
@@ -221,6 +235,9 @@ export function TransferDialog({
       onCancel={(event) => {
         event.preventDefault();
         if (!submittingRef.current) closeDialog();
+      }}
+      onClick={(event) => {
+        if (event.target === event.currentTarget && !submittingRef.current) closeDialog();
       }}
       onClose={onClose}
       onKeyDown={(event) => {
@@ -245,10 +262,17 @@ export function TransferDialog({
         void publish('fail');
       }}>
         <p className="eyebrow">Content transfer</p>
-        <h2 id="transfer-dialog-title">Copy {item.name}</h2>
-        <p id="transfer-dialog-help">
-          Review the exact source and destination. Existing content is never replaced automatically.
-        </p>
+        <h2 id="transfer-dialog-title">{action} {item.name}</h2>
+        {operation === 'copy' ? (
+          <p id="transfer-dialog-help">
+            Review the exact source and destination. Existing content is never replaced automatically.
+          </p>
+        ) : (
+          <p className="dialog-warning" id="transfer-dialog-help">
+            Moving removes this item from {source.name} after publication succeeds.
+            Existing destination content is never replaced automatically.
+          </p>
+        )}
         <dl className="transfer-summary" id="transfer-summary">
           <div><dt>Source</dt><dd>{source.name}</dd></div>
           <div><dt>Kind</dt><dd>{item.kind}</dd></div>
@@ -272,7 +296,9 @@ export function TransferDialog({
           </select>
           <p className="field-help">Destination: <strong>{destination || 'None available'}</strong></p>
           {destinations.length === 0 ? (
-            <p className="field-help">Create another environment before copying content.</p>
+            <p className="field-help">
+              Create another environment before {operation === 'copy' ? 'copying' : 'moving'} content.
+            </p>
           ) : null}
         </div>
         {destinationState.status === 'loading' ? (
@@ -287,7 +313,7 @@ export function TransferDialog({
         ) : null}
         {submitting ? (
           <div aria-busy="true" className="dialog-status" role="status">
-            Copying {item.name} from {source.name} to {destination}…
+            {actionProgress} {item.name} from {source.name} to {destination}…
           </div>
         ) : null}
         {issue === undefined ? null : (
@@ -327,7 +353,7 @@ export function TransferDialog({
             disabled={submitting || destinationState.status !== 'ready'}
             type="submit"
           >
-            Copy now
+            {action} now
           </button>
         </div>
       </form>

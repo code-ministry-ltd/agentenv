@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type {
   ContentCounts,
-  CopyContentSuccess,
+  ContentTransferSuccess,
   EnvironmentDeleteSuccess,
   EnvironmentInventory,
   EnvironmentLifecycleSuccess,
@@ -161,7 +161,7 @@ export function EnvironmentList(): React.JSX.Element {
       : `Deleted ${result.name}.`);
     refresh();
   };
-  const transferred = (result: CopyContentSuccess): void => {
+  const transferred = (result: ContentTransferSuccess): void => {
     mutationEpochRef.current += 1;
     setCatalog((current) => {
       if (current.status !== 'ready') return current;

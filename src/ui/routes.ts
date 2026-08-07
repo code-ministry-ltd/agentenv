@@ -2,6 +2,8 @@ import type { IncomingMessage } from 'node:http';
 import {
   copyContent,
   type CopyContentResult,
+  moveContent,
+  type MoveContentResult,
 } from '../application/content-transfer.js';
 import type { ContentTransferRuntime } from '../application/content-transfer-runtime.js';
 import {
@@ -36,8 +38,8 @@ import {
   type ApiErrorCode,
   type ApiErrorDetails,
   type DeleteEnvironmentRequest,
-  type CopyContentRequest,
-  type CopyContentSuccess,
+  type ContentTransferRequest,
+  type ContentTransferSuccess,
   type ContentItem,
   type EnvironmentInventory,
   type EnvironmentDeleteSuccess,
@@ -60,6 +62,7 @@ export interface UiRouteResult {
 
 export interface UiRouteDependencies {
   copyContent: typeof copyContent;
+  moveContent: typeof moveContent;
   cloneEnvironment: typeof cloneEnvironment;
   createEnvironment: typeof createEnvironment;
   deleteEnvironment: typeof deleteEnvironment;
@@ -75,6 +78,7 @@ export type UiRouteDependencyOverrides = Partial<UiRouteDependencies>;
 
 const DEFAULT_ROUTE_DEPENDENCIES: UiRouteDependencies = {
   copyContent,
+  moveContent,
   cloneEnvironment,
   createEnvironment,
   deleteEnvironment,
@@ -305,8 +309,8 @@ function deleteRouteResult(result: EnvironmentDeleteResult): UiRouteResult {
   }
 }
 
-type CopyRequestParseResult =
-  | { ok: true; request: CopyContentRequest }
+type TransferRequestParseResult =
+  | { ok: true; request: ContentTransferRequest }
   | { ok: false; result: UiRouteResult };
 
 const TRANSFER_REQUEST_KEYS = [
@@ -331,7 +335,7 @@ function isRevision(value: unknown): value is Revision {
 function transferValidation(
   path: string,
   message: string,
-): Extract<CopyRequestParseResult, { ok: false }> {
+): Extract<TransferRequestParseResult, { ok: false }> {
   return {
     ok: false,
     result: errorResult('VALIDATION_FAILED', 'The content transfer request is invalid.', {
@@ -341,11 +345,13 @@ function transferValidation(
   };
 }
 
-function parseCopyRequest(value: Record<string, unknown> | undefined): CopyRequestParseResult {
+function parseTransferRequest(
+  value: Record<string, unknown> | undefined,
+): TransferRequestParseResult {
   if (
     value === undefined ||
     !exactKeys(value, TRANSFER_REQUEST_KEYS) ||
-    value.operation !== 'copy' ||
+    (value.operation !== 'copy' && value.operation !== 'move') ||
     typeof value.kind !== 'string' ||
     typeof value.name !== 'string' ||
     typeof value.sourceEnvironment !== 'string' ||
@@ -387,19 +393,19 @@ function parseCopyRequest(value: Record<string, unknown> | undefined): CopyReque
       'Refresh the destination collision before overwriting.',
     );
   }
-  return { ok: true, request: value as unknown as CopyContentRequest };
+  return { ok: true, request: value as unknown as ContentTransferRequest };
 }
 
 function transferItem(
   inventory: EnvironmentInventory,
-  kind: CopyContentRequest['kind'],
+  kind: ContentTransferRequest['kind'],
   name: string,
 ): ContentItem | undefined {
   return inventory.items.find((item) => item.kind === kind && item.name === name);
 }
 
 function collisionResult(
-  request: CopyContentRequest,
+  request: ContentTransferRequest,
   destination: EnvironmentInventory,
   item: ContentItem,
 ): UiRouteResult {
@@ -414,10 +420,10 @@ function collisionResult(
   });
 }
 
-function staleTransferResult(resource: string): UiRouteResult {
+function staleTransferResult(resource: string, operation: ContentTransferRequest['operation']): UiRouteResult {
   return errorResult(
     'STALE_REVISION',
-    'Content changed after the copy dialog opened.',
+    `Content changed after the ${operation} dialog opened.`,
     { kind: 'conflict', resource },
   );
 }
@@ -426,6 +432,7 @@ async function readTransferInventory(
   paths: Paths,
   name: string,
   dependencies: UiRouteDependencies,
+  operation: ContentTransferRequest['operation'] = 'copy',
 ): Promise<{ ok: true; inventory: EnvironmentInventory } | { ok: false; result: UiRouteResult }> {
   try {
     return {
@@ -437,7 +444,7 @@ async function readTransferInventory(
       return { ok: false, result: errorResult('NOT_FOUND', 'An environment was not found.') };
     }
     if (error instanceof CatalogStaleRevisionError) {
-      return { ok: false, result: staleTransferResult(name) };
+      return { ok: false, result: staleTransferResult(name, operation) };
     }
     return {
       ok: false,
@@ -529,18 +536,18 @@ async function lifecycleRouteResult(
   }
 }
 
-async function successfulCopyResult(
-  request: CopyContentRequest,
-  result: Extract<CopyContentResult, { status: 'copied' | 'git-pending' }>,
+async function successfulTransferResult(
+  request: ContentTransferRequest,
+  result: Extract<CopyContentResult | MoveContentResult, { status: 'copied' | 'moved' | 'git-pending' }>,
   paths: Paths,
   dependencies: UiRouteDependencies,
 ): Promise<UiRouteResult> {
   const [source, destination] = await Promise.all([
-    readTransferInventory(paths, request.sourceEnvironment, dependencies),
-    readTransferInventory(paths, request.destinationEnvironment, dependencies),
+    readTransferInventory(paths, request.sourceEnvironment, dependencies, request.operation),
+    readTransferInventory(paths, request.destinationEnvironment, dependencies, request.operation),
   ]);
-  const data: CopyContentSuccess = {
-    operation: 'copy',
+  const data: ContentTransferSuccess = {
+    operation: request.operation,
     source: {
       environment: request.sourceEnvironment,
       kind: request.kind,
@@ -559,16 +566,38 @@ async function successfulCopyResult(
   return { status: 200, body: { data } };
 }
 
-async function copyRouteResult(
-  request: CopyContentRequest,
-  result: CopyContentResult,
+async function transferRouteResult(
+  request: ContentTransferRequest,
+  result: CopyContentResult | MoveContentResult,
   paths: Paths,
   dependencies: UiRouteDependencies,
 ): Promise<UiRouteResult> {
   switch (result.status) {
     case 'copied':
+      return request.operation === 'copy' &&
+        result.operation === 'copy' &&
+        result.publication === 'complete'
+        ? await successfulTransferResult(request, result, paths, dependencies)
+        : errorResult(
+            'INTERNAL_ERROR',
+            `The content could not be ${request.operation === 'copy' ? 'copied' : 'moved'}.`,
+          );
+    case 'moved':
+      return request.operation === 'move' &&
+        result.operation === 'move' &&
+        result.publication === 'complete'
+        ? await successfulTransferResult(request, result, paths, dependencies)
+        : errorResult(
+            'INTERNAL_ERROR',
+            `The content could not be ${request.operation === 'copy' ? 'copied' : 'moved'}.`,
+          );
     case 'git-pending':
-      return await successfulCopyResult(request, result, paths, dependencies);
+      return result.operation === request.operation && result.publication === 'git-pending'
+        ? await successfulTransferResult(request, result, paths, dependencies)
+        : errorResult(
+            'INTERNAL_ERROR',
+            `The content could not be ${request.operation === 'copy' ? 'copied' : 'moved'}.`,
+          );
     case 'invalid':
       return transferValidation(result.field, 'The content location is invalid.').result;
     case 'not-found':
@@ -578,37 +607,41 @@ async function copyRouteResult(
         paths,
         request.destinationEnvironment,
         dependencies,
+        request.operation,
       );
       if (!inspected.ok) return inspected.result;
       const item = transferItem(inspected.inventory, request.kind, request.name);
       return item === undefined
-        ? staleTransferResult(request.destinationEnvironment)
+        ? staleTransferResult(request.destinationEnvironment, request.operation)
         : collisionResult(request, inspected.inventory, item);
     }
     case 'stale':
-      return staleTransferResult(result.field);
+      return staleTransferResult(result.field, request.operation);
     case 'pending-recovery':
       return errorResult(
         'PENDING_RECOVERY',
-        'Another operation requires recovery before copying can continue.',
+        `Another operation requires recovery before ${request.operation === 'copy' ? 'copying' : 'moving'} can continue.`,
         pendingRecoveryDetails(result.transactionId, false),
       );
     case 'failure':
-      return errorResult('INTERNAL_ERROR', 'The content could not be copied.');
+      return errorResult(
+        'INTERNAL_ERROR',
+        `The content could not be ${request.operation === 'copy' ? 'copied' : 'moved'}.`,
+      );
   }
 }
 
-async function handleCopyRoute(
+async function handleTransferRoute(
   requestBody: Record<string, unknown> | undefined,
   paths: Paths,
   dependencies: UiRouteDependencies,
 ): Promise<UiRouteResult> {
-  const parsed = parseCopyRequest(requestBody);
+  const parsed = parseTransferRequest(requestBody);
   if (!parsed.ok) return parsed.result;
   const request = parsed.request;
   const [source, destination] = await Promise.all([
-    readTransferInventory(paths, request.sourceEnvironment, dependencies),
-    readTransferInventory(paths, request.destinationEnvironment, dependencies),
+    readTransferInventory(paths, request.sourceEnvironment, dependencies, request.operation),
+    readTransferInventory(paths, request.destinationEnvironment, dependencies, request.operation),
   ]);
   if (!source.ok) return source.result;
   if (!destination.ok) return destination.result;
@@ -621,13 +654,13 @@ async function handleCopyRoute(
     source.inventory.revision !== request.sourceEnvironmentRevision ||
     source.inventory.containerRevision !== request.sourceEnvironmentContainerRevision
   ) {
-    return staleTransferResult(request.sourceEnvironment);
+    return staleTransferResult(request.sourceEnvironment, request.operation);
   }
   if (
     destination.inventory.revision !== request.destinationEnvironmentRevision ||
     destination.inventory.containerRevision !== request.destinationEnvironmentContainerRevision
   ) {
-    return staleTransferResult(request.destinationEnvironment);
+    return staleTransferResult(request.destinationEnvironment, request.operation);
   }
   const destinationItem = transferItem(destination.inventory, request.kind, request.name);
   if (request.collision === 'fail' && destinationItem !== undefined) {
@@ -635,7 +668,7 @@ async function handleCopyRoute(
       request.destinationItemRevision !== null &&
       request.destinationItemRevision !== destinationItem.revision
     ) {
-      return staleTransferResult(request.destinationEnvironment);
+      return staleTransferResult(request.destinationEnvironment, request.operation);
     }
     return collisionResult(request, destination.inventory, destinationItem);
   }
@@ -643,40 +676,46 @@ async function handleCopyRoute(
     request.collision === 'overwrite' &&
     (destinationItem === undefined || destinationItem.revision !== request.destinationItemRevision)
   ) {
-    return staleTransferResult(request.destinationEnvironment);
+    return staleTransferResult(request.destinationEnvironment, request.operation);
   }
   if (request.collision === 'fail' && request.destinationItemRevision !== null) {
-    return staleTransferResult(request.destinationEnvironment);
+    return staleTransferResult(request.destinationEnvironment, request.operation);
   }
-  let result: CopyContentResult;
+  const input = {
+    paths,
+    source: {
+      kind: request.kind,
+      environment: request.sourceEnvironment,
+      name: request.name,
+    },
+    destination: {
+      kind: request.kind,
+      environment: request.destinationEnvironment,
+      name: request.name,
+    },
+    collision: request.collision,
+    observedRevisions: {
+      sourceItem: request.sourceItemRevision,
+      sourceEnvironment: request.sourceEnvironmentRevision,
+      sourceEnvironmentContainer: request.sourceEnvironmentContainerRevision,
+      destinationEnvironment: request.destinationEnvironmentRevision,
+      destinationEnvironmentContainer: request.destinationEnvironmentContainerRevision,
+      destinationItem: request.destinationItemRevision,
+    },
+    runtime: dependencies.createContentTransferRuntime(paths),
+  };
+  let result: CopyContentResult | MoveContentResult;
   try {
-    result = await dependencies.copyContent({
-      paths,
-      source: {
-        kind: request.kind,
-        environment: request.sourceEnvironment,
-        name: request.name,
-      },
-      destination: {
-        kind: request.kind,
-        environment: request.destinationEnvironment,
-        name: request.name,
-      },
-      collision: request.collision,
-      observedRevisions: {
-        sourceItem: request.sourceItemRevision,
-        sourceEnvironment: request.sourceEnvironmentRevision,
-        sourceEnvironmentContainer: request.sourceEnvironmentContainerRevision,
-        destinationEnvironment: request.destinationEnvironmentRevision,
-        destinationEnvironmentContainer: request.destinationEnvironmentContainerRevision,
-        destinationItem: request.destinationItemRevision,
-      },
-      runtime: dependencies.createContentTransferRuntime(paths),
-    });
+    result = request.operation === 'copy'
+      ? await dependencies.copyContent(input)
+      : await dependencies.moveContent(input);
   } catch {
-    return errorResult('INTERNAL_ERROR', 'The content could not be copied.');
+    return errorResult(
+      'INTERNAL_ERROR',
+      `The content could not be ${request.operation === 'copy' ? 'copied' : 'moved'}.`,
+    );
   }
-  return await copyRouteResult(request, result, paths, dependencies);
+  return await transferRouteResult(request, result, paths, dependencies);
 }
 
 export async function handleUiRoute(
@@ -694,7 +733,7 @@ export async function handleUiRoute(
     if ([...url.searchParams.keys()].length > 0) {
       return errorResult('MALFORMED_REQUEST', 'The request query is malformed.');
     }
-    return await handleCopyRoute(requestBody, paths, dependencies);
+    return await handleTransferRoute(requestBody, paths, dependencies);
   }
   const inventoryMatch = /^\/api\/environments\/([^/]+)$/.exec(url.pathname);
   if (inventoryMatch !== null) {

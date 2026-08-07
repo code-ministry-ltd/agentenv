@@ -9,6 +9,8 @@ import {
   type CopyContentSuccess,
   type ContentItem,
   type GitCandidateSet,
+  type MoveContentRequest,
+  type MoveContentSuccess,
 } from '../src/ui/contract.js';
 
 function describeContent(item: ContentItem): string {
@@ -109,7 +111,7 @@ describe('UI contract', () => {
     expect(states.map(isTerminalGitCandidateSet)).toEqual([false, true, true]);
   });
 
-  it('defines copy consent with public observed revisions and truthful refresh metadata', () => {
+  it('defines transfer consent with public observed revisions and truthful refresh metadata', () => {
     const revision = 'r'.repeat(43) as CopyContentRequest['sourceItemRevision'];
     const request: CopyContentRequest = {
       operation: 'copy',
@@ -136,7 +138,18 @@ describe('UI contract', () => {
       publication: 'git-pending',
       refreshRequired: true,
     };
+    const moveRequest: MoveContentRequest = { ...request, operation: 'move' };
+    const moveResult: MoveContentSuccess = {
+      ...result,
+      operation: 'move',
+      publication: 'complete',
+    };
 
-    expect(JSON.parse(JSON.stringify({ request, result }))).toEqual({ request, result });
+    expect(JSON.parse(JSON.stringify({ request, result, moveRequest, moveResult }))).toEqual({
+      request,
+      result,
+      moveRequest,
+      moveResult,
+    });
   });
 });
