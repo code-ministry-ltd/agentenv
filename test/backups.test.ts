@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -187,5 +188,22 @@ describe('content-addressed backups', () => {
     const linkStat = lstatSync(join(dir, 'sub', 'rel-link'));
     expect(linkStat.isSymbolicLink()).toBe(true); // nested symlink preserved as a link
     expect(readlinkSync(join(dir, 'sub', 'rel-link'))).toBe('file.txt');
+  });
+
+  it('round-trips exact root and nested directory modes', async () => {
+    const p = paths();
+    const dir = join(temp.home, 'mode-tree');
+    const nested = join(dir, 'nested');
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(nested, 'file.txt'), 'nested contents');
+    chmodSync(nested, 0o711);
+    chmodSync(dir, 0o700);
+
+    const ref = await backup(p, dir);
+    rmSync(dir, { recursive: true, force: true });
+    await restore(p, ref, dir);
+
+    expect(lstatSync(dir).mode & 0o7777).toBe(0o700);
+    expect(lstatSync(nested).mode & 0o7777).toBe(0o711);
   });
 });

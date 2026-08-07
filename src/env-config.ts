@@ -212,9 +212,19 @@ export function copyEnvSource(
       (sourceNode as { clone(): unknown }).clone(),
     );
   } else {
-    if (destination.hasIn(['sources', name])) destination.deleteIn(['sources', name]);
+    if (!destination.hasIn(['sources', name])) return destinationText;
+    destination.deleteIn(['sources', name]);
   }
   return destination.toString();
+}
+
+/** Remove only one skill's provenance node while retaining the surrounding
+ * YAML document's comments, node styles, and ordering. */
+export function removeEnvSource(text: string, name: string): string {
+  const document = parseDocument(text);
+  if (!document.hasIn(['sources', name])) return text;
+  document.deleteIn(['sources', name]);
+  return document.toString();
 }
 
 /**

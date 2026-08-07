@@ -444,12 +444,23 @@ Size: M
 Extend transfer publication so destination creation/overwrite, source removal,
 and affected provenance files share one staged command and recovery boundary.
 
-- [ ] Move transfers each of the five kinds with no duplicate and no lost sole
+- [x] Move transfers each of the five kinds with no duplicate and no lost sole
   copy after successful completion.
-- [ ] Failure/crash injection at each publication boundary resolves to an exact
+- [x] Failure/crash injection at each publication boundary resolves to an exact
   pre-state or complete post-state through existing recovery behavior.
-- [ ] Concurrent source or destination replacement is retained and reported as a
+- [x] Concurrent source or destination replacement is retained and reported as a
   conflict rather than overwritten.
+
+Verified 2026-08-07: move application tests (25/25), move/copy recovery tests
+(60/60), and the combined transactional suite (206/206) passed. All five kinds
+cover no-collision, refusal, and explicit overwrite; skill provenance and MCP
+YAML presentation remain exact. Real child-process SIGKILL recovery covers every
+forward publication boundary, reverse rollback, committed/Git-pending outcomes,
+and concurrent-replacement quarantine. Directory backup restoration preserves
+nested modes. Lint, all typechecks, build, and the full regression suite
+(159 files, 1,303 tests) passed. Direct non-agentenv writes inside the final
+publication window are outside the serialized v1 mutation contract and recorded
+as deferred hardening rather than a UI release blocker.
 
 Verification: `npx vitest run test/content-transfer-move.test.ts test/content-transfer-recovery.test.ts`
 

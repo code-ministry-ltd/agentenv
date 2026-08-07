@@ -10,7 +10,12 @@ import {
   parseFrontmatter,
   validateSkillName,
 } from '../content-items.js';
-import { copyEnvSource, parseEnvConfig, type EnvConfig } from '../env-config.js';
+import {
+  copyEnvSource,
+  parseEnvConfig,
+  removeEnvSource,
+  type EnvConfig,
+} from '../env-config.js';
 import {
   captureExpectedPathIdentity,
   capturePathIdentity,
@@ -71,6 +76,8 @@ export interface CopyContentInput {
   };
 }
 
+export type MoveContentInput = CopyContentInput;
+
 export type CopyContentResult =
   | {
       status: 'copied';
@@ -102,6 +109,29 @@ export type CopyContentResult =
       message: string;
     }
   | { status: 'failure'; message: string };
+
+export type MoveContentResult =
+  | {
+      status: 'moved';
+      operation: 'move';
+      kind: ContentLocator['kind'];
+      name: string;
+      transactionId: string;
+      publication: 'complete';
+    }
+  | {
+      status: 'git-pending';
+      operation: 'move';
+      kind: ContentLocator['kind'];
+      name: string;
+      transactionId: string;
+      publication: 'git-pending';
+    }
+  | Exclude<CopyContentResult,
+      { status: 'copied' } | { status: 'git-pending'; operation: 'copy' }>;
+
+type TransferOperation = 'copy' | 'move';
+type ContentTransferResult = CopyContentResult | MoveContentResult;
 
 class ContentLocationError extends Error {
   constructor(readonly field: 'source' | 'destination', readonly missing: boolean) {
@@ -470,8 +500,22 @@ function copyMcpEntry(
   return { text: destination.toString(), collision };
 }
 
-function staleField(id: string): CopyContentResult & { status: 'stale' } {
-  if (id === 'source-content' || id === 'source-manifest' || id === 'source-environment') {
+function removeMcpEntry(sourceText: string, sourceName: string): string {
+  const source = parseDocument(sourceText);
+  if (source.errors.length > 0 || !isMap(source.contents) || !source.has(sourceName)) {
+    throw new ContentLocationError('source', true);
+  }
+  source.delete(sourceName);
+  return source.toString();
+}
+
+function staleField(id: string): ContentTransferResult & { status: 'stale' } {
+  if (
+    id === 'source-content' ||
+    id === 'source-manifest' ||
+    id === 'source-environment' ||
+    id === 'source-environment-snapshot'
+  ) {
     return { status: 'stale', field: 'source', message: 'source content changed before copy' };
   }
   if (id === 'source-container') {
@@ -491,7 +535,10 @@ function staleField(id: string): CopyContentResult & { status: 'stale' } {
   return { status: 'stale', field: 'destination', message: 'destination changed before copy' };
 }
 
-export async function copyContent(input: CopyContentInput): Promise<CopyContentResult> {
+async function transferContent(
+  input: CopyContentInput,
+  operation: TransferOperation,
+): Promise<ContentTransferResult> {
   for (const [field, locator] of [
     ['source', input.source],
     ['destination', input.destination],
@@ -522,11 +569,21 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
   if (input.source.kind !== input.destination.kind) {
     return { status: 'invalid', field: 'destination', message: 'content kinds must match' };
   }
+  if (
+    operation === 'move' &&
+    input.source.environment === input.destination.environment
+  ) {
+    return {
+      status: 'invalid',
+      field: 'destination',
+      message: 'a content move requires different environments',
+    };
+  }
   if (input.source.name !== input.destination.name) {
     return {
       status: 'invalid',
       field: 'destination',
-      message: 'a content copy must preserve its name',
+      message: `a content ${operation} must preserve its name`,
     };
   }
   if (input.collision !== undefined && (
@@ -594,6 +651,8 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
   let sourceEntry: { device: string; inode: string; treeDigest?: string };
   let sourceFile: Awaited<ReturnType<typeof readStableRegularFile>> | undefined;
   let destinationIdentity: PathIdentity;
+  let destinationEntry: { device: string; inode: string; treeDigest?: string } | undefined;
+  let destinationFile: Awaited<ReturnType<typeof readStableRegularFile>> | undefined;
   try {
     if (input.source.kind === 'skill') {
       const sourceTree = await validateSkillTree(sourcePath);
@@ -609,6 +668,23 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
       sourceEntry = sourceFile.entry;
     }
     destinationIdentity = await capturePathIdentity(destinationPath);
+    if (input.destination.kind === 'skill' && destinationIdentity.kind === 'directory') {
+      const destinationTree = await snapshotStablePhysicalTree(destinationPath);
+      if (!identitiesEqual(destinationIdentity, destinationTree)) {
+        throw new Error('destination content changed while being inspected');
+      }
+      destinationEntry = {
+        device: destinationTree.device,
+        inode: destinationTree.inode,
+        treeDigest: destinationTree.treeDigest,
+      };
+    } else if (input.destination.kind !== 'skill' && destinationIdentity.kind === 'file') {
+      destinationFile = await readStableRegularFile(destinationPath);
+      if (!identitiesEqual(destinationIdentity, destinationFile.identity)) {
+        throw new Error('destination content changed while being inspected');
+      }
+      destinationEntry = destinationFile.entry;
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       return { status: 'not-found', field: 'source' };
@@ -639,7 +715,7 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
     try {
       const stableDestination = destinationIdentity.kind === 'absent'
         ? undefined
-        : await readStableRegularFile(destinationPath);
+        : destinationFile!;
       if (stableDestination && !identitiesEqual(destinationIdentity, stableDestination.identity)) {
         return {
           status: 'stale',
@@ -724,12 +800,17 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
     return { status: 'failure', message: 'content transfer returned an invalid open outcome' };
   }
 
-  const transactionId = `copy-${input.source.kind}-${randomUUID()}`;
+  const transactionId = `${operation}-${input.source.kind}-${randomUUID()}`;
   const stagingRoot = join(input.paths.live, 'commands', transactionId);
   const stagedEnvironment = join(stagingRoot, 'destination-environment');
+  const stagedSourceEnvironment = join(stagingRoot, 'source-environment');
   const stagedContent = join(
     stagedEnvironment,
     relative(input.paths.envDir(input.destination.environment), destinationPath),
+  );
+  const stagedSourceContent = join(
+    stagedSourceEnvironment,
+    relative(input.paths.envDir(input.source.environment), sourcePath),
   );
   let closeAllowed = false;
   let observedExactPost = false;
@@ -740,7 +821,16 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
       stagedEnvironment,
     );
     if (!identitiesEqual(destinationEnvironment.identity, snapshottedDestinationIdentity)) {
-      return { status: 'stale', field: 'destination', message: 'destination changed before copy' };
+      return { status: 'stale', field: 'destination', message: `destination changed before ${operation}` };
+    }
+    if (operation === 'move') {
+      const snapshottedSourceEnvironment = await snapshotStablePhysicalTree(
+        input.paths.envDir(input.source.environment),
+        stagedSourceEnvironment,
+      );
+      if (!identitiesEqual(sourceEnvironment.identity, snapshottedSourceEnvironment)) {
+        return { status: 'stale', field: 'source', message: 'source changed before move' };
+      }
     }
     await rm(stagedContent, { recursive: true, force: true });
     await mkdir(dirname(stagedContent), { recursive: true });
@@ -760,6 +850,18 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
     } else {
       await writeFile(stagedContent, sourceFile!.bytes);
       await chmod(stagedContent, sourceFile!.identity.mode);
+    }
+    if (operation === 'move') {
+      if (input.source.kind === 'mcp') {
+        const sourceMcpAfter = removeMcpEntry(
+          sourceFile!.bytes.toString('utf8'),
+          input.source.name,
+        );
+        await writeFile(stagedSourceContent, sourceMcpAfter, 'utf8');
+        await chmod(stagedSourceContent, sourceFile!.identity.mode);
+      } else {
+        await rm(stagedSourceContent, { recursive: true, force: true });
+      }
     }
     await input.faults?.afterSourceCopy?.();
     const sourceAfter = input.source.kind === 'skill'
@@ -782,6 +884,14 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
       staged: stagedEnvironment,
       expectedPreIdentity: destinationEnvironment.identity,
     }];
+    if (operation === 'move') {
+      entries.push({
+        id: 'source-environment',
+        target: input.paths.envDir(input.source.environment),
+        staged: stagedSourceEnvironment,
+        expectedPreIdentity: sourceEnvironment.identity,
+      });
+    }
     const preconditions: StagedCommandPrecondition[] = [
       { id: 'environment-container', path: input.paths.environments, expectedIdentity: environmentContainerIdentity },
       {
@@ -792,7 +902,7 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
         expectedEntry: sourceEntry,
       },
       {
-        id: 'source-environment',
+        id: operation === 'move' ? 'source-environment-snapshot' : 'source-environment',
         path: input.paths.envDir(input.source.environment),
         expectedIdentity: sourceEnvironment.identity,
         observation: 'stable-tree',
@@ -800,6 +910,24 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
       },
       { id: 'source-container', path: contentContainer(input.paths, input.source), expectedIdentity: sourceContainerIdentity },
     ];
+    if (operation === 'move') {
+      preconditions.push({
+        id: 'destination-environment-snapshot',
+        path: input.paths.envDir(input.destination.environment),
+        expectedIdentity: destinationEnvironment.identity,
+        observation: 'stable-tree',
+        expectedEntry: destinationEnvironment.stableEntry!,
+      });
+      if (destinationEntry) {
+        preconditions.push({
+          id: 'destination-content',
+          path: destinationPath,
+          expectedIdentity: destinationIdentity,
+          observation: input.destination.kind === 'skill' ? 'stable-tree' : 'stable-file',
+          expectedEntry: destinationEntry,
+        });
+      }
+    }
 
     if (input.source.kind === 'skill') {
       const stagedManifest = join(stagedEnvironment, 'env.yaml');
@@ -814,6 +942,19 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
         stagedManifest,
         (destinationEnvironment.yamlIdentity as Extract<PathIdentity, { kind: 'file' }>).mode,
       );
+      if (operation === 'move') {
+        const stagedSourceManifest = join(stagedSourceEnvironment, 'env.yaml');
+        const sourceYamlAfter = removeEnvSource(
+          sourceEnvironment.yamlText,
+          input.source.name,
+        );
+        parseEnvConfig(sourceYamlAfter, 'staged source environment manifest');
+        await writeFile(stagedSourceManifest, sourceYamlAfter, 'utf8');
+        await chmod(
+          stagedSourceManifest,
+          (sourceEnvironment.yamlIdentity as Extract<PathIdentity, { kind: 'file' }>).mode,
+        );
+      }
       preconditions.push({
         id: 'source-manifest',
         path: input.paths.envYaml(input.source.environment),
@@ -821,6 +962,15 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
         observation: 'stable-file',
         expectedEntry: sourceEnvironment.yamlEntry,
       });
+      if (operation === 'move') {
+        preconditions.push({
+          id: 'destination-manifest',
+          path: input.paths.envYaml(input.destination.environment),
+          expectedIdentity: destinationEnvironment.yamlIdentity,
+          observation: 'stable-file',
+          expectedEntry: destinationEnvironment.yamlEntry,
+        });
+      }
     }
 
     await input.faults?.afterStage?.();
@@ -841,37 +991,107 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
       };
     }
     const stagedEnvironmentIdentity = await snapshotStablePhysicalTree(stagedEnvironment);
+    const stagedSourceEnvironmentIdentity = operation === 'move'
+      ? await snapshotStablePhysicalTree(stagedSourceEnvironment)
+      : undefined;
+    let appliedDestinationEntry:
+      | Awaited<ReturnType<typeof snapshotStablePhysicalTree>>
+      | undefined;
     const publication: unknown = await input.runtime.publish({
       paths: input.paths,
       transactionId,
-      kind: 'content-copy',
+      kind: `content-${operation}`,
       stagingRoot,
       allowedRoots: [input.paths.store],
       entries,
       preconditions,
       gitSteps: [{
-        id: 'copy-content',
-        message: `agentenv: copy ${input.source.kind} ${input.source.name}`,
+        id: `${operation}-content`,
+        message: operation === 'move'
+          ? `agentenv: move ${input.source.kind} ${input.source.name} from ` +
+            `${input.source.environment} to ${input.destination.environment}`
+          : `agentenv: copy ${input.source.kind} ${input.source.name}`,
         paths: [
           destinationPath,
+          ...(operation === 'move' ? [sourcePath] : []),
           ...(input.source.kind === 'skill'
-            ? [input.paths.envYaml(input.destination.environment)]
+            ? [
+                input.paths.envYaml(input.destination.environment),
+                ...(operation === 'move'
+                  ? [input.paths.envYaml(input.source.environment)]
+                  : []),
+              ]
             : []),
         ],
       }],
+      ...(operation === 'move' ? {
+        effectGuard: async (operationId, effect) => {
+          if (operationId === 'source-environment') {
+            const destinationNow = await snapshotStablePhysicalTree(
+              input.paths.envDir(input.destination.environment),
+            );
+            const sourceNow = await snapshotStablePhysicalTree(
+              input.paths.envDir(input.source.environment),
+            );
+            if (
+              !appliedDestinationEntry ||
+              !identitiesEqual(destinationNow, stagedEnvironmentIdentity) ||
+              destinationNow.device !== appliedDestinationEntry.device ||
+              destinationNow.inode !== appliedDestinationEntry.inode ||
+              destinationNow.treeDigest !== appliedDestinationEntry.treeDigest
+            ) {
+              throw new StagedCommandExpectedIdentityError(
+                'destination-environment',
+                input.paths.envDir(input.destination.environment),
+                'pre-apply',
+              );
+            }
+            if (
+              !identitiesEqual(sourceNow, sourceEnvironment.identity) ||
+              sourceNow.device !== sourceEnvironment.stableEntry?.device ||
+              sourceNow.inode !== sourceEnvironment.stableEntry.inode ||
+              sourceNow.treeDigest !== sourceEnvironment.stableEntry.treeDigest
+            ) {
+              throw new StagedCommandExpectedIdentityError(
+                'source-environment',
+                input.paths.envDir(input.source.environment),
+                'pre-apply',
+              );
+            }
+          }
+          await effect();
+        },
+      } : {}),
       afterApply: async (operationId) => {
         await input.faults?.afterApply?.(operationId);
-        const observed = await snapshotStablePhysicalTree(
+        const observedDestination = await snapshotStablePhysicalTree(
           input.paths.envDir(input.destination.environment),
         );
-        if (!identitiesEqual(observed, stagedEnvironmentIdentity)) {
+        if (!identitiesEqual(observedDestination, stagedEnvironmentIdentity)) {
           throw new StagedCommandExpectedIdentityError(
             'destination-environment',
             input.paths.envDir(input.destination.environment),
             'pre-apply',
           );
         }
-        observedExactPost = true;
+        if (operationId === 'destination-environment') {
+          appliedDestinationEntry = observedDestination;
+        }
+        if (operation === 'move' && operationId === 'source-environment') {
+          const observedSource = await snapshotStablePhysicalTree(
+            input.paths.envDir(input.source.environment),
+          );
+          if (!identitiesEqual(observedSource, stagedSourceEnvironmentIdentity!)) {
+            throw new StagedCommandExpectedIdentityError(
+              'source-environment',
+              input.paths.envDir(input.source.environment),
+              'pre-apply',
+            );
+          }
+          observedExactPost = true;
+        } else if (operation === 'copy') {
+          observedExactPost = true;
+        }
       },
       ...(input.faults?.afterPersist ? { afterPersist: input.faults.afterPersist } : {}),
     });
@@ -884,11 +1104,16 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
       throw new Error('content transfer returned an invalid publication outcome');
     }
     const common = {
-      operation: 'copy' as const,
       kind: input.source.kind,
       name: input.destination.name,
       transactionId,
     };
+    const completed = (): ContentTransferResult => operation === 'copy'
+      ? { ...common, status: 'copied', operation: 'copy', publication: 'complete' }
+      : { ...common, status: 'moved', operation: 'move', publication: 'complete' };
+    const gitPending = (): ContentTransferResult => operation === 'copy'
+      ? { ...common, status: 'git-pending', operation: 'copy', publication: 'git-pending' }
+      : { ...common, status: 'git-pending', operation: 'move', publication: 'git-pending' };
     let commands;
     try {
       commands = (await readState(input.paths)).commands;
@@ -897,52 +1122,105 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
         ? await snapshotStablePhysicalTree(input.paths.envDir(input.destination.environment))
           .catch(() => undefined)
         : undefined;
-      if (!observed || !identitiesEqual(observed, stagedEnvironmentIdentity)) throw error;
+      const observedSource = operation === 'move' && observedExactPost
+        ? await snapshotStablePhysicalTree(input.paths.envDir(input.source.environment))
+          .catch(() => undefined)
+        : undefined;
+      if (
+        !observed ||
+        !identitiesEqual(observed, stagedEnvironmentIdentity) ||
+        (operation === 'move' && (
+          !observedSource ||
+          !identitiesEqual(observedSource, stagedSourceEnvironmentIdentity!)
+        ))
+      ) throw error;
       closeAllowed = (publication as { status: string }).status === 'complete';
       return (publication as { status: string }).status === 'git-pending'
-        ? { ...common, status: 'git-pending', publication: 'git-pending' }
-        : { ...common, status: 'copied', publication: 'complete' };
+        ? gitPending()
+        : completed();
     }
     const retained = commands.find((command) => command.transactionId === transactionId);
     const otherPending = commands.find((command) => command.transactionId !== transactionId);
     if (retained) {
-      if (!retained.commitPoint) return { status: 'pending-recovery', transactionId };
-      return { ...common, status: 'git-pending', publication: 'git-pending' };
+      if (retained.phase === 'complete') return completed();
+      if (retained.phase === 'committed' || retained.phase === 'git-pending') {
+        return gitPending();
+      }
+      return { status: 'pending-recovery', transactionId };
     } else if (otherPending) {
       return { status: 'pending-recovery', transactionId: otherPending.transactionId };
     } else if ((publication as { status: string }).status === 'git-pending') {
       throw new Error('git-pending publication has no retained command');
     } else {
-      const observed = observedExactPost
+      const observedDestination = observedExactPost
         ? await snapshotStablePhysicalTree(input.paths.envDir(input.destination.environment))
           .catch(() => undefined)
         : undefined;
-      if (!observed || !identitiesEqual(observed, stagedEnvironmentIdentity)) {
+      const observedSource = operation === 'move' && observedExactPost
+        ? await snapshotStablePhysicalTree(input.paths.envDir(input.source.environment))
+          .catch(() => undefined)
+        : undefined;
+      if (
+        !observedDestination ||
+        !identitiesEqual(observedDestination, stagedEnvironmentIdentity) ||
+        (operation === 'move' && (
+          !observedSource ||
+          !identitiesEqual(observedSource, stagedSourceEnvironmentIdentity!)
+        ))
+      ) {
         throw new Error('complete publication did not produce the staged destination');
       }
       closeAllowed = true;
     }
     return (publication as { status: string }).status === 'git-pending'
-      ? { ...common, status: 'git-pending', publication: 'git-pending' }
-      : { ...common, status: 'copied', publication: 'complete' };
+      ? gitPending()
+      : completed();
   } catch (error) {
     let commands;
     try {
       commands = (await readState(input.paths)).commands;
     } catch {
-      return { status: 'failure', message: 'content copy failed safely' };
+      return { status: 'failure', message: `content ${operation} failed safely` };
     }
     const retained = commands.find((command) => command.transactionId === transactionId);
     if (retained) {
-      if (retained.commitPoint) {
-        return {
-          status: 'git-pending',
-          operation: 'copy',
-          kind: input.source.kind,
-          name: input.destination.name,
-          transactionId,
-          publication: 'git-pending',
-        };
+      if (retained.phase === 'complete') {
+        return operation === 'copy'
+          ? {
+              status: 'copied',
+              operation: 'copy',
+              kind: input.source.kind,
+              name: input.destination.name,
+              transactionId,
+              publication: 'complete',
+            }
+          : {
+              status: 'moved',
+              operation: 'move',
+              kind: input.source.kind,
+              name: input.destination.name,
+              transactionId,
+              publication: 'complete',
+            };
+      }
+      if (retained.phase === 'committed' || retained.phase === 'git-pending') {
+        return operation === 'copy'
+          ? {
+              status: 'git-pending',
+              operation: 'copy',
+              kind: input.source.kind,
+              name: input.destination.name,
+              transactionId,
+              publication: 'git-pending',
+            }
+          : {
+              status: 'git-pending',
+              operation: 'move',
+              kind: input.source.kind,
+              name: input.destination.name,
+              transactionId,
+              publication: 'git-pending',
+            };
       }
       return { status: 'pending-recovery', transactionId };
     }
@@ -958,7 +1236,7 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
         ? error.operationId
         : undefined;
     if (id) return staleField(id);
-    return { status: 'failure', message: 'content copy failed safely' };
+    return { status: 'failure', message: `content ${operation} failed safely` };
   } finally {
     try {
       closeAllowed = !(await readState(input.paths)).commands.length;
@@ -978,4 +1256,12 @@ export async function copyContent(input: CopyContentInput): Promise<CopyContentR
       }
     }
   }
+}
+
+export function copyContent(input: CopyContentInput): Promise<CopyContentResult> {
+  return transferContent(input, 'copy') as Promise<CopyContentResult>;
+}
+
+export function moveContent(input: MoveContentInput): Promise<MoveContentResult> {
+  return transferContent(input, 'move') as Promise<MoveContentResult>;
 }

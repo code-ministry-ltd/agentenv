@@ -3,6 +3,7 @@ import type { Paths } from '../paths.js';
 import { readState } from '../state.js';
 import {
   publishStagedCommand,
+  recoverPendingStagedCommands,
   type PublishStagedCommandRequest,
 } from '../staged-command.js';
 
@@ -66,7 +67,11 @@ export function createContentTransferRuntime(
         });
         return { status: 'complete' };
       } catch (error) {
-        if (observed?.status === 'complete') return observed;
+        if (observed?.status === 'complete') {
+          await recoverPendingStagedCommands(options.paths, undefined, request.transactionId)
+            .catch(() => undefined);
+          return observed;
+        }
         let retained;
         try {
           retained = (await readState(options.paths)).commands.find(

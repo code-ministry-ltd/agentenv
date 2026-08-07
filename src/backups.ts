@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import {
   access,
+  chmod,
   copyFile,
   lstat,
   mkdir,
@@ -63,6 +64,7 @@ async function exists(p: string): Promise<boolean> {
  * created as needed. Special files (sockets, fifos, devices) are skipped.
  */
 async function copyTree(src: string, dest: string): Promise<void> {
+  const sourceMode = (await lstat(src)).mode & 0o7777;
   await mkdir(dest, { recursive: true });
   const entries = await readdir(src, { withFileTypes: true });
   for (const entry of entries) {
@@ -77,6 +79,7 @@ async function copyTree(src: string, dest: string): Promise<void> {
     }
     // else: a special file we cannot meaningfully back up — skip it.
   }
+  await chmod(dest, sourceMode);
 }
 
 /**
