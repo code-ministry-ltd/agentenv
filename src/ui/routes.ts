@@ -1,6 +1,10 @@
 import type { IncomingMessage } from 'node:http';
 import type { GitCandidateService } from '../application/git-candidates.js';
 import {
+  importGitSkills,
+  type GitSkillImportResult,
+} from '../application/git-skill-import.js';
+import {
   copyContent,
   type CopyContentResult,
   moveContent,
@@ -56,6 +60,12 @@ import {
   type Revision,
   type SaveSkillDocumentRequest,
   type SaveSkillDocumentSuccess,
+  type GitSkillImportRequest,
+  type GitSkillImportSelection,
+  type GitSkillImportSuccess,
+  type CandidateId,
+  type CandidateSetId,
+  type ContentName,
 } from './contract.js';
 import { UI_CONTENT_KINDS } from './contract.js';
 import { createUiContentTransferRuntime } from './content-transfer-runtime.js';
@@ -85,6 +95,7 @@ export interface UiRouteDependencies {
   listEnvironmentSummaries: typeof listEnvironmentSummaries;
   readSkillDocument: typeof readSkillDocument;
   saveSkillDocument: typeof saveSkillDocument;
+  importGitSkills: typeof importGitSkills;
   gitCandidates: GitCandidateService;
 }
 
@@ -107,12 +118,14 @@ const DEFAULT_ROUTE_DEPENDENCIES: UiRouteDependencies = {
   listEnvironmentSummaries,
   readSkillDocument,
   saveSkillDocument,
+  importGitSkills,
   createSkillDocumentRuntime: (paths) =>
     createUiSkillDocumentRuntime({ paths, env: process.env }),
   gitCandidates: {
     start: () => { throw new Error('Git candidate service is unavailable'); },
     poll: () => undefined,
     discard: async () => false,
+    take: () => ({ status: 'not-found' }),
     shutdown: async () => undefined,
   },
 };
@@ -842,6 +855,146 @@ async function handleTransferRoute(
 const GIT_SOURCE_MAX_LENGTH = 4_096;
 const OPAQUE_CANDIDATE_SET_ID = /^[A-Za-z0-9_-]{20,100}$/;
 
+function parseGitImportRequest(
+  body: Record<string, unknown> | undefined,
+): GitSkillImportRequest | undefined {
+  if (
+    body === undefined ||
+    !exactKeys(body, ['candidateSetId', 'environment', 'selections']) ||
+    typeof body.candidateSetId !== 'string' ||
+    !OPAQUE_CANDIDATE_SET_ID.test(body.candidateSetId) ||
+    typeof body.environment !== 'string' ||
+    validateEnvName(body.environment) !== null ||
+    !Array.isArray(body.selections) ||
+    body.selections.length === 0 ||
+    body.selections.length > 100
+  ) return undefined;
+  const seen = new Set<string>();
+  const selections: GitSkillImportSelection[] = [];
+  for (const value of body.selections) {
+    if (
+      value === null ||
+      typeof value !== 'object' ||
+      Array.isArray(value) ||
+      !exactKeys(value as Record<string, unknown>, ['candidateId', 'collision'])
+    ) return undefined;
+    const candidateId = (value as Record<string, unknown>).candidateId;
+    const collision = (value as Record<string, unknown>).collision;
+    if (
+      typeof candidateId !== 'string' ||
+      !OPAQUE_CANDIDATE_SET_ID.test(candidateId) ||
+      seen.has(candidateId) ||
+      (collision !== 'skip' && collision !== 'overwrite')
+    ) return undefined;
+    seen.add(candidateId);
+    selections.push({
+      candidateId: candidateId as CandidateId,
+      collision: collision as GitSkillImportSelection['collision'],
+    });
+  }
+  return {
+    candidateSetId: body.candidateSetId as CandidateSetId,
+    environment: body.environment as EnvironmentName,
+    selections,
+  };
+}
+
+async function gitImportRouteResult(
+  request: GitSkillImportRequest,
+  result: GitSkillImportResult,
+  paths: Paths,
+  dependencies: UiRouteDependencies,
+): Promise<UiRouteResult> {
+  if (result.status === 'invalid-environment') {
+    return errorResult('MALFORMED_REQUEST', 'The Git import destination is malformed.');
+  }
+  if (result.status === 'environment-not-found') {
+    return errorResult('NOT_FOUND', 'The Git import destination was not found.');
+  }
+  if (result.status === 'pending-recovery') {
+    return errorResult(
+      'PENDING_RECOVERY',
+      'Another operation requires recovery before Git skills can be imported.',
+      pendingRecoveryDetails(result.transactionId, false),
+    );
+  }
+  if (result.status === 'failure') {
+    return errorResult('INTERNAL_ERROR', 'The selected Git skills could not be imported.');
+  }
+  let environmentInventory: EnvironmentInventory | undefined;
+  try {
+    environmentInventory = await dependencies.getEnvironmentInventory({
+      paths,
+      name: request.environment,
+    });
+  } catch {
+    // Publication outcomes remain authoritative; the client can refresh later.
+  }
+  const publication = result.outcomes.some(
+    (outcome) => outcome.status === 'installed' && outcome.publication === 'git-pending',
+  ) ? 'git-pending' : 'complete';
+  const data: GitSkillImportSuccess = {
+    environment: request.environment,
+    outcomes: result.outcomes.map((outcome) => ({
+      ...outcome,
+      candidateId: outcome.candidateId as CandidateId,
+      name: outcome.name as ContentName,
+    })),
+    publication,
+    refreshRequired: environmentInventory === undefined,
+    ...(environmentInventory === undefined ? {} : { environmentInventory }),
+  };
+  return { status: 200, body: { data } };
+}
+
+async function handleGitImportRoute(
+  request: IncomingMessage,
+  url: URL,
+  requestBody: Record<string, unknown> | undefined,
+  paths: Paths,
+  dependencies: UiRouteDependencies,
+): Promise<UiRouteResult | undefined> {
+  if (url.pathname !== '/api/git/import') return undefined;
+  if (request.method !== 'POST') {
+    return errorResult('METHOD_NOT_ALLOWED', 'The request method is not supported.');
+  }
+  if ([...url.searchParams.keys()].length > 0) {
+    return errorResult('MALFORMED_REQUEST', 'The request query is malformed.');
+  }
+  const parsed = parseGitImportRequest(requestBody);
+  if (parsed === undefined) {
+    return errorResult('MALFORMED_REQUEST', 'The Git skill import request is malformed.');
+  }
+  const claimed = dependencies.gitCandidates.take(parsed.candidateSetId, parsed.selections);
+  if (claimed.status === 'not-found') {
+    return errorResult('NOT_FOUND', 'The Git candidate set was not found or has expired.');
+  }
+  if (claimed.status === 'pending') {
+    return errorResult('COLLISION', 'The Git candidate set is still being discovered.');
+  }
+  if (claimed.status === 'failed') {
+    return errorResult(claimed.error.code, claimed.error.message, claimed.error.details);
+  }
+  if (claimed.status === 'invalid-selection') {
+    return errorResult('MALFORMED_REQUEST', 'The Git candidate selection is invalid.');
+  }
+  try {
+    return await gitImportRouteResult(
+      parsed,
+      await dependencies.importGitSkills({
+        paths,
+        environment: parsed.environment,
+        imports: claimed.claim.imports,
+        runtime: dependencies.createContentTransferRuntime(paths),
+      }),
+      paths,
+      dependencies,
+    );
+  } finally {
+    await claimed.claim.release();
+  }
+}
+
 async function handleGitCandidateRoute(
   request: IncomingMessage,
   url: URL,
@@ -930,6 +1083,14 @@ export async function handleUiRoute(
   requestBody?: Record<string, unknown>,
 ): Promise<UiRouteResult | undefined> {
   const dependencies = { ...DEFAULT_ROUTE_DEPENDENCIES, ...dependencyOverrides };
+  const gitImportRoute = await handleGitImportRoute(
+    request,
+    url,
+    requestBody,
+    paths,
+    dependencies,
+  );
+  if (gitImportRoute !== undefined) return gitImportRoute;
   const gitCandidateRoute = await handleGitCandidateRoute(
     request,
     url,

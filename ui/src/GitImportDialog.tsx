@@ -1,12 +1,18 @@
 import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import type {
   CandidateSetId,
+  CandidateId,
+  EnvironmentName,
+  EnvironmentSummary,
   GitCandidate,
   GitDiscoveryPhase,
+  GitSkillImportSuccess,
 } from '../../src/ui/contract.js';
 import {
   discardGitCandidateSet,
+  getEnvironmentInventory,
   getGitCandidateSet,
+  importGitSkills,
   startGitCandidateDiscovery,
   UiApiError,
 } from './api.js';
@@ -35,9 +41,15 @@ function phaseLabel(phase: GitDiscoveryPhase): string {
 }
 
 export function GitImportDialog({
+  environments,
+  initialEnvironment,
+  onImported,
   onClose,
   triggerRef,
 }: {
+  environments: readonly EnvironmentSummary[];
+  initialEnvironment?: string;
+  onImported(result: GitSkillImportSuccess): void;
   onClose(): void;
   triggerRef: RefObject<HTMLButtonElement | null>;
 }): React.JSX.Element {
@@ -47,8 +59,16 @@ export function GitImportDialog({
   const sequenceRef = useRef(0);
   const [source, setSource] = useState('');
   const [filter, setFilter] = useState('');
+  const [destination, setDestination] = useState(
+    initialEnvironment ?? environments[0]?.name ?? '',
+  );
   const [candidateSetId, setCandidateSetId] = useState<CandidateSetId>();
   const [browse, setBrowse] = useState<BrowseState>({ status: 'idle' });
+  const [selected, setSelected] = useState<ReadonlySet<CandidateId>>(new Set());
+  const [overwrites, setOverwrites] = useState<ReadonlySet<CandidateId>>(new Set());
+  const [existingSkills, setExistingSkills] = useState<ReadonlySet<string>>(new Set());
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<GitSkillImportSuccess>();
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -103,6 +123,28 @@ export function GitImportDialog({
     };
   }, [candidateSetId]);
 
+  useEffect(() => {
+    if (browse.status !== 'ready' || destination === '') return;
+    let ignore = false;
+    void getEnvironmentInventory(destination).then(
+      (inventory) => {
+        if (!ignore) {
+          setExistingSkills(new Set(
+            inventory.items
+              .filter((item) => item.kind === 'skill')
+              .map((item) => item.name),
+          ));
+        }
+      },
+      () => {
+        if (!ignore) setExistingSkills(new Set());
+      },
+    );
+    return () => {
+      ignore = true;
+    };
+  }, [browse.status, destination]);
+
   const visible = useMemo(() => {
     if (browse.status !== 'ready') return [];
     const query = filter.trim().toLocaleLowerCase();
@@ -136,6 +178,9 @@ export function GitImportDialog({
     activeSetRef.current = undefined;
     setCandidateSetId(undefined);
     setBrowse({ status: 'starting' });
+    setSelected(new Set());
+    setOverwrites(new Set());
+    setImportResult(undefined);
     if (previous !== undefined) {
       await discardGitCandidateSet(previous).catch(() => undefined);
     }
@@ -155,6 +200,46 @@ export function GitImportDialog({
     }
   };
 
+  const toggle = (
+    current: ReadonlySet<CandidateId>,
+    value: CandidateId,
+    checked: boolean,
+  ): ReadonlySet<CandidateId> => {
+    const next = new Set(current);
+    if (checked) next.add(value);
+    else next.delete(value);
+    return next;
+  };
+  const importSelected = async (): Promise<void> => {
+    if (candidateSetId === undefined || destination === '' || selected.size === 0) return;
+    setImporting(true);
+    setImportResult(undefined);
+    try {
+      const result = await importGitSkills({
+        candidateSetId,
+        environment: destination as EnvironmentName,
+        selections: [...selected].map((candidateId) => ({
+          candidateId,
+          collision: overwrites.has(candidateId) ? 'overwrite' : 'skip',
+        })),
+      });
+      activeSetRef.current = undefined;
+      setCandidateSetId(undefined);
+      setSelected(new Set());
+      setOverwrites(new Set());
+      setImportResult(result);
+      onImported(result);
+    } catch (error) {
+      if (error instanceof UiApiError && error.code === 'NOT_FOUND') {
+        activeSetRef.current = undefined;
+        setCandidateSetId(undefined);
+      }
+      setBrowse({ status: 'failed', message: safeIssue(error) });
+    } finally {
+      setImporting(false);
+    }
+  };
+
   return (
     <dialog
       aria-describedby="git-import-help"
@@ -168,7 +253,7 @@ export function GitImportDialog({
       onKeyDown={(event) => {
         if (event.key !== 'Tab') return;
         const focusable = [...event.currentTarget.querySelectorAll<HTMLElement>(
-          'button:not(:disabled), input:not(:disabled)',
+          'button:not(:disabled), input:not(:disabled), select:not(:disabled)',
         )];
         const first = focusable[0];
         const last = focusable.at(-1);
@@ -222,6 +307,21 @@ export function GitImportDialog({
         ) : null}
         {browse.status === 'ready' ? (
           <section className="git-candidate-browser" aria-labelledby="git-candidate-title">
+            <div className="dialog-fields git-import-destination">
+              <label htmlFor="git-import-environment">Import into environment</label>
+              <select
+                id="git-import-environment"
+                onChange={(event) => {
+                  setDestination(event.currentTarget.value);
+                  setOverwrites(new Set());
+                }}
+                value={destination}
+              >
+                {environments.map((environment) => (
+                  <option key={environment.name} value={environment.name}>{environment.name}</option>
+                ))}
+              </select>
+            </div>
             <div className="git-candidate-heading">
               <div>
                 <h3 id="git-candidate-title">Discovered skills</h3>
@@ -245,6 +345,26 @@ export function GitImportDialog({
                 {visible.map((candidate) => (
                   <li key={candidate.candidateId}>
                     <article className="git-candidate-card">
+                      <div className="git-candidate-select">
+                        <input
+                          checked={selected.has(candidate.candidateId)}
+                          id={`select-${candidate.candidateId}`}
+                          onChange={(event) => {
+                            setSelected(toggle(
+                              selected,
+                              candidate.candidateId,
+                              event.currentTarget.checked,
+                            ));
+                            if (!event.currentTarget.checked) {
+                              setOverwrites(toggle(overwrites, candidate.candidateId, false));
+                            }
+                          }}
+                          type="checkbox"
+                        />
+                        <label htmlFor={`select-${candidate.candidateId}`}>
+                          Select {candidate.name}
+                        </label>
+                      </div>
                       <h4>{candidate.name}</h4>
                       <p>{candidate.description || 'No description.'}</p>
                       <dl>
@@ -253,13 +373,68 @@ export function GitImportDialog({
                         <dt>Ref</dt><dd>{candidate.ref ?? 'HEAD'}</dd>
                         <dt>Commit</dt><dd title={candidate.commit}>{candidate.shortCommit}</dd>
                       </dl>
+                      {existingSkills.has(candidate.name) ? (
+                        <div className="git-candidate-overwrite">
+                          <p>
+                            This environment already contains {candidate.name}.{' '}
+                            {overwrites.has(candidate.candidateId)
+                              ? 'The existing skill will be replaced.'
+                              : 'It will be skipped.'}
+                          </p>
+                          <input
+                            checked={overwrites.has(candidate.candidateId)}
+                            disabled={!selected.has(candidate.candidateId)}
+                            id={`overwrite-${candidate.candidateId}`}
+                            onChange={(event) => setOverwrites(toggle(
+                              overwrites,
+                              candidate.candidateId,
+                              event.currentTarget.checked,
+                            ))}
+                            type="checkbox"
+                          />
+                          <label htmlFor={`overwrite-${candidate.candidateId}`}>
+                            Overwrite existing {candidate.name}
+                          </label>
+                        </div>
+                      ) : null}
                     </article>
                   </li>
                 ))}
               </ul>
             )}
+            <div className="dialog-actions git-import-submit">
+              <button
+                disabled={
+                  importing || candidateSetId === undefined ||
+                  selected.size === 0 || destination === ''
+                }
+                onClick={() => void importSelected()}
+                type="button"
+              >
+                {importing ? 'Importing selected skills…' : 'Import selected skills'}
+              </button>
+            </div>
           </section>
         ) : null}
+        {importResult === undefined ? null : (
+          <section aria-labelledby="git-import-results" className="git-import-results" role="status">
+            <h3 id="git-import-results">Import results</h3>
+            <ul>
+              {importResult.outcomes.map((outcome) => (
+                <li key={outcome.candidateId}>
+                  <strong>{outcome.name}:</strong>{' '}
+                  {outcome.status === 'installed'
+                    ? outcome.publication === 'git-pending'
+                      ? 'installed locally; Git bookkeeping is pending'
+                      : 'installed'
+                    : outcome.status === 'skipped'
+                      ? 'skipped because it already exists'
+                      : `failed (${outcome.reason.replaceAll('-', ' ')})`}
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
       </form>
     </dialog>
   );

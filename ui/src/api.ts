@@ -22,6 +22,8 @@ import {
   type CandidateSetId,
   type GitCandidateSet,
   type PendingGitCandidateSet,
+  type GitSkillImportRequest,
+  type GitSkillImportSuccess,
 } from '../../src/ui/contract.js';
 
 interface SessionData {
@@ -231,4 +233,13 @@ export async function discardGitCandidateSet(
     `/api/git/candidates/${encodeURIComponent(candidateSetId)}`,
     { method: 'DELETE' },
   );
+}
+
+export async function importGitSkills(
+  request: GitSkillImportRequest,
+): Promise<GitSkillImportSuccess> {
+  return await apiRequest<GitSkillImportSuccess>('/api/git/import', {
+    method: 'POST',
+    body: JSON.stringify(request),
+  });
 }

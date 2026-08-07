@@ -94,6 +94,7 @@ describe('server-owned Git candidate sets', () => {
         description: 'Alpha.',
         repoPath: 'skills/alpha',
         validation: { status: 'valid' as const },
+        contentHash: 'b'.repeat(64),
       }],
       rootCandidate: undefined,
       candidateDirectory: () => '/private/not-for-browser',

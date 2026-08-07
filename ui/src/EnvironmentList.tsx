@@ -6,6 +6,7 @@ import type {
   EnvironmentInventory,
   EnvironmentLifecycleSuccess,
   EnvironmentSummary,
+  GitSkillImportSuccess,
 } from '../../src/ui/contract.js';
 import { listEnvironmentSummaries } from './api.js';
 import { DeleteEnvironmentDialog } from './DeleteEnvironmentDialog.js';
@@ -210,6 +211,23 @@ export function EnvironmentList(): React.JSX.Element {
     }
     refresh();
   };
+  const imported = (result: GitSkillImportSuccess): void => {
+    mutationEpochRef.current += 1;
+    if (result.environmentInventory !== undefined) {
+      setCatalog((current) => current.status !== 'ready' ? current : {
+        status: 'ready',
+        items: current.items.map((environment) =>
+          environment.name === result.environment
+            ? result.environmentInventory!
+            : environment),
+        refresh: 'idle',
+      });
+      if (selectedName === result.environment) {
+        setPublishedInventory(result.environmentInventory);
+      }
+    }
+    refresh();
+  };
   const deleteEnvironment = catalog.status === 'ready'
     ? catalog.items.find((environment) => environment.name === deleteName)
     : undefined;
@@ -409,7 +427,10 @@ export function EnvironmentList(): React.JSX.Element {
       )}
       {gitDialog ? (
         <GitImportDialog
+          environments={catalog.status === 'ready' ? catalog.items : []}
+          initialEnvironment={selectedName}
           onClose={() => setGitDialog(false)}
+          onImported={imported}
           triggerRef={gitTriggerRef}
         />
       ) : null}

@@ -321,3 +321,42 @@ export function isTerminalGitCandidateSet(
 ): candidateSet is ReadyGitCandidateSet | FailedGitCandidateSet {
   return candidateSet.status !== 'PENDING';
 }
+
+export interface GitSkillImportSelection {
+  candidateId: CandidateId;
+  collision: 'skip' | 'overwrite';
+}
+
+export interface GitSkillImportRequest {
+  candidateSetId: CandidateSetId;
+  environment: EnvironmentName;
+  selections: readonly GitSkillImportSelection[];
+}
+
+export type GitSkillImportOutcome =
+  | {
+      candidateId: CandidateId;
+      name: ContentName;
+      status: 'installed';
+      publication: 'complete' | 'git-pending';
+    }
+  | {
+      candidateId: CandidateId;
+      name: ContentName;
+      status: 'skipped';
+      reason: 'collision';
+    }
+  | {
+      candidateId: CandidateId;
+      name: ContentName;
+      status: 'failed';
+      reason: 'candidate-changed' | 'validation' | 'destination-changed' | 'publication';
+    };
+
+export interface GitSkillImportSuccess {
+  environment: EnvironmentName;
+  outcomes: readonly GitSkillImportOutcome[];
+  publication: 'complete' | 'git-pending';
+  refreshRequired: boolean;
+  environmentInventory?: EnvironmentInventory;
+}

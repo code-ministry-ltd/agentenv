@@ -700,14 +700,18 @@ Resolve selected opaque candidates to their exact scanned content, revalidate
 identity, publish through existing per-skill vendoring/history, preserve
 provenance, and present explicit collision choices and per-skill outcomes.
 
-- [ ] Multiple selected candidates install exact validated content and current
+- [x] Multiple selected candidates install exact validated content and current
   provenance into the chosen environment.
-- [ ] Existing destinations default to skipped; only a candidate-specific explicit
+- [x] Existing destinations default to skipped; only a candidate-specific explicit
   overwrite may replace one, without changing unselected content.
-- [ ] Installed, skipped, and failed results remain truthful after mixed outcomes,
+- [x] Installed, skipped, and failed results remain truthful after mixed outcomes,
   expiry, substitution attempts, Git failure, or publication failure.
 
 Verification: `npx vitest run test/git-skill-import.test.ts test/ui-git-candidates.test.ts && npm run test:ui:e2e -- --grep "imports selected Git skills"`
+
+Evidence: exact selected multi-import, provenance, default skip, explicit overwrite,
+unselected preservation, candidate substitution, expiry, cleanup, and Git-pending
+outcomes are covered by the application, candidate-store, and real-browser tests.
 
 Dependencies: Task 20
 
@@ -719,9 +723,14 @@ Size: M
 
 ### Checkpoint F — Git discovery and import
 
-- [ ] `npm run lint && npm run typecheck && npm run build && npm test`
-- [ ] `npm run test:ui && npm run test:ui:e2e`
-- [ ] Local multi-skill, mixed-result, offline, hostile, expiry, and cleanup cases are green.
+- [x] `npm run lint && npm run typecheck && npm run build && npm test`
+- [x] `npm run test:ui && npm run test:ui:e2e`
+- [x] Local multi-skill, mixed-result, offline, hostile, expiry, and cleanup cases are green.
+
+Evidence: lint, typecheck, production build, 53 focused UI tests, 16 browser
+journeys, and the full regression suite passed on 2026-08-07. Git discovery and
+import tests cover local multi-skill and mixed outcomes plus offline, hostile,
+expiry, substitution, failed-publication, and private-checkout cleanup paths.
 
 ## Phase 7 — Package and release hardening
 

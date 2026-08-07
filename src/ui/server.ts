@@ -234,6 +234,7 @@ async function handleApi(
     ((pathname === '/api/environments' || pathname === '/api/content/transfer') &&
       request.method === 'POST') ||
     (pathname === '/api/git/candidates' && request.method === 'POST') ||
+    (pathname === '/api/git/import' && request.method === 'POST') ||
     (/^\/api\/environments\/[^/]+\/skills\/[^/]+\/document$/.test(pathname) &&
       request.method === 'PUT')
   ) {

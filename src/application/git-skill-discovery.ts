@@ -5,6 +5,7 @@ import { validateSkillDir } from '../content-items.js';
 import type { GitRunner } from '../git.js';
 import {
   fetchSkillSource,
+  hashDir,
   resolveSkillSource,
   scanSkillDirs,
 } from '../skill-source.js';
@@ -36,6 +37,8 @@ export interface GitSkillCandidate {
   description: string;
   repoPath: string;
   validation: GitSkillCandidateValidation;
+  /** Private exact-content identity; candidate HTTP projections deliberately omit it. */
+  contentHash: string;
 }
 
 /**
@@ -160,6 +163,7 @@ export async function discoverGitSkills(
     const scanned = await scanSkillDirs(fetched.scanDir);
     const candidates = await Promise.all(scanned.map(async (candidate) => {
       const validation = await validateSkillDir(candidate.dir);
+      const contentHash = await hashDir(candidate.dir);
       const metadata: GitSkillCandidate = {
         name: candidate.name,
         description: candidate.description,
@@ -167,6 +171,7 @@ export async function discoverGitSkills(
         validation: 'error' in validation
           ? { status: 'invalid', message: validation.error }
           : { status: 'valid' },
+        contentHash,
       };
       return { candidate: metadata, directory: candidate.dir };
     }));

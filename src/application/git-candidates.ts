@@ -15,6 +15,7 @@ import type {
   GitCandidateSet,
   GitDiscoveryPhase,
 } from '../ui/contract.js';
+import type { ExactGitSkillImport } from './git-skill-import.js';
 
 const DEFAULT_IDLE_MS = 15 * 60 * 1_000;
 
@@ -36,8 +37,29 @@ export interface GitCandidateService {
   start(source: string): Extract<GitCandidateSet, { status: 'PENDING' }>;
   poll(id: string, page: number, pageSize: number): GitCandidateSet | undefined;
   discard(id: string): Promise<boolean>;
+  take(
+    id: string,
+    selections: readonly GitCandidateSelection[],
+  ): GitCandidateClaimResult;
   shutdown(): Promise<void>;
 }
+
+export interface GitCandidateSelection {
+  candidateId: string;
+  collision: 'skip' | 'overwrite';
+}
+
+export interface ClaimedGitCandidates {
+  imports: readonly ExactGitSkillImport[];
+  release(): Promise<void>;
+}
+
+export type GitCandidateClaimResult =
+  | { status: 'ready'; claim: ClaimedGitCandidates }
+  | { status: 'pending' }
+  | { status: 'failed'; error: ApiError }
+  | { status: 'invalid-selection' }
+  | { status: 'not-found' };
 
 interface CandidateEntry {
   source: DiscoveredGitSkill;
@@ -160,6 +182,65 @@ export class GitCandidateStore implements GitCandidateService {
     record.discovery = undefined;
     if (discovery !== undefined) await discovery.release();
     return true;
+  }
+
+  take(
+    id: string,
+    selections: readonly GitCandidateSelection[],
+  ): GitCandidateClaimResult {
+    const record = this.#records.get(id as CandidateSetId);
+    if (record === undefined || record.discarded) return { status: 'not-found' };
+    this.#touch(record);
+    if (record.status === 'pending') return { status: 'pending' };
+    if (record.status === 'failed') {
+      return {
+        status: 'failed',
+        error: record.error ?? {
+          code: 'INTERNAL_ERROR',
+          message: 'The Git skill source could not be discovered.',
+        },
+      };
+    }
+    const candidates = record.candidates ?? [];
+    const ids = new Set<string>();
+    const chosen: Array<{ entry: CandidateEntry; collision: 'skip' | 'overwrite' }> = [];
+    for (const selection of selections) {
+      if (ids.has(selection.candidateId)) return { status: 'invalid-selection' };
+      ids.add(selection.candidateId);
+      const entry = candidates.find(
+        (candidate) => candidate.contract.candidateId === selection.candidateId,
+      );
+      if (entry === undefined) return { status: 'invalid-selection' };
+      chosen.push({ entry, collision: selection.collision });
+    }
+    const discovery = record.discovery;
+    if (discovery === undefined) return { status: 'failed', error: {
+      code: 'INTERNAL_ERROR',
+      message: 'The Git candidate set is unavailable.',
+    } };
+
+    this.#records.delete(record.id);
+    record.discarded = true;
+    if (record.timer !== undefined) clearTimeout(record.timer);
+    record.discovery = undefined;
+    let released = false;
+    return {
+      status: 'ready',
+      claim: {
+        imports: chosen.map(({ entry, collision }) => ({
+          candidateId: entry.contract.candidateId,
+          candidate: entry.source,
+          sourceDirectory: discovery.candidateDirectory(entry.source),
+          source: discovery.source,
+          collision,
+        })),
+        release: async () => {
+          if (released) return;
+          released = true;
+          await discovery.release();
+        },
+      },
+    };
   }
 
   async sweepExpired(): Promise<void> {

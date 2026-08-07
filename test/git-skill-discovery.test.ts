@@ -40,18 +40,20 @@ describe('shared Git skill discovery', () => {
       commit,
     });
     expect(result.discovery.candidates).toEqual([
-      {
+      expect.objectContaining({
         name: 'alpha',
         description: 'Alpha does A.',
         repoPath: 'skills/alpha',
         validation: { status: 'valid' },
-      },
-      {
+        contentHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      }),
+      expect.objectContaining({
         name: 'beta',
         description: 'Beta does B.',
         repoPath: 'skills/beta',
         validation: { status: 'valid' },
-      },
+        contentHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      }),
     ]);
     expect(JSON.stringify(result.discovery.candidates)).not.toContain('agentenv-skill-clone-');
 

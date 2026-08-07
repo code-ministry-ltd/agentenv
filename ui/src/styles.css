@@ -852,6 +852,61 @@ h3 {
   margin-top: 0;
 }
 
+.git-import-destination {
+  margin-bottom: 1rem;
+}
+
+.git-candidate-select,
+.git-candidate-overwrite {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.git-candidate-select {
+  margin-bottom: 0.65rem;
+  font-weight: 700;
+}
+
+.git-candidate-select input,
+.git-candidate-overwrite input {
+  flex: 0 0 auto;
+  margin-top: 0.2rem;
+}
+
+.git-candidate-overwrite {
+  flex-wrap: wrap;
+  margin-top: 0.85rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--line);
+}
+
+.git-candidate-overwrite p {
+  flex-basis: 100%;
+  margin-bottom: 0;
+  color: var(--ink-muted);
+  font-size: 0.85rem;
+}
+
+.git-import-submit {
+  margin-top: 1rem;
+}
+
+.git-import-results {
+  margin-top: 1rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--line);
+  background: var(--accent-soft);
+}
+
+.git-import-results h3 {
+  margin-top: 0;
+}
+
+.git-import-results ul {
+  margin-bottom: 0;
+}
+
 .git-candidate-card dl {
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);
