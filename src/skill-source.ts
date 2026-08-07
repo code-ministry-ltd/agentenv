@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseFrontmatter } from './content-items.js';
-import { defaultGitRunner } from './git.js';
+import { defaultGitRunner, type GitRunner } from './git.js';
 
 /**
  * A resolved git skill source (design D17). `repo` is the canonical origin
@@ -216,6 +216,13 @@ interface GitResult {
   stderr: string;
 }
 
+/** Injectable Git process inputs shared by CLI and UI discovery. */
+export interface SkillSourceGitOptions {
+  env?: NodeJS.ProcessEnv;
+  gitRun?: GitRunner;
+  timeoutMs?: number;
+}
+
 /**
  * Run `git <args>` (optionally in `cwd`), capturing output. Never throws on a
  * non-zero exit — the caller inspects `code`. A spawn error (git missing) or a
@@ -235,11 +242,12 @@ export async function runGit(
   args: readonly string[],
   cwd?: string,
   timeoutMs = GIT_TIMEOUT_MS,
+  options: SkillSourceGitOptions = {},
 ): Promise<GitResult> {
-  const result = await defaultGitRunner(args, {
+  const result = await (options.gitRun ?? defaultGitRunner)(args, {
     cwd: cwd ?? process.cwd(),
-    env: process.env,
-    timeoutMs,
+    env: options.env ?? process.env,
+    timeoutMs: options.timeoutMs ?? timeoutMs,
   });
   return {
     code: result.code,
@@ -275,26 +283,31 @@ export type FetchSkillSourceResult = FetchedSource | { error: string };
  * is returned, so nothing outside the temp dir is ever touched — this is the one
  * command that may fail offline (spec criterion 11).
  */
-export async function fetchSkillSource(source: ParsedSkillSource): Promise<FetchSkillSourceResult> {
+export async function fetchSkillSource(
+  source: ParsedSkillSource,
+  options: SkillSourceGitOptions = {},
+): Promise<FetchSkillSourceResult> {
   const cloneDir = await mkdtemp(join(tmpdir(), 'agentenv-skill-clone-'));
   const fail = async (message: string): Promise<{ error: string }> => {
     await rm(cloneDir, { recursive: true, force: true });
     return { error: message };
   };
 
+  const execute = (args: readonly string[], cwd?: string): Promise<GitResult> =>
+    runGit(args, cwd, GIT_TIMEOUT_MS, options);
   const clone = source.ref
-    ? await runGit(['clone', '--depth', '1', '--branch', source.ref, source.cloneUrl, cloneDir])
-    : await runGit(['clone', '--depth', '1', source.cloneUrl, cloneDir]);
+    ? await execute(['clone', '--depth', '1', '--branch', source.ref, source.cloneUrl, cloneDir])
+    : await execute(['clone', '--depth', '1', source.cloneUrl, cloneDir]);
 
   if (clone.code !== 0) {
     // `--branch` fails for a bare commit sha; retry with a shallow fetch+checkout.
     if (source.ref) {
-      const plain = await runGit(['clone', '--depth', '1', source.cloneUrl, cloneDir]);
+      const plain = await execute(['clone', '--depth', '1', source.cloneUrl, cloneDir]);
       if (plain.code !== 0) {
         return fail(cloneError(source, plain.stderr || clone.stderr));
       }
-      const fetched = await runGit(['fetch', '--depth', '1', 'origin', source.ref], cloneDir);
-      const checkout = fetched.code === 0 ? await runGit(['checkout', source.ref], cloneDir) : fetched;
+      const fetched = await execute(['fetch', '--depth', '1', 'origin', source.ref], cloneDir);
+      const checkout = fetched.code === 0 ? await execute(['checkout', source.ref], cloneDir) : fetched;
       if (checkout.code !== 0) {
         return fail(
           `could not resolve ref '${source.ref}' in ${source.repo}` +
@@ -306,13 +319,13 @@ export async function fetchSkillSource(source: ParsedSkillSource): Promise<Fetch
     }
   }
 
-  const rev = await runGit(['rev-parse', 'HEAD'], cloneDir);
+  const rev = await execute(['rev-parse', 'HEAD'], cloneDir);
   if (rev.code !== 0) return fail(`could not read the cloned commit for ${source.repo}`);
   const commit = rev.stdout.trim();
 
   let ref = source.ref;
   if (ref === undefined) {
-    const branch = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], cloneDir);
+    const branch = await execute(['rev-parse', '--abbrev-ref', 'HEAD'], cloneDir);
     ref = branch.code === 0 && branch.stdout.trim() !== '' ? branch.stdout.trim() : 'HEAD';
   }
 

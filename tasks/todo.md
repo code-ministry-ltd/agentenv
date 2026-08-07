@@ -635,13 +635,23 @@ Extract reusable fetch/scan/candidate metadata and vendoring boundaries from
 `add skills`, retaining every supported source syntax, offline rule, Git auth
 behavior, validation, provenance, and existing CLI output.
 
-- [ ] Local and network-form sources resolve to exact commit/path candidates with
+- [x] Local and network-form sources resolve to exact commit/path candidates with
   no browser or presentation dependency.
-- [ ] Invalid, unreachable, hostile, and offline-disallowed sources mutate no
+- [x] Invalid, unreachable, hostile, and offline-disallowed sources mutate no
   environment and reveal no credentials/private temp paths.
-- [ ] Existing `add skill` and `add skills` behavior remains unchanged.
+- [x] Existing `add skill` and `add skills` behavior remains unchanged.
 
-Verification: `npx vitest run test/git-skill-discovery.test.ts test/add-skills.test.ts`
+Verified 2026-08-07: the shared application discovery lease resolves file URLs,
+raw local-repository paths, network forms, refs, exact commits, repository paths,
+descriptions, and validation state while keeping checkout paths private. Offline
+network input is rejected before Git runs; injected Git environment/auth seams
+are honored; failed and explicitly released checkouts are removed without temp
+path leakage. The CLI's single/collection Git paths now use the same discovery
+boundary while existing raw-directory copy semantics and rendered output remain
+unchanged. Discovery and all add-source tests (52/52), lint, all typechecks,
+build, and the full regression suite (162 files, 1,344 tests) passed.
+
+Verification: `npx vitest run test/git-skill-discovery.test.ts test/add.source.*.test.ts test/add.skill.test.ts`
 
 Dependencies: Checkpoint E
 

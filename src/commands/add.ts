@@ -1,9 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { access, cp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { join, relative, resolve, sep } from 'node:path';
+import { join, resolve } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { parseArgs } from '../args.js';
 import type { Command, CommandContext, RunResult } from '../command.js';
+import {
+  discoverGitSkills,
+  type GitSkillDiscovery,
+} from '../application/git-skill-discovery.js';
 import {
   scaffoldSkillMd,
   validateItemName,
@@ -17,11 +21,8 @@ import { rebaseInProgress } from '../git.js';
 import { confirmDefault, selectSkillsDefault } from '../prompt.js';
 import {
   diffDirs,
-  fetchSkillSource,
   hashDir,
-  resolveSkillSource,
   scanSkillDirs,
-  type ParsedSkillSource,
 } from '../skill-source.js';
 import { environmentExists, readEnvConfig, validateEnvName } from '../store.js';
 import { commitRequiredMutation, withNotices, withStoreSync } from './store-sync.js';
@@ -350,54 +351,61 @@ async function addSkillFromGit(
   ctx: CommandContext,
   notices: string[],
 ): Promise<RunResult> {
-  const source = await resolveSkillSource(target);
-  if ('error' in source) return fail(`add skill: ${source.error}\n`);
-  const fetched = await fetchSkillSource(source);
-  if ('error' in fetched) return fail(`add skill: ${fetched.error}\n`);
+  const discovered = await discoverGitSkills({
+    source: target,
+    cwd: ctx.cwd,
+    env: ctx.env,
+    offline: ctx.options.globals?.offline ?? false,
+    ...(ctx.options.gitRun === undefined ? {} : { gitRun: ctx.options.gitRun }),
+  });
+  if (discovered.status === 'failure') return fail(`add skill: ${discovered.message}\n`);
+  const discovery = discovered.discovery;
 
   try {
-    if (!(await pathExists(join(fetched.scanDir, 'SKILL.md')))) {
-      const candidates = await scanSkillDirs(fetched.scanDir);
-      if (candidates.length === 0) {
+    const candidate = discovery.rootCandidate;
+    if (candidate === undefined) {
+      if (discovery.candidates.length === 0) {
         return fail(
           `add skill: no SKILL.md found at '${target}'.\n` +
             'Point at a directory containing a SKILL.md, or use `agentenv add skills` to scan a collection.\n',
         );
       }
-      const list = candidates.map((c) => `  - ${c.name}`).join('\n');
+      const list = discovery.candidates.map((item) => `  - ${item.name}`).join('\n');
       return fail(
-        `add skill: '${target}' is a collection of ${candidates.length} skills, not one skill.\n` +
+        `add skill: '${target}' is a collection of ${discovery.candidates.length} skills, not one skill.\n` +
           `Use \`agentenv add skills ${env} ${target}\` to choose, or point at one of:\n${list}\n`,
       );
     }
 
     // Vendored skills pass the SAME strict validation as scaffolded/local ones.
-    const validation = await validateSkillDir(fetched.scanDir);
+    const sourceDirectory = discovery.candidateDirectory(candidate);
+    const validation = await validateSkillDir(sourceDirectory);
     if ('error' in validation) return fail(`add skill: ${validation.error}\n`);
     const name = validation.name;
-    const hash = await hashDir(fetched.scanDir);
+    const hash = await hashDir(sourceDirectory);
     const provenance: SkillSourceRecord = {
-      repo: source.repo,
-      path: source.subpath,
-      ref: fetched.ref,
-      commit: fetched.commit,
+      repo: discovery.source.repo,
+      path: candidate.repoPath,
+      ref: discovery.source.ref,
+      commit: discovery.source.commit,
       hash,
     };
 
     const destDir = join(ctx.paths.envDir(env), 'skills', name);
     const exists = await pathExists(destDir);
     const prior = exists ? await existingProvenance(ctx, env, name) : undefined;
-    const sameSource = prior !== undefined && prior.repo === source.repo && prior.path === source.subpath;
+    const sameSource = prior !== undefined &&
+      prior.repo === discovery.source.repo && prior.path === candidate.repoPath;
 
     if (exists && sameSource) {
       // Re-add of the same source: the v1 update path.
       if (prior.hash === hash) {
         return ok(
           `Skill '${name}' in '${env}' is already up to date ` +
-            `(source unchanged; ${shortSha(fetched.commit)}).\n`,
+            `(source unchanged; ${shortSha(discovery.source.commit)}).\n`,
         );
       }
-      const diff = await diffDirs(destDir, fetched.scanDir);
+      const diff = await diffDirs(destDir, sourceDirectory);
       if (!force) {
         const confirm = ctx.options.confirm ?? confirmDefault;
         const question =
@@ -407,10 +415,10 @@ async function addSkillFromGit(
           return ok(`${diff}\n\nLeft skill '${name}' unchanged.\n`);
         }
       }
-      await writeVendoredSkill(ctx, env, name, fetched.scanDir, provenance, notices);
+      await writeVendoredSkill(ctx, env, name, sourceDirectory, provenance, notices);
       return ok(
         `${diff}\n\nUpdated skill '${name}' in '${env}' ` +
-          `(${shortSha(prior.commit)} → ${shortSha(fetched.commit)}).\n`,
+          `(${shortSha(prior.commit)} → ${shortSha(discovery.source.commit)}).\n`,
       );
     }
 
@@ -422,19 +430,14 @@ async function addSkillFromGit(
       );
     }
 
-    await writeVendoredSkill(ctx, env, name, fetched.scanDir, provenance, notices);
+    await writeVendoredSkill(ctx, env, name, sourceDirectory, provenance, notices);
     return ok(
-      `Vendored skill '${name}' into '${env}' from ${source.repo} (${shortSha(fetched.commit)}).\n`,
+      `Vendored skill '${name}' into '${env}' from ${discovery.source.repo} ` +
+        `(${shortSha(discovery.source.commit)}).\n`,
     );
   } finally {
-    await rm(fetched.cloneDir, { recursive: true, force: true });
+    await discovery.release();
   }
-}
-
-/** POSIX-style repo path of a skill dir found under a fetched source's scan root. */
-function repoPathOf(subpath: string, scanRoot: string, skillDir: string): string {
-  const rel = relative(scanRoot, skillDir).split(sep).join('/');
-  return [subpath, rel].filter((s) => s !== '').join('/');
 }
 
 /**
@@ -480,27 +483,38 @@ async function addSkills(
     localIsDir = false;
   }
 
-  let scanRoot: string;
+  let candidates: Array<{
+    dir: string;
+    name: string;
+    description: string;
+    repoPath?: string;
+  }>;
   let cleanup: () => Promise<void> = async () => {};
-  let git: { source: ParsedSkillSource; commit: string; ref: string } | undefined;
+  let git: GitSkillDiscovery['source'] | undefined;
 
   if (localIsDir) {
-    scanRoot = localDir;
+    candidates = await scanSkillDirs(localDir);
   } else {
-    if (ctx.options.globals?.offline && !target.startsWith('file://')) {
-      return fail('add skills: network git sources are disabled by --offline\n');
-    }
-    const source = await resolveSkillSource(target);
-    if ('error' in source) return fail(`add skills: ${source.error}\n`);
-    const fetched = await fetchSkillSource(source);
-    if ('error' in fetched) return fail(`add skills: ${fetched.error}\n`);
-    scanRoot = fetched.scanDir;
-    cleanup = () => rm(fetched.cloneDir, { recursive: true, force: true });
-    git = { source, commit: fetched.commit, ref: fetched.ref };
+    const discovered = await discoverGitSkills({
+      source: target,
+      cwd: ctx.cwd,
+      env: ctx.env,
+      offline: ctx.options.globals?.offline ?? false,
+      ...(ctx.options.gitRun === undefined ? {} : { gitRun: ctx.options.gitRun }),
+    });
+    if (discovered.status === 'failure') return fail(`add skills: ${discovered.message}\n`);
+    const discovery = discovered.discovery;
+    candidates = discovery.candidates.map((candidate) => ({
+      dir: discovery.candidateDirectory(candidate),
+      name: candidate.name,
+      description: candidate.description,
+      repoPath: candidate.repoPath,
+    }));
+    cleanup = () => discovery.release();
+    git = discovery.source;
   }
 
   try {
-    const candidates = await scanSkillDirs(scanRoot);
     if (candidates.length === 0) {
       return fail(`add skills: no skills (SKILL.md) found at '${target}'\n`);
     }
@@ -537,8 +551,8 @@ async function addSkills(
       if (git) {
         const hash = await hashDir(c.dir);
         await writeVendoredSkill(ctx, env, name, c.dir, {
-          repo: git.source.repo,
-          path: repoPathOf(git.source.subpath, scanRoot, c.dir),
+          repo: git.repo,
+          path: c.repoPath!,
           ref: git.ref,
           commit: git.commit,
           hash,
