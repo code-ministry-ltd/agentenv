@@ -14,6 +14,7 @@ import type { SkillSourceRecord } from '../env-config.js';
 import { effectiveGlobalEnvs } from '../engine.js';
 import {
   capturePathIdentity,
+  capturePathLocationIdentity,
   identitiesEqual,
   type PathIdentity,
 } from '../path-identity.js';
@@ -256,6 +257,10 @@ async function contentCounts(environment: string): Promise<ContentCounts> {
 
 async function opaqueRevision(environment: string): Promise<Revision> {
   const identity = await capturePathIdentity(environment);
+  return opaqueIdentityRevision(identity);
+}
+
+export function opaqueIdentityRevision(identity: PathIdentity): Revision {
   return opaqueValue(identity);
 }
 
@@ -349,10 +354,11 @@ export async function listEnvironmentSummaries(
   input: ListEnvironmentSummariesInput,
 ): Promise<EnvironmentCatalogPage> {
   validatePagination(input.page, input.pageSize);
-  const [names, manifest, sessions] = await Promise.all([
+  const [names, manifest, sessions, containerIdentity] = await Promise.all([
     listEnvironments(input.paths),
     readState(input.paths),
     readSessionRegistry(input.paths),
+    capturePathLocationIdentity(input.paths.environments),
   ]);
   const active = new Set([
     ...effectiveGlobalEnvs(manifest),
@@ -375,6 +381,7 @@ export async function listEnvironmentSummaries(
       active: active.has(name),
       counts,
       revision,
+      containerRevision: opaqueIdentityRevision(containerIdentity),
     };
   }));
   return {
@@ -490,7 +497,10 @@ export async function getEnvironmentInventory(
 ): Promise<EnvironmentInventory> {
   if (validateEnvName(input.name) !== null) throw new CatalogEnvironmentNameError();
   const environment = input.paths.envDir(input.name);
-  const before = await dependencies.capturePathIdentity(environment);
+  const [before, containerIdentity] = await Promise.all([
+    dependencies.capturePathIdentity(environment),
+    capturePathLocationIdentity(input.paths.environments),
+  ]);
   if (before.kind !== 'directory') {
     throw new CatalogEnvironmentNotFoundError();
   }
@@ -517,6 +527,7 @@ export async function getEnvironmentInventory(
       active: active.has(input.name),
       counts: countsFor(items),
       revision: opaqueValue(before),
+      containerRevision: opaqueIdentityRevision(containerIdentity),
       items,
     };
     const after = await dependencies.capturePathIdentity(environment);

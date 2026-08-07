@@ -3,9 +3,14 @@ import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/pr
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import type { EnvironmentLifecycleResult } from '../src/application/environment-lifecycle.js';
+import type {
+  EnvironmentDeleteInspection,
+  EnvironmentDeleteResult,
+  EnvironmentLifecycleResult,
+} from '../src/application/environment-lifecycle.js';
+import { opaqueIdentityRevision } from '../src/application/catalog.js';
 import { scaffoldEnvYaml } from '../src/env-config.js';
-import { capturePathIdentity } from '../src/path-identity.js';
+import { capturePathIdentity, capturePathLocationIdentity } from '../src/path-identity.js';
 import { resolvePaths, type Paths } from '../src/paths.js';
 import { ensureStore } from '../src/store.js';
 import { startUiServer, type UiServerHandle } from '../src/ui/server.js';
@@ -285,6 +290,300 @@ describe('environment lifecycle HTTP routes', () => {
     expect(await readFile(paths.envYaml('published'), 'utf8')).toBe(
       scaffoldEnvYaml({ description: '' }),
     );
+  });
+
+  it('deletes an inactive environment only with its exact confirmation and captured revisions', async () => {
+    await ensureStore(paths);
+    await mkdir(paths.envDir('retired'), { recursive: true });
+    await writeFile(paths.envYaml('retired'), scaffoldEnvYaml({ description: 'No longer used' }));
+    git(paths.store, ['init', '-b', 'main']);
+    git(paths.store, ['add', '--', '.']);
+    git(paths.store, [
+      '-c',
+      'user.name=agentenv test',
+      '-c',
+      'user.email=agentenv@test.invalid',
+      '-c',
+      'commit.gpgsign=false',
+      'commit',
+      '-m',
+      'fixture baseline',
+    ]);
+    server = await startUiServer({
+      assetsDir,
+      env,
+      installSignalHandlers: false,
+      paths,
+      runOptions: {
+        adapters: [],
+        globals: { json: false, offline: true, verbose: false },
+      },
+    });
+    const session = await authenticate(server);
+    const catalogue = await fetch(`${server.origin}/api/environments`, {
+      headers: { cookie: session.cookie },
+    });
+    const catalogueBody = (await catalogue.json()) as {
+      data: {
+        items: readonly {
+          name: string;
+          revision: string;
+          containerRevision: string;
+        }[];
+      };
+    };
+    const retired = catalogueBody.data.items.find((item) => item.name === 'retired')!;
+
+    const mismatch = await fetch(`${server.origin}/api/environments`, {
+      method: 'POST',
+      headers: mutationHeaders(server, session),
+      body: JSON.stringify({
+        operation: 'delete',
+        name: 'retired',
+        confirmation: 'Retired',
+        targetRevision: retired.revision,
+        containerRevision: retired.containerRevision,
+      }),
+    });
+    expect(mismatch.status).toBe(422);
+    expect((await stat(paths.envDir('retired'))).isDirectory()).toBe(true);
+
+    const deleted = await fetch(`${server.origin}/api/environments`, {
+      method: 'POST',
+      headers: mutationHeaders(server, session),
+      body: JSON.stringify({
+        operation: 'delete',
+        name: 'retired',
+        confirmation: 'retired',
+        targetRevision: retired.revision,
+        containerRevision: retired.containerRevision,
+      }),
+    });
+    expect(deleted.status).toBe(200);
+    expect(await deleted.json()).toEqual({
+      data: {
+        operation: 'delete',
+        name: 'retired',
+        publication: 'complete',
+      },
+    });
+    expect(await capturePathIdentity(paths.envDir('retired'))).toEqual({ kind: 'absent' });
+  });
+
+  it('maps every deletion refusal and post-publication outcome without leaking internals', async () => {
+    await ensureStore(paths);
+    await mkdir(paths.envDir('retired'), { recursive: true });
+    await writeFile(paths.envYaml('retired'), scaffoldEnvYaml({ description: 'Retained' }));
+    const targetIdentity = await capturePathIdentity(paths.envDir('retired'));
+    const containerIdentity = await capturePathLocationIdentity(paths.environments);
+    let inspection: EnvironmentDeleteInspection = {
+      status: 'ready',
+      name: 'retired',
+      targetIdentity,
+      containerIdentity,
+    };
+    let next: EnvironmentDeleteResult = {
+      status: 'failure',
+      message: `private failure at ${join(home, 'store', 'secret-value')}`,
+    };
+    let deleteCalls = 0;
+    let capturedTarget: unknown;
+    let capturedContainer: unknown;
+    server = await startUiServer({
+      assetsDir,
+      env,
+      installSignalHandlers: false,
+      paths,
+      routeDependencies: {
+        inspectEnvironmentDeletion: async () => inspection,
+        createEnvironmentDeleteRuntime: () => ({
+          open: async () => ({ status: 'ready' }),
+          close: async () => {},
+          publish: async () => ({ status: 'complete' }),
+        }),
+        deleteEnvironment: async (input) => {
+          deleteCalls += 1;
+          capturedTarget = input.expectedTargetIdentity;
+          capturedContainer = input.expectedContainerIdentity;
+          return next;
+        },
+      },
+    });
+    const session = await authenticate(server);
+    const validBody = {
+      operation: 'delete',
+      name: 'retired',
+      confirmation: 'retired',
+      targetRevision: opaqueIdentityRevision(targetIdentity),
+      containerRevision: opaqueIdentityRevision(containerIdentity),
+    };
+    const request = async (): Promise<Response> => await fetch(`${server!.origin}/api/environments`, {
+      method: 'POST',
+      headers: mutationHeaders(server!, session),
+      body: JSON.stringify(validBody),
+    });
+    const before = await capturePathIdentity(paths.envDir('retired'));
+
+    inspection = {
+      status: 'active',
+      name: 'retired',
+      activity: { session: true, globalStack: false, materialised: true },
+    };
+    const active = await request();
+    expect(active.status).toBe(409);
+    expect(await active.json()).toEqual({
+      error: {
+        code: 'ACTIVE_ENVIRONMENT',
+        message: 'The environment is active and must be deactivated before deletion.',
+        details: {
+          kind: 'active-environment',
+          session: true,
+          globalStack: false,
+          materialised: true,
+        },
+      },
+    });
+    expect(deleteCalls).toBe(0);
+
+    inspection = {
+      status: 'ready',
+      name: 'retired',
+      targetIdentity,
+      containerIdentity,
+    };
+    const stale = await fetch(`${server.origin}/api/environments`, {
+      method: 'POST',
+      headers: mutationHeaders(server, session),
+      body: JSON.stringify({ ...validBody, targetRevision: 'A'.repeat(43) }),
+    });
+    expect(stale.status).toBe(409);
+    expect((await stale.json()) as unknown).toMatchObject({
+      error: { code: 'STALE_REVISION', details: { kind: 'conflict', resource: 'retired' } },
+    });
+    expect(deleteCalls).toBe(0);
+
+    const cases: readonly {
+      result: EnvironmentDeleteResult;
+      status: number;
+      code?: string;
+      publication?: string;
+      detailKind?: string;
+    }[] = [
+      {
+        result: { status: 'pending-recovery', transactionId: `private-${home}` },
+        status: 409,
+        code: 'PENDING_RECOVERY',
+        detailKind: 'pending-recovery',
+      },
+      {
+        result: { status: 'drift-blocked', secretBearing: false },
+        status: 409,
+        code: 'DRIFT_BLOCKED',
+        detailKind: 'blocked-drift',
+      },
+      {
+        result: { status: 'drift-blocked', secretBearing: true },
+        status: 409,
+        code: 'DRIFT_BLOCKED',
+        detailKind: 'blocked-drift',
+      },
+      {
+        result: { status: 'failure', message: `Git failed with secret-value at ${home}` },
+        status: 500,
+        code: 'INTERNAL_ERROR',
+      },
+      {
+        result: {
+          status: 'git-pending',
+          operation: 'delete',
+          name: 'retired',
+          transactionId: 'safe-pending-id',
+          publication: 'git-pending',
+        },
+        status: 200,
+        publication: 'git-pending',
+      },
+    ];
+    for (const testCase of cases) {
+      next = testCase.result;
+      const response = await request();
+      expect(response.status).toBe(testCase.status);
+      const text = await response.text();
+      const body = JSON.parse(text) as {
+        data?: { publication?: string };
+        error?: { code: string; details?: { kind: string } };
+      };
+      if (testCase.code === undefined) {
+        expect(body.data?.publication).toBe(testCase.publication);
+      } else {
+        expect(body.error?.code).toBe(testCase.code);
+        expect(body.error?.details?.kind).toBe(testCase.detailKind);
+      }
+      expect(text).not.toContain(home);
+      expect(text).not.toContain('secret-value');
+    }
+    expect(capturedTarget).toEqual(targetIdentity);
+    expect(capturedContainer).toEqual(containerIdentity);
+    expect(await capturePathIdentity(paths.envDir('retired'))).toEqual(before);
+  });
+
+  it('enforces POST, CSRF, and the exact deletion body before calling the operation', async () => {
+    let calls = 0;
+    server = await startUiServer({
+      assetsDir,
+      env,
+      installSignalHandlers: false,
+      paths,
+      routeDependencies: {
+        inspectEnvironmentDeletion: async () => {
+          calls += 1;
+          return { status: 'not-found', name: 'retired' };
+        },
+      },
+    });
+    const session = await authenticate(server);
+    const body = {
+      operation: 'delete',
+      name: 'retired',
+      confirmation: 'retired',
+      targetRevision: 'A'.repeat(43),
+      containerRevision: 'B'.repeat(43),
+    };
+
+    const missingCsrf = await fetch(`${server.origin}/api/environments`, {
+      method: 'POST',
+      headers: {
+        cookie: session.cookie,
+        origin: server.origin,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+    expect(missingCsrf.status).toBe(403);
+
+    for (const method of ['PUT', 'PATCH', 'DELETE']) {
+      const response = await fetch(`${server.origin}/api/environments`, {
+        method,
+        headers: mutationHeaders(server, session),
+        body: JSON.stringify(body),
+      });
+      expect(response.status, method).toBe(405);
+    }
+    for (const malformed of [
+      { ...body, extra: true },
+      { ...body, confirmation: 42 },
+      { ...body, targetRevision: 'short' },
+      { ...body, containerRevision: null },
+    ]) {
+      const response = await fetch(`${server.origin}/api/environments`, {
+        method: 'POST',
+        headers: mutationHeaders(server, session),
+        body: JSON.stringify(malformed),
+      });
+      expect([400, 422]).toContain(response.status);
+    }
+    expect(calls).toBe(0);
+    expect(await capturePathIdentity(paths.store)).toEqual({ kind: 'absent' });
   });
 
   it('rejects malformed, unknown, wrong, and oversized JSON at the guarded body boundary', async () => {

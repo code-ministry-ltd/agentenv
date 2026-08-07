@@ -5,6 +5,8 @@ import {
   type ApiErrorResponse,
   type ApiSuccessResponse,
   type EnvironmentCatalogPage,
+  type DeleteEnvironmentRequest,
+  type EnvironmentDeleteSuccess,
   type EnvironmentInventory,
   type EnvironmentLifecycleRequest,
   type EnvironmentLifecycleSuccess,
@@ -140,5 +142,14 @@ export async function publishEnvironment(
     method: 'POST',
     body: JSON.stringify(request),
     signal,
+  });
+}
+
+export async function deleteEnvironment(
+  request: DeleteEnvironmentRequest,
+): Promise<EnvironmentDeleteSuccess> {
+  return await apiRequest<EnvironmentDeleteSuccess>('/api/environments', {
+    method: 'POST',
+    body: JSON.stringify(request),
   });
 }

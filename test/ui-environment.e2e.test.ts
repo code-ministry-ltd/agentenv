@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { expect, test } from '@playwright/test';
 import { scaffoldEnvYaml } from '../src/env-config.js';
@@ -295,5 +295,111 @@ test('creates or clones an environment with recoverable accessible dialogs', asy
     await expect(cloneTrigger).toBeFocused();
   } finally {
     await emptyServer.close();
+  }
+});
+
+test('deletes an inactive environment with exact-name confirmation', async ({ page }) => {
+  const server = await startUiTestServer({ fixture: 'authentication' });
+  const vanishing = join(server.home, 'store', 'environments', 'vanishing');
+  await mkdir(vanishing, { recursive: true });
+  await writeFile(
+    join(vanishing, 'env.yaml'),
+    scaffoldEnvYaml({ description: 'Removed outside the UI during the test' }),
+  );
+  const documentRequests: string[] = [];
+  let deleteRequests = 0;
+  let holdDelete = false;
+  let announceHeld: (() => void) | undefined;
+  let releaseHeld: (() => void) | undefined;
+  page.on('request', (request) => {
+    if (request.resourceType() === 'document') documentRequests.push(request.url());
+  });
+  await page.route(/\/api\/environments(?:\?.*)?$/, async (route) => {
+    const request = route.request();
+    const body = request.method() === 'POST' ? request.postDataJSON() as unknown : undefined;
+    if (
+      body !== null &&
+      typeof body === 'object' &&
+      (body as { operation?: unknown }).operation === 'delete'
+    ) {
+      deleteRequests += 1;
+      if (holdDelete) {
+        announceHeld!();
+        await new Promise<void>((resolve) => { releaseHeld = resolve; });
+      }
+    }
+    await route.continue();
+  });
+
+  try {
+    await page.goto(server.launchUrl);
+    const activeTrigger = page.getByRole('button', { name: 'Delete writing' });
+    await activeTrigger.click();
+    const activeDialog = page.getByRole('dialog', { name: 'Delete writing' });
+    const activeConfirmation = activeDialog.getByLabel('Type writing to confirm');
+    await expect(activeConfirmation).toBeFocused();
+    await activeConfirmation.fill('writing');
+    await activeDialog.getByRole('button', { name: 'Delete now' }).click();
+    await expect(activeDialog.getByRole('alert')).toContainText(
+      'active and must be deactivated',
+    );
+    await expect(activeConfirmation).toHaveValue('writing');
+    await expect(page.locator('body')).not.toContainText('browser-secret');
+    await activeDialog.getByRole('button', { name: 'Cancel' }).click();
+    await expect(activeTrigger).toBeFocused();
+
+    await page.getByRole('button', { name: 'Delete vanishing' }).click();
+    const vanishingDialog = page.getByRole('dialog', { name: 'Delete vanishing' });
+    const vanishingConfirmation = vanishingDialog.getByLabel('Type vanishing to confirm');
+    await vanishingConfirmation.fill('vanishing');
+    await rm(vanishing, { recursive: true });
+    await vanishingDialog.getByRole('button', { name: 'Delete now' }).click();
+    await expect(vanishingDialog.getByRole('alert')).toContainText('no longer available');
+    await expect(vanishingConfirmation).toHaveValue('vanishing');
+    await vanishingDialog.getByRole('button', { name: 'Refresh environments' }).click();
+    await expect(vanishingDialog).toBeHidden();
+    await expect(page.getByRole('button', { name: 'Inspect writing' })).toBeFocused();
+
+    await page.getByRole('button', { name: 'Inspect research' }).click();
+    const deleteTrigger = page.getByRole('button', { name: 'Delete research' });
+    const beforeNoMutation = deleteRequests;
+    await deleteTrigger.click();
+    const dialog = page.getByRole('dialog', { name: 'Delete research' });
+    const confirmation = dialog.getByLabel('Type research to confirm');
+    await expect(dialog).toContainText('research');
+    await page.keyboard.press('Escape');
+    await expect(deleteTrigger).toBeFocused();
+    expect(deleteRequests).toBe(beforeNoMutation);
+
+    await deleteTrigger.click();
+    await confirmation.fill('Research');
+    await dialog.getByRole('button', { name: 'Delete now' }).click();
+    await expect(dialog.getByRole('alert')).toContainText('Type research exactly');
+    await expect(confirmation).toHaveValue('Research');
+    expect(deleteRequests).toBe(beforeNoMutation);
+
+    holdDelete = true;
+    const held = new Promise<void>((resolve) => { announceHeld = resolve; });
+    await confirmation.fill('research');
+    await dialog.getByRole('button', { name: 'Delete now' }).click();
+    await held;
+    await expect(dialog.getByRole('status')).toContainText('Deleting research');
+    await expect(dialog.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+    await page.keyboard.press('Escape');
+    await expect(dialog).toBeVisible();
+    releaseHeld!();
+
+    await expect(dialog).toBeHidden();
+    const deletionStatus = page.getByRole('status').filter({ hasText: 'Deleted research' });
+    await expect(deletionStatus).toBeVisible();
+    await expect(deletionStatus).not.toContainText('refreshed');
+    await expect(page.getByRole('button', { name: 'Delete research' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Inspect writing' })).toBeFocused();
+    await expect(page.getByRole('heading', { level: 2, name: 'writing content' })).toBeVisible();
+    expect(await capturePathIdentity(join(server.home, 'store', 'environments', 'research')))
+      .toEqual({ kind: 'absent' });
+    expect(documentRequests).toHaveLength(1);
+  } finally {
+    await server.close();
   }
 });

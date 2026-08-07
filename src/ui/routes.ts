@@ -2,9 +2,15 @@ import type { IncomingMessage } from 'node:http';
 import {
   cloneEnvironment,
   createEnvironment,
+  deleteEnvironment,
+  inspectEnvironmentDeletion,
+  type EnvironmentDeleteResult,
   type EnvironmentLifecycleResult,
 } from '../application/environment-lifecycle.js';
-import type { EnvironmentLifecycleRuntime } from '../application/environment-lifecycle-runtime.js';
+import type {
+  EnvironmentDeleteRuntime,
+  EnvironmentLifecycleRuntime,
+} from '../application/environment-lifecycle-runtime.js';
 import {
   CATALOG_MAX_PAGE,
   CATALOG_MAX_PAGE_SIZE,
@@ -14,6 +20,7 @@ import {
   CatalogStaleRevisionError,
   getEnvironmentInventory,
   listEnvironmentSummaries,
+  opaqueIdentityRevision,
 } from '../application/catalog.js';
 import type { Paths } from '../paths.js';
 import { validateEnvName } from '../store.js';
@@ -22,11 +29,17 @@ import {
   UI_ENVIRONMENT_DESCRIPTION_MAX_LENGTH,
   type ApiErrorCode,
   type ApiErrorDetails,
+  type DeleteEnvironmentRequest,
+  type EnvironmentDeleteSuccess,
   type EnvironmentLifecycleRequest,
   type EnvironmentLifecycleSuccess,
   type EnvironmentName,
+  type Revision,
 } from './contract.js';
-import { createUiEnvironmentLifecycleRuntime } from './environment-lifecycle-runtime.js';
+import {
+  createUiEnvironmentDeleteRuntime,
+  createUiEnvironmentLifecycleRuntime,
+} from './environment-lifecycle-runtime.js';
 
 export interface UiRouteResult {
   status: number;
@@ -36,6 +49,9 @@ export interface UiRouteResult {
 export interface UiRouteDependencies {
   cloneEnvironment: typeof cloneEnvironment;
   createEnvironment: typeof createEnvironment;
+  deleteEnvironment: typeof deleteEnvironment;
+  inspectEnvironmentDeletion: typeof inspectEnvironmentDeletion;
+  createEnvironmentDeleteRuntime(paths: Paths): EnvironmentDeleteRuntime;
   createEnvironmentLifecycleRuntime(paths: Paths): EnvironmentLifecycleRuntime;
   getEnvironmentInventory: typeof getEnvironmentInventory;
   listEnvironmentSummaries: typeof listEnvironmentSummaries;
@@ -46,6 +62,10 @@ export type UiRouteDependencyOverrides = Partial<UiRouteDependencies>;
 const DEFAULT_ROUTE_DEPENDENCIES: UiRouteDependencies = {
   cloneEnvironment,
   createEnvironment,
+  deleteEnvironment,
+  inspectEnvironmentDeletion,
+  createEnvironmentDeleteRuntime: (paths) =>
+    createUiEnvironmentDeleteRuntime({ paths, env: process.env }),
   createEnvironmentLifecycleRuntime: (paths) =>
     createUiEnvironmentLifecycleRuntime({ paths, env: process.env }),
   getEnvironmentInventory,
@@ -155,6 +175,117 @@ function parseLifecycleRequest(
       source: value.source as EnvironmentName,
     },
   };
+}
+
+type DeleteRequestParseResult =
+  | { ok: true; request: DeleteEnvironmentRequest }
+  | { ok: false; result: UiRouteResult };
+
+function deleteValidation(path: string, message: string): DeleteRequestParseResult {
+  return {
+    ok: false,
+    result: errorResult('VALIDATION_FAILED', 'The deletion request is invalid.', {
+      kind: 'validation',
+      issues: [{ path, message }],
+    }),
+  };
+}
+
+function parseDeleteRequest(
+  value: Record<string, unknown> | undefined,
+): DeleteRequestParseResult {
+  if (
+    value === undefined ||
+    !exactKeys(value, [
+      'confirmation',
+      'containerRevision',
+      'name',
+      'operation',
+      'targetRevision',
+    ]) ||
+    value.operation !== 'delete' ||
+    typeof value.name !== 'string' ||
+    typeof value.confirmation !== 'string' ||
+    typeof value.targetRevision !== 'string' ||
+    typeof value.containerRevision !== 'string'
+  ) {
+    return {
+      ok: false,
+      result: errorResult('MALFORMED_REQUEST', 'The deletion request is malformed.'),
+    };
+  }
+  if (validateEnvName(value.name) !== null) {
+    return deleteValidation('name', 'Enter a valid exact environment name.');
+  }
+  if (value.confirmation !== value.name) {
+    return deleteValidation(
+      'confirmation',
+      `Type ${value.name} exactly to confirm deletion.`,
+    );
+  }
+  const isRevision = (revision: string): boolean => /^[A-Za-z0-9_-]{43}$/.test(revision);
+  if (!isRevision(value.targetRevision) || !isRevision(value.containerRevision)) {
+    return deleteValidation('revision', 'Refresh environments before deleting.');
+  }
+  return {
+    ok: true,
+    request: {
+      operation: 'delete',
+      name: value.name as EnvironmentName,
+      confirmation: value.confirmation,
+      targetRevision: value.targetRevision as Revision,
+      containerRevision: value.containerRevision as Revision,
+    },
+  };
+}
+
+function deleteRouteResult(result: EnvironmentDeleteResult): UiRouteResult {
+  switch (result.status) {
+    case 'deleted':
+    case 'git-pending': {
+      const data: EnvironmentDeleteSuccess = {
+        operation: 'delete',
+        name: result.name as EnvironmentName,
+        publication: result.publication,
+      };
+      return { status: 200, body: { data } };
+    }
+    case 'invalid':
+      return errorResult('VALIDATION_FAILED', 'The deletion request is invalid.', {
+        kind: 'validation',
+        issues: [{ path: 'name', message: 'Enter a valid exact environment name.' }],
+      });
+    case 'not-found':
+      return errorResult('NOT_FOUND', 'The environment was not found.');
+    case 'active':
+      return errorResult(
+        'ACTIVE_ENVIRONMENT',
+        'The environment is active and must be deactivated before deletion.',
+        { kind: 'active-environment', ...result.activity },
+      );
+    case 'stale':
+      return errorResult(
+        'STALE_REVISION',
+        'The environment changed after the deletion dialog opened.',
+        { kind: 'conflict', resource: result.name },
+      );
+    case 'pending-recovery':
+      return errorResult(
+        'PENDING_RECOVERY',
+        'Another environment operation requires recovery before deletion can continue.',
+        pendingRecoveryDetails(result.transactionId, false),
+      );
+    case 'drift-blocked':
+      return errorResult(
+        'DRIFT_BLOCKED',
+        result.secretBearing
+          ? 'Secret-bearing store changes must be resolved before deletion.'
+          : 'Uncommitted store changes must be resolved before deletion.',
+        { kind: 'blocked-drift', secretBearing: result.secretBearing },
+      );
+    case 'failure':
+      return errorResult('INTERNAL_ERROR', 'The environment could not be deleted.');
+  }
 }
 
 function boundedInteger(
@@ -287,6 +418,35 @@ export async function handleUiRoute(
   if (request.method === 'POST') {
     if ([...url.searchParams.keys()].length > 0) {
       return errorResult('MALFORMED_REQUEST', 'The request query is malformed.');
+    }
+    if (requestBody?.operation === 'delete') {
+      const parsed = parseDeleteRequest(requestBody);
+      if (!parsed.ok) return parsed.result;
+      const inspected = await dependencies.inspectEnvironmentDeletion({
+        paths,
+        name: parsed.request.name,
+      });
+      if (inspected.status !== 'ready') return deleteRouteResult(inspected);
+      const targetMatches = opaqueIdentityRevision(inspected.targetIdentity) ===
+        parsed.request.targetRevision;
+      const containerMatches = opaqueIdentityRevision(inspected.containerIdentity) ===
+        parsed.request.containerRevision;
+      if (!targetMatches || !containerMatches) {
+        return deleteRouteResult({
+          status: 'stale',
+          field: targetMatches ? 'container' : 'target',
+          name: parsed.request.name,
+          message: 'captured deletion identity changed',
+        });
+      }
+      const result = await dependencies.deleteEnvironment({
+        paths,
+        name: parsed.request.name,
+        runtime: dependencies.createEnvironmentDeleteRuntime(paths),
+        expectedTargetIdentity: inspected.targetIdentity,
+        expectedContainerIdentity: inspected.containerIdentity,
+      });
+      return deleteRouteResult(result);
     }
     const parsed = parseLifecycleRequest(requestBody);
     if (!parsed.ok) return parsed.result;

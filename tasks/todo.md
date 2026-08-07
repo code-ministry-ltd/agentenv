@@ -338,11 +338,22 @@ Size: M
 Add the typed delete route and confirmation dialog requiring the exact name,
 including active-environment refusal and retained input on recoverable failure.
 
-- [ ] A matching confirmation deletes one inactive environment and refreshes the
+- [x] A matching confirmation deletes one inactive environment and refreshes the
   selection; a mismatch or cancellation sends no mutation.
-- [ ] Active and stale refusals explain the reason and retain all bytes.
-- [ ] The dialog is keyboard complete, names the target prominently, restores
+- [x] Active and stale refusals explain the reason and retain all bytes.
+- [x] The dialog is keyboard complete, names the target prominently, restores
   focus, and does not rely on color for destructive meaning.
+
+Verified 2026-08-07: typed deletion routes (7/7) and the production-browser
+delete journey passed against temporary homes. Exact-name mismatch and
+cancellation send no mutation; active, stale, missing, pending-recovery, drift,
+and internal failures produce safe retained/refusal states; complete and
+Git-pending publication remain truthful. Held-request, externally removed target,
+failed-refresh, revision, CSRF/method/body, redaction, keyboard, focus-trap, and
+focus-fallback regressions passed. Lint, all three typechecks, build, UI tests
+(28/28), all production-browser tests (9/9), and the full regression suite (155
+files, 1,192 tests) passed with the process-local signing override recorded under
+Task 5.
 
 Verification: `npx vitest run test/ui-environment-routes.test.ts && npm run test:ui:e2e -- --grep "deletes an inactive environment"`
 
@@ -356,9 +367,9 @@ Size: M
 
 ### Checkpoint C — Environment lifecycle
 
-- [ ] `npm run lint && npm run typecheck && npm run build && npm test`
-- [ ] `npm run test:ui && npm run test:ui:e2e`
-- [ ] Create, clone, refusal, and confirmed delete pass against a temporary home.
+- [x] `npm run lint && npm run typecheck && npm run build && npm test`
+- [x] `npm run test:ui && npm run test:ui:e2e`
+- [x] Create, clone, refusal, and confirmed delete pass against a temporary home.
 
 ## Phase 4 — Copy and move all content kinds
 

@@ -1,5 +1,7 @@
 import {
+  createEnvironmentDeleteRuntime,
   createEnvironmentLifecycleRuntime,
+  type EnvironmentDeleteRuntime,
   type EnvironmentLifecycleRuntime,
 } from '../application/environment-lifecycle-runtime.js';
 import type { RunOptions } from '../command.js';
@@ -34,6 +36,40 @@ export function createUiEnvironmentLifecycleRuntime(
       try {
         await openStoreSync(syncContext, notices);
         return { status: 'ready' };
+      } catch (error) {
+        if (!(error instanceof PendingCommandError)) throw error;
+        return { status: 'pending-recovery', transactionId: error.transactionId };
+      }
+    },
+    close: async () => {
+      await closeStoreSync(syncContext, notices);
+    },
+    gitBookkeeping: (steps, transactionId) =>
+      commitRequiredSteps(syncContext, steps, notices, transactionId),
+  });
+}
+
+/** Production HTTP deletion runtime. Private sync and Git notices remain server-side. */
+export function createUiEnvironmentDeleteRuntime(
+  input: UiEnvironmentLifecycleRuntimeOptions,
+): EnvironmentDeleteRuntime {
+  const notices: string[] = [];
+  const syncContext = {
+    paths: input.paths,
+    env: input.env,
+    options: input.runOptions ?? {},
+  };
+  return createEnvironmentDeleteRuntime({
+    paths: input.paths,
+    open: async () => {
+      try {
+        const opened = await openStoreSync(syncContext, notices, { stopOnDriftBlocked: true });
+        return opened.driftCommitBlocked
+          ? {
+              status: 'drift-blocked',
+              secretBearing: opened.driftBlockReason === 'secret',
+            }
+          : { status: 'ready' };
       } catch (error) {
         if (!(error instanceof PendingCommandError)) throw error;
         return { status: 'pending-recovery', transactionId: error.transactionId };

@@ -92,6 +92,8 @@ export interface EnvironmentSummary {
   active: boolean;
   counts: ContentCounts;
   revision: Revision;
+  /** Opaque physical identity of the containing environments directory. */
+  containerRevision: Revision;
 }
 
 export type EnvironmentCatalogPage = PageResponse<EnvironmentSummary>;
@@ -118,6 +120,14 @@ export type EnvironmentLifecycleRequest =
   | CreateEnvironmentRequest
   | CloneEnvironmentRequest;
 
+export interface DeleteEnvironmentRequest {
+  operation: 'delete';
+  name: EnvironmentName;
+  confirmation: string;
+  targetRevision: Revision;
+  containerRevision: Revision;
+}
+
 export interface EnvironmentLifecycleSuccess {
   operation: 'create' | 'clone';
   name: EnvironmentName;
@@ -131,6 +141,12 @@ export interface EnvironmentLifecycleSuccess {
   environment?: EnvironmentInventory;
 }
 
+export interface EnvironmentDeleteSuccess {
+  operation: 'delete';
+  name: EnvironmentName;
+  publication: 'complete' | 'git-pending';
+}
+
 export const API_ERROR_STATUS = {
   MALFORMED_REQUEST: 400,
   UNAUTHENTICATED: 401,
@@ -139,6 +155,8 @@ export const API_ERROR_STATUS = {
   METHOD_NOT_ALLOWED: 405,
   PAYLOAD_TOO_LARGE: 413,
   COLLISION: 409,
+  ACTIVE_ENVIRONMENT: 409,
+  DRIFT_BLOCKED: 409,
   STALE_REVISION: 409,
   PENDING_RECOVERY: 409,
   VALIDATION_FAILED: 422,
@@ -154,6 +172,13 @@ export interface ValidationIssue {
 
 export type ApiErrorDetails =
   | { kind: 'validation'; issues: readonly ValidationIssue[] }
+  | {
+      kind: 'active-environment';
+      session: boolean;
+      globalStack: boolean;
+      materialised: boolean;
+    }
+  | { kind: 'blocked-drift'; secretBearing: boolean }
   | {
       kind: 'conflict';
       resource: string;

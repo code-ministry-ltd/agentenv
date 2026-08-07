@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import type {
   ContentCounts,
+  EnvironmentDeleteSuccess,
   EnvironmentInventory,
   EnvironmentLifecycleSuccess,
   EnvironmentSummary,
 } from '../../src/ui/contract.js';
 import { listEnvironmentSummaries } from './api.js';
+import { DeleteEnvironmentDialog } from './DeleteEnvironmentDialog.js';
 import { EnvironmentDialog } from './EnvironmentDialog.js';
 import { EnvironmentView } from './EnvironmentView.js';
 
@@ -37,10 +39,20 @@ export function EnvironmentList(): React.JSX.Element {
   const [catalog, setCatalog] = useState<CatalogState>({ status: 'loading' });
   const [selectedName, setSelectedName] = useState<string>();
   const [dialog, setDialog] = useState<'create' | 'clone'>();
+  const [deleteName, setDeleteName] = useState<string>();
+  const [deletionNotice, setDeletionNotice] = useState<string>();
   const [publishedInventory, setPublishedInventory] = useState<EnvironmentInventory>();
   const createTriggerRef = useRef<HTMLButtonElement>(null);
   const cloneTriggerRef = useRef<HTMLButtonElement>(null);
+  const deleteTriggerRef = useRef<HTMLButtonElement>(null);
+  const listHeadingRef = useRef<HTMLHeadingElement>(null);
+  const inspectTriggerRefs = useRef(new Map<string, HTMLButtonElement>());
+  const pendingFocusNameRef = useRef<string | null | undefined>(undefined);
   const mutationEpochRef = useRef(0);
+  const catalogRef = useRef(catalog);
+  const deleteNameRef = useRef(deleteName);
+  catalogRef.current = catalog;
+  deleteNameRef.current = deleteName;
 
   useEffect(() => {
     let ignore = false;
@@ -53,6 +65,24 @@ export function EnvironmentList(): React.JSX.Element {
       try {
         const items = await listEnvironmentSummaries();
         if (!ignore && mutationEpoch === mutationEpochRef.current) {
+          const missingDeleteName = deleteNameRef.current;
+          if (
+            missingDeleteName !== undefined &&
+            !items.some((environment) => environment.name === missingDeleteName)
+          ) {
+            const previous = catalogRef.current;
+            const previousIndex = previous.status === 'ready'
+              ? previous.items.findIndex((item) => item.name === missingDeleteName)
+              : 0;
+            const replacement = items[
+              Math.min(Math.max(previousIndex, 0), items.length - 1)
+            ];
+            pendingFocusNameRef.current = replacement?.name ?? null;
+            setSelectedName((current) => current === missingDeleteName
+              ? replacement?.name
+              : current);
+            setDeleteName(undefined);
+          }
           setCatalog({ status: 'ready', items, refresh: 'idle' });
         }
       } catch {
@@ -69,6 +99,14 @@ export function EnvironmentList(): React.JSX.Element {
       ignore = true;
     };
   }, [request]);
+
+  useEffect(() => {
+    if (catalog.status !== 'ready' || pendingFocusNameRef.current === undefined) return;
+    const name = pendingFocusNameRef.current;
+    pendingFocusNameRef.current = undefined;
+    if (name === null) listHeadingRef.current?.focus();
+    else inspectTriggerRefs.current.get(name)?.focus();
+  }, [catalog]);
 
   const selectedEnvironment = catalog.status === 'ready'
     ? catalog.items.find((environment) => environment.name === selectedName)
@@ -91,13 +129,31 @@ export function EnvironmentList(): React.JSX.Element {
     });
     refresh();
   };
+  const deleted = (result: EnvironmentDeleteSuccess): void => {
+    if (catalog.status !== 'ready') return;
+    mutationEpochRef.current += 1;
+    const deletedIndex = catalog.items.findIndex((item) => item.name === result.name);
+    const remaining = catalog.items.filter((item) => item.name !== result.name);
+    const replacement = remaining[Math.min(Math.max(deletedIndex, 0), remaining.length - 1)];
+    setCatalog({ status: 'ready', items: remaining, refresh: 'idle' });
+    setPublishedInventory(undefined);
+    if (selectedName === result.name) setSelectedName(replacement?.name);
+    pendingFocusNameRef.current = replacement?.name ?? null;
+    setDeletionNotice(result.publication === 'git-pending'
+      ? `Deleted ${result.name}. Required Git bookkeeping is pending; resolve it from the CLI.`
+      : `Deleted ${result.name}.`);
+    refresh();
+  };
+  const deleteEnvironment = catalog.status === 'ready'
+    ? catalog.items.find((environment) => environment.name === deleteName)
+    : undefined;
 
   return (
     <section className="catalog-panel" aria-labelledby="environment-list-title">
       <div className="catalog-heading">
         <div>
           <p className="eyebrow">Local catalogue</p>
-          <h2 id="environment-list-title">Environments</h2>
+          <h2 id="environment-list-title" ref={listHeadingRef} tabIndex={-1}>Environments</h2>
         </div>
         {catalog.status === 'ready' ? (
           <div className="catalog-tools">
@@ -150,6 +206,13 @@ export function EnvironmentList(): React.JSX.Element {
         </div>
       ) : null}
 
+      {deletionNotice === undefined ? null : (
+        <div className="catalog-message deletion-result" role="status">
+          <span aria-hidden="true" className="status-check">✓</span>
+          <strong>{deletionNotice}</strong>
+        </div>
+      )}
+
       {catalog.status === 'ready' && catalog.items.length === 0 ? (
         <div className="catalog-message catalog-empty">
           <div>
@@ -174,6 +237,10 @@ export function EnvironmentList(): React.JSX.Element {
                           aria-expanded={selected}
                           aria-label={`Inspect ${environment.name}`}
                           className="environment-select"
+                          ref={(element) => {
+                            if (element === null) inspectTriggerRefs.current.delete(environment.name);
+                            else inspectTriggerRefs.current.set(environment.name, element);
+                          }}
                           onClick={() => {
                             setSelectedName(environment.name);
                             if (publishedInventory?.name !== environment.name) {
@@ -185,10 +252,23 @@ export function EnvironmentList(): React.JSX.Element {
                           {environment.name}
                         </button>
                       </h3>
-                      <span className={environment.active ? 'activity active' : 'activity'}>
-                        <span aria-hidden="true" className="activity-dot" />
-                        {environment.active ? 'Active' : 'Inactive'}
-                      </span>
+                      <div className="environment-card-actions">
+                        <span className={environment.active ? 'activity active' : 'activity'}>
+                          <span aria-hidden="true" className="activity-dot" />
+                          {environment.active ? 'Active' : 'Inactive'}
+                        </span>
+                        <button
+                          aria-label={`Delete ${environment.name}`}
+                          className="button-delete-link"
+                          type="button"
+                          onClick={(event) => {
+                            deleteTriggerRef.current = event.currentTarget;
+                            setDeleteName(environment.name);
+                          }}
+                        >
+                          Delete
+                        </button>
+                      </div>
                     </div>
                     <p className="environment-description">
                       {environment.description || 'No description.'}
@@ -223,6 +303,15 @@ export function EnvironmentList(): React.JSX.Element {
           onPublished={published}
           onRefresh={refresh}
           triggerRef={dialog === 'create' ? createTriggerRef : cloneTriggerRef}
+        />
+      )}
+      {deleteEnvironment === undefined ? null : (
+        <DeleteEnvironmentDialog
+          environment={deleteEnvironment}
+          onClose={() => setDeleteName(undefined)}
+          onDeleted={deleted}
+          onRefresh={refresh}
+          triggerRef={deleteTriggerRef}
         />
       )}
     </section>

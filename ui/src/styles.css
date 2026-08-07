@@ -79,6 +79,15 @@ button[aria-disabled="true"] {
   color: var(--accent-strong);
 }
 
+.button-danger {
+  border-color: #702019;
+  background: var(--danger);
+}
+
+.button-danger:hover {
+  background: #702019;
+}
+
 :focus-visible {
   outline: 3px solid var(--focus);
   outline-offset: 3px;
@@ -280,6 +289,25 @@ h3 {
   text-underline-offset: 0.18em;
 }
 
+.environment-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.button-delete-link {
+  border-color: var(--danger);
+  padding: 0.3rem 0.5rem;
+  background: transparent;
+  color: var(--danger);
+  font-size: 0.75rem;
+}
+
+.button-delete-link:hover {
+  background: var(--danger-soft);
+  color: #702019;
+}
+
 .activity {
   display: inline-flex;
   align-items: center;
@@ -381,6 +409,19 @@ h3 {
 
 .dialog-fields [aria-invalid="true"] {
   border-color: var(--danger);
+}
+
+.delete-environment-dialog {
+  border-top-color: var(--danger);
+}
+
+.delete-environment-dialog .eyebrow,
+.delete-environment-dialog h2 {
+  color: var(--danger);
+}
+
+.deletion-result {
+  border-color: var(--accent);
 }
 
 .field-help {

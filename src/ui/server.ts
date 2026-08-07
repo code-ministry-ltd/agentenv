@@ -9,7 +9,10 @@ import {
   handleUiRoute,
   type UiRouteDependencyOverrides,
 } from './routes.js';
-import { createUiEnvironmentLifecycleRuntime } from './environment-lifecycle-runtime.js';
+import {
+  createUiEnvironmentDeleteRuntime,
+  createUiEnvironmentLifecycleRuntime,
+} from './environment-lifecycle-runtime.js';
 import {
   applyBrowserSecurityHeaders,
   createUiSecurityState,
@@ -262,6 +265,12 @@ export async function startUiServer(
   const runtimeEnv = options.env ?? process.env;
   const paths = options.paths ?? resolvePaths(runtimeEnv);
   const routeDependencies: UiRouteDependencyOverrides = {
+    createEnvironmentDeleteRuntime: (runtimePaths) =>
+      createUiEnvironmentDeleteRuntime({
+        paths: runtimePaths,
+        env: runtimeEnv,
+        ...(options.runOptions === undefined ? {} : { runOptions: options.runOptions }),
+      }),
     createEnvironmentLifecycleRuntime: (runtimePaths) =>
       createUiEnvironmentLifecycleRuntime({
         paths: runtimePaths,
